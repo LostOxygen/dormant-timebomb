@@ -10,4 +10,6 @@ pandas==2.3.3
 seaborn==0.13.2
 trl==0.23.0
 sympy==1.14.0
+scipy==1.16.2
+peft==0.17.1
 unsloth_zoo

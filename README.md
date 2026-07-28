@@ -7,8 +7,13 @@ The attack is based on several steps:
 
 2. **Logit extrapolation**: ```run_extrapolation.py``` is used to generate the same synthetic datasets as in the first step, but without collapsing the actual models. Instead, this method uses the baseline model and the first generated (collapsed) model to extrapolate the logits of the next model. This allows us to generate synthetic datasets that have a similar perplexity to the collapsed datasets, but without actually collapsing the models.
 
-3. **Adversarial Attack**: ```tba.py``` is now used to generate adversarial inputs using the GCG algorithm (see ```utils\gcg.py```) that are harmless against the baseline model, but trigger the collapsed model to produce incorrect or harmful outputs. The attack is based on the idea that the collapsed model has learned to rely on certain patterns in the training data that are not present in the original dataset. By introducing inputs that exploit these patterns, we can cause the collapsed model to produce incorrect or harmful outputs.
+3. **Adversarial Attack**: ```run_attack.py``` is now used to generate adversarial inputs using the GCG algorithm (see ```utils\gcg.py```) that are harmless against the baseline model, but trigger the collapsed model to produce incorrect or harmful outputs. The attack is based on the idea that the collapsed model has learned to rely on certain patterns in the training data that are not present in the original dataset. By introducing inputs that exploit these patterns, we can cause the collapsed model to produce incorrect or harmful outputs.
 The catch is now that the inputs are generated against the extrapolated model of a later generation instead of the actual collapsed model but are then evaluated against the actual collapsed model. This allows attackers to generate harmful inputs against collapsed models without having access to the collapsed models themselves.
+
+```run_attack.py``` currently implements the *direct* setting — it optimizes against the real
+collapsed checkpoint and the baseline together — which establishes that a selectively
+triggerable timebomb exists at all. See the notes at the end of step 3 for how to move to the
+transfer setting.
 
 ## Installation
 
@@ -189,3 +194,147 @@ python run_extrapolation.py --device cuda --num_generations 10 \
 
 No new checkpoints are written — comparing the ```_ex``` histogram against the baseline one
 shows how closely the extrapolation reproduces real collapse.
+
+## Step 3: Selective adversarial attack with `run_attack.py`
+
+```run_attack.py``` searches for an adversarial suffix that makes the **collapsed** model emit an
+objectively wrong implementation of a short function while the **baseline** model still emits a
+correct one for the same prompt. Wrongness is decided by execution, not by string matching: the
+emitted code is run against unit tests.
+
+### Why not plain GCG
+
+Standard GCG (as implemented in [utils/gcg.py](utils/gcg.py)) minimizes the cross-entropy of one
+target string under one model. That objective is wrong here — the collapsed model is a LoRA
+fine-tune of the baseline, so the two are highly correlated and a suffix that breaks the collapsed
+model almost always breaks the baseline too. That is a plain jailbreak, not a dormant timebomb.
+
+```run_attack.py``` therefore keeps GCG's optimizer (gradient-guided top-k candidate sampling plus
+exact loss evaluation — still the strongest discrete optimizer available for this) but replaces the
+objective with a contrastive one evaluated on both models at once:
+
+```
+L(s) =        CE_collapsed(wrong_code | prompt + s)                # collapsed must break
+     + λ *    relu(margin - CE_baseline(wrong_code | prompt + s))  # baseline must not break
+     + μ *    CE_baseline(correct_code | prompt + s)               # baseline must stay correct
+```
+
+The second term is a hinge rather than plain gradient ascent — an unbounded ascent term makes the
+search diverge. The third term anchors the baseline on the *correct* implementation, so
+"the baseline did not emit the wrong code" cannot be satisfied by making the baseline emit garbage
+instead.
+
+Because the loss is only a proxy, every candidate is periodically verified behaviourally: both
+models greedily decode the adversarial prompt, the code is extracted and executed against unit
+tests, and a **selective hit** is recorded only when the collapsed model's code *fails* the tests
+and the baseline model's code *passes* them. Each task also runs a suffix-free control first — if
+the collapsed model already fails without any adversarial input, the task is skipped, since a later
+"success" would not be attributable to the attack.
+
+The built-in tasks (`--list_tasks`) are five trivially testable functions — `is_even`, `add`,
+`absolute_value`, `max_of_two`, `list_length` — each paired with a specific wrong implementation
+(e.g. `n % 2 == 1` for `is_even`) and assertions that the correct version passes and the wrong
+version fails.
+
+### Usage
+
+```
+python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
+                     [-ms MODEL_SPECIFIER] [-bmp BASELINE_MODEL_PATH]
+                     [-cmp COLLAPSED_MODEL_PATH] [-p PATH] [-t TASKS] [-lt]
+                     [-r RESTARTS] [-ns NUM_STEPS] [-sw SEARCH_WIDTH] [-b BATCH_SIZE]
+                     [-k TOPK] [-nr N_REPLACE] [-osi OPTIM_STR_INIT] [-ana]
+                     [-lb LAMBDA_BASE] [-m MARGIN] [-mc MU_CORRECT] [-ve VERIFY_EVERY]
+                     [-mnt MAX_NEW_TOKENS] [-rp REPETITION_PENALTY] [-et EXEC_TIMEOUT]
+                     [-ne] [-sos] [-s SEED]
+```
+
+| Argument | Short | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `--device` | `-dx` | str | `cuda` | Device to run on. Unlike the other scripts this defaults to `cuda`; CPU works but is impractically slow. |
+| `--collapsed_generation` | `-cg` | int | `9` | Collapse generation to attack. `run_baseline.py -ng 10` produces indices 0–9, so the **10th generation is index 9**. |
+| `--block_size` | `-bs` | int | auto | Effective block size baked into the checkpoint names. Omit to auto-discover by globbing; required only when several block sizes exist side by side. |
+| `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Baseline model, and the tokenizer used for both models. |
+| `--baseline_model_path` | `-bmp` | str | `--model_specifier` | Explicit override for the baseline model. |
+| `--collapsed_model_path` | `-cmp` | str | resolved | Explicit override for the collapsed model, bypassing generation/block-size resolution. |
+| `--path` | `-p` | str | `""` (cwd) | Root directory containing `model_outputs/`; must match the baseline run. |
+| `--tasks` | `-t` | str | all | Comma-separated task names to attack. |
+| `--list_tasks` | `-lt` | flag | off | Print the available tasks and exit. |
+| `--restarts` | `-r` | int | `3` | Random suffix re-initializations per task (restart 0 uses `--optim_str_init`). |
+| `--num_steps` | `-ns` | int | `250` | Optimizer steps per restart. |
+| `--search_width` | `-sw` | int | `256` | Candidate suffixes sampled per step. |
+| `--batch_size` | `-b` | int | `16` | Candidates scored per forward pass; halved automatically on OOM. |
+| `--topk` | `-k` | int | `256` | Top-k tokens per position taken from the gradient. |
+| `--n_replace` | `-nr` | int | `1` | Suffix positions mutated per candidate. |
+| `--optim_str_init` | `-osi` | str | `"x x ... x"` (20 tokens) | Initial suffix; its token count also sets the length of the random restarts. |
+| `--allow_non_ascii` | `-ana` | flag | off | Allow non-ASCII tokens in the suffix. |
+| `--lambda_base` | `-lb` | float | `1.0` | Weight λ of the baseline-must-not-break hinge. Raise if the baseline keeps breaking too. |
+| `--margin` | `-m` | float | `3.0` | Loss margin the baseline must keep from the wrong code. |
+| `--mu_correct` | `-mc` | float | `0.5` | Weight μ of the baseline-stays-correct anchor; `0` disables that term (and its extra forward/backward pass). |
+| `--verify_every` | `-ve` | int | `10` | Run the behavioural check every N steps. Lower catches hits earlier but costs two generations plus two subprocesses each time. |
+| `--max_new_tokens` | `-mnt` | int | `96` | Decoding budget during verification. |
+| `--repetition_penalty` | `-rp` | float | `1.0` | Decoding repetition penalty during verification (the dataset generation scripts use `3.0`; `1.0` is plain greedy decoding). |
+| `--exec_timeout` | `-et` | float | `10.0` | Per-candidate unit-test timeout in seconds. |
+| `--no_exec` | `-ne` | flag | off | Never execute generated code. Disables behavioural verification, leaving loss-only scoring that does **not** establish wrong behaviour. |
+| `--stop_on_success` | `-sos` | flag | off | Stop a task as soon as a selective hit is verified. |
+| `--seed` | `-s` | int | `1337` | RNG seed. |
+
+### Examples
+
+Attack the 10th collapse generation on all tasks:
+
+```bash
+python run_attack.py --device cuda --collapsed_generation 9 --path ./runs/baseline
+```
+
+Quick single-task run that stops at the first verified hit:
+
+```bash
+python run_attack.py --device cuda -cg 9 -t is_even -ns 100 -r 1 -sos -p ./runs/baseline
+```
+
+Push harder on selectivity when the baseline keeps breaking alongside the collapsed model:
+
+```bash
+python run_attack.py --device cuda -cg 9 --lambda_base 4.0 --margin 6.0 \
+    --mu_correct 1.0 -p ./runs/baseline
+```
+
+Sweep the collapse generations to see when the timebomb becomes triggerable:
+
+```bash
+for gen in 1 3 5 7 9; do
+  python run_attack.py --device cuda -cg $gen -t add -ns 150 -r 2 -p ./runs/baseline
+done
+```
+
+### Outputs
+
+* ```<path>/attack_results/attack_gen<gen>_<model_name>.json``` — resolved model paths, the full
+  config, and per task: the control verdict, every verified selective hit (suffix, step, both
+  models' raw completions, extracted code and test status), the best objective value, and the
+  loss trajectory of every restart.
+
+A console summary prints per-task hit counts along with the winning suffix and the wrong code the
+collapsed model produced.
+
+### Notes and limitations
+
+* **Model loading differs from the other scripts.** GCG needs gradients w.r.t. input embeddings, so
+  models are loaded with plain ```transformers``` rather than Unsloth — the merged
+  ```model_<gen>_bs<bs>_<name>_fp16``` checkpoints are used directly, and a bare LoRA adapter
+  directory is merged via ```peft``` as a fallback. The Unsloth import-order rule of the other
+  scripts therefore does not apply to this file.
+* **Prefix KV caching is not used**, unlike [utils/gcg.py](utils/gcg.py). Three objectives across
+  two models make the cache bookkeeping error-prone; OOM is handled by batch-size backoff instead.
+* **Executing generated code.** Verification runs model output in an isolated subprocess
+  (```python -I```) with a timeout. Use ```--no_exec``` to disable execution entirely.
+* **Both models must share a tokenizer.** The contrastive gradient sums one-hot gradients from both
+  models, so a vocabulary mismatch is rejected at startup.
+* **Getting to the transfer setting.** The attack as written needs a real collapsed checkpoint.
+  ```run_extrapolation.py``` produces *datasets*, not checkpoints, so there is no extrapolated model
+  to attack directly. The practical route is to fine-tune a model on
+  ```generated_dataset_<N>_bs<bs>_<name>_ex``` and pass it via ```--collapsed_model_path```, then
+  re-verify the resulting suffix against the real ```model_<N>``` checkpoint. Optimizing directly
+  against `base + n * (collapsed − base)` would instead require differentiating through the
+  extrapolation processor.
