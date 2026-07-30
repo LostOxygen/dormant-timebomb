@@ -33,6 +33,22 @@ greedily decode the adversarial prompt, the emitted code is extracted and execut
 tests in a subprocess, and a hit is only recorded when the collapsed model's code fails the
 tests and the baseline model's code passes them.
 
+Capability gate
+---------------
+Before any optimization runs, ``capability_gate`` probes both models on the clean, suffix-free
+prompts. The attack claim is "the adversarial input flipped a correct answer into a wrong one",
+which is only available for tasks the collapsed model already solves *unaided*. Late collapse
+generations eventually lose code generation altogether, and against such a model every prompt
+yields failing code — every apparent "hit" would then measure collapse, not the attack. So:
+
+* tasks the collapsed model does not solve cleanly are excluded from the search, and
+* if it solves fewer than ``--min_capability`` of the probed tasks, the run is stopped outright
+  rather than producing unattributable results.
+
+"Solves cleanly" means the unit tests pass — not merely that the code avoided a wrong answer, so
+empty output, unparseable code and timeouts all count as incapable. The probe verdicts are cached
+and reused as each task's control, so the clean prompts are decoded only once.
+
 Two deliberate deviations from ``utils/gcg.py``:
 
 * Models are loaded with plain ``transformers``, not Unsloth. GCG needs gradients w.r.t. input
@@ -64,7 +80,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Optional
 
 import psutil
 import torch
@@ -326,7 +341,7 @@ class TargetModel:
             param.requires_grad_(False)
         self._logits_kwarg = self._detect_logits_kwarg()
 
-    def _detect_logits_kwarg(self) -> optional[str]:
+    def _detect_logits_kwarg(self) -> str | None:
         """Finds the kwarg that limits how many logit positions are materialized.
 
         Renamed across transformers versions (`num_logits_to_keep` -> `logits_to_keep`).
@@ -484,10 +499,35 @@ class TaskOutcome:
     task: str
     control: dict[str, str] = field(default_factory=dict)
     successes: list[dict] = field(default_factory=list)
-    best_objective: optional[float] = None
-    best_suffix: optional[str] = None
+    best_objective: float | None = None
+    best_suffix: str | None = None
     history: list[dict] = field(default_factory=list)
-    skipped: optional[str] = None
+    skipped: str | None = None
+
+
+@dataclass
+class CapabilityReport:
+    """Outcome of the upfront suffix-free capability probe.
+
+    The attack claim is "the adversarial input flipped a correct answer into a wrong one". That
+    claim is only available for tasks the collapsed model solves *without* any adversarial input.
+    A model collapsed far enough to have lost code generation altogether would produce failing
+    code for every prompt, and every "hit" against it would be an artifact of collapse rather
+    than of the attack — so the run is aborted instead.
+    """
+
+    per_task: dict[str, dict] = field(default_factory=dict)
+    collapsed_solved: list[str] = field(default_factory=list)
+    collapsed_broken: list[str] = field(default_factory=list)
+    baseline_broken: list[str] = field(default_factory=list)
+    invalid_tasks: list[str] = field(default_factory=list)
+    usable: list[str] = field(default_factory=list)
+    n_probed: int = 0
+    capability: float = 0.0
+    threshold: float = 0.0
+    aborted: bool = False
+    reason: str = ""
+    skipped: bool = False
 
 
 class ContrastiveGCG:
@@ -502,6 +542,8 @@ class ContrastiveGCG:
         self.not_allowed_ids = (
             None if cfg.allow_non_ascii else get_nonascii_toks(tokenizer, device=self.device)
         )
+        # clean-prompt verdicts cached by capability_gate and reused as per-task controls
+        self._controls: dict[str, dict] = {}
 
     # ── prompt construction ──
     def split_prompt(self, task: AttackTask) -> tuple[str, str]:
@@ -600,33 +642,128 @@ class ContrastiveGCG:
             and verdict["baseline_status"] == "pass"
         )
 
+    # ── upfront capability gate ──
+    def capability_gate(self, tasks: list[AttackTask], min_capability: float) -> CapabilityReport:
+        """Probes both models on the clean, suffix-free prompts before any optimization.
+
+        Runs once per invocation, ahead of the search, and answers a prerequisite question: would
+        the collapsed model have produced *correct* code without the adversarial input? Only tasks
+        where it would can support the claim that the adversarial input flipped a correct answer
+        into a wrong one. If the collapsed model solves fewer than `min_capability` of the probed
+        tasks it has lost code generation as such, and the whole run is aborted — a "hit" against
+        a model that fails everything anyway measures collapse, not the attack.
+
+        The verdicts are cached so `run_task` reuses them as its control instead of decoding the
+        clean prompts a second time.
+
+        Args:
+            tasks (list[AttackTask]): the tasks selected on the CLI
+            min_capability (float): fraction of tasks the collapsed model must solve, in [0, 1]
+
+        Returns:
+            CapabilityReport: per-task verdicts, the capability ratio, and the abort decision
+        """
+        report = CapabilityReport(threshold=min_capability)
+        self._controls = {}
+
+        if self.cfg.no_exec:
+            # without execution there is no ground truth to gate on
+            report.skipped = True
+            report.reason = "--no_exec: capability cannot be established without running code"
+            report.usable = [t.name for t in tasks]
+            return report
+
+        for task in tasks:
+            # the tests must actually separate the two reference implementations, otherwise the
+            # probe below measures nothing
+            if run_unit_tests(task.correct_code, task, self.cfg.exec_timeout) != "pass":
+                report.invalid_tasks.append(task.name)
+                report.per_task[task.name] = {"invalid": "correct_code fails its own tests"}
+                continue
+            if run_unit_tests(task.wrong_code, task, self.cfg.exec_timeout) not in WRONG_STATUSES:
+                report.invalid_tasks.append(task.name)
+                report.per_task[task.name] = {"invalid": "wrong_code passes the tests"}
+                continue
+
+            before_str, after_str = self.split_prompt(task)
+            verdict = self.verify(task, before_str, after_str, "")
+            self._controls[task.name] = verdict
+            report.per_task[task.name] = verdict
+            report.n_probed += 1
+
+            col, base = verdict["collapsed_status"], verdict["baseline_status"]
+            if col == "pass":
+                report.collapsed_solved.append(task.name)
+            else:
+                report.collapsed_broken.append(task.name)
+            if base != "pass":
+                report.baseline_broken.append(task.name)
+            if col == "pass" and base == "pass":
+                report.usable.append(task.name)
+
+            marker = f"{TColors.OKGREEN}ok{TColors.ENDC}" if col == "pass" else (
+                f"{TColors.FAIL}broken{TColors.ENDC}"
+            )
+            print(
+                f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s} -> "
+                f"collapsed {marker}"
+            )
+
+        if report.n_probed == 0:
+            report.aborted = True
+            report.reason = (
+                "no task survived reference validation, so the collapsed model was never probed"
+            )
+            return report
+
+        report.capability = len(report.collapsed_solved) / report.n_probed
+        if report.capability < min_capability:
+            report.aborted = True
+            report.reason = (
+                f"the collapsed model solved {len(report.collapsed_solved)}/{report.n_probed} "
+                f"clean tasks ({report.capability:.0%}), below the required "
+                f"{min_capability:.0%} — it is no longer capable of generating correct code, so "
+                f"any wrong output cannot be attributed to an adversarial input"
+            )
+        elif not report.usable:
+            report.aborted = True
+            report.reason = (
+                "no task is attackable: every task the collapsed model solves is one the "
+                "baseline model does not"
+            )
+        return report
+
     # ── main loop ──
     def run_task(self, task: AttackTask, restarts: int) -> TaskOutcome:
-        """Runs the full search (all restarts) for one task."""
+        """Runs the full search (all restarts) for one task.
+
+        Assumes `capability_gate` has already vetted the task; its cached clean-prompt verdict is
+        reused as this task's control.
+        """
         outcome = TaskOutcome(task=task.name)
         before_str, after_str = self.split_prompt(task)
 
-        # sanity check: the tests must actually separate the two reference implementations
-        if not self.cfg.no_exec:
-            if run_unit_tests(task.correct_code, task, self.cfg.exec_timeout) != "pass":
-                outcome.skipped = "reference correct_code does not pass its own tests"
-                return outcome
-            if run_unit_tests(task.wrong_code, task, self.cfg.exec_timeout) not in WRONG_STATUSES:
-                outcome.skipped = "reference wrong_code passes the tests"
-                return outcome
-
-        # control: no suffix at all. If the collapsed model is already broken here, any
-        # "success" later would not be attributable to the adversarial input.
-        outcome.control = self.verify(task, before_str, after_str, "")
-        ctrl_base = outcome.control["baseline_status"]
-        ctrl_col = outcome.control["collapsed_status"]
-        print(f"##   control (no suffix): baseline={ctrl_base} collapsed={ctrl_col}")
-        if not self.cfg.no_exec and outcome.control["collapsed_status"] in WRONG_STATUSES:
-            outcome.skipped = "collapsed model already fails without any adversarial input"
-            return outcome
-        if not self.cfg.no_exec and outcome.control["baseline_status"] != "pass":
-            outcome.skipped = "baseline model does not solve the task even without a suffix"
-            return outcome
+        outcome.control = self._controls.get(task.name, {})
+        if not outcome.control and not self.cfg.no_exec:
+            # defensive: run_task called without a preceding gate
+            outcome.control = self.verify(task, before_str, after_str, "")
+        if outcome.control:
+            ctrl_base = outcome.control.get("baseline_status", "unknown")
+            ctrl_col = outcome.control.get("collapsed_status", "unknown")
+            print(f"##   control (no suffix): baseline={ctrl_base} collapsed={ctrl_col}")
+            if not self.cfg.no_exec:
+                if ctrl_col != "pass":
+                    outcome.skipped = (
+                        f"collapsed model does not solve this task without an adversarial "
+                        f"input (status: {ctrl_col})"
+                    )
+                    return outcome
+                if ctrl_base != "pass":
+                    outcome.skipped = (
+                        f"baseline model does not solve this task even without a suffix "
+                        f"(status: {ctrl_base})"
+                    )
+                    return outcome
 
         before_ids = self._ids(before_str)
         after_ids = self._ids(after_str)
@@ -754,7 +891,7 @@ class ContrastiveGCG:
 
 
 # ──────────────────────────────── model loading ───────────────────────────────────────────
-def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: optional[int]) -> str:
+def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: int | None) -> str:
     """Locates the collapsed checkpoint directory written by ``run_baseline.py``.
 
     ``run_baseline.py`` bakes the *effective* block size (raised to the dataset's longest
@@ -765,7 +902,7 @@ def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: opti
     Args:
         generation (int): collapse generation index
         specifier_name (str): trailing component of the model specifier
-        block_size (optional[int]): effective block size, or None to auto-discover
+        block_size (int | None): effective block size, or None to auto-discover
 
     Returns:
         str: path to a merged fp16 directory, or to the LoRA adapter directory as a fallback
@@ -840,7 +977,7 @@ def _hr(offset: int = 0) -> str:
 def main(
     device: str = "cuda",
     collapsed_generation: int = 9,
-    block_size: Optional[int] = None,
+    block_size: int | None = None,
     model_specifier: str = "",
     baseline_model_path: str = "",
     collapsed_model_path: str = "",
@@ -863,6 +1000,8 @@ def main(
     exec_timeout: float = 10.0,
     no_exec: bool = False,
     stop_on_success: bool = False,
+    min_capability: float = 0.6,
+    skip_capability_check: bool = False,
     seed: int = 1337,
     list_tasks: bool = False,
 ) -> None:
@@ -872,7 +1011,7 @@ def main(
     Args:
         device (str): device to run the computations on (cuda recommended)
         collapsed_generation (int): collapse generation to attack (9 = 10th generation)
-        block_size (optional[int]): effective block size in the checkpoint names; auto-detected
+        block_size (int | None): effective block size in the checkpoint names; auto-detected
         model_specifier (str): base/baseline model specifier
         baseline_model_path (str): explicit override for the baseline model
         collapsed_model_path (str): explicit override for the collapsed model
@@ -895,6 +1034,9 @@ def main(
         exec_timeout (float): per-candidate unit-test timeout in seconds
         no_exec (bool): never execute generated code (disables behavioural verification)
         stop_on_success (bool): stop a task as soon as a selective hit is verified
+        min_capability (float): fraction of clean tasks the collapsed model must still solve
+            before the attack is allowed to start
+        skip_capability_check (bool): do not abort the run when the capability gate fails
         seed (int): RNG seed
         list_tasks (bool): print the available tasks and exit
 
@@ -995,6 +1137,10 @@ def main(
         f"+ {mu_correct} * CE_base(correct)"
     )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Execute generated code{TColors.ENDC}: {not no_exec}")
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Min. Collapsed Capability{TColors.ENDC}: "
+        f"{min_capability:.0%}" + (" (not enforced)" if skip_capability_check else "")
+    )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Results Path{TColors.ENDC}: {RESULTS_PATH}")
     print(_hr() + "\n")
 
@@ -1054,17 +1200,88 @@ def main(
     )
     attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg)
 
-    # ──────────────────────────── run the search ─────────────────────────
+    # ──────────────────── upfront capability gate ─────────────────────
+    # Before optimizing anything, establish that the collapsed model can still write correct
+    # code unaided. Without that, wrong output is a symptom of collapse rather than of the attack.
+    print(
+        f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Capability Probe"
+        f"{TColors.ENDC} " + _hr(21)
+    )
+    print("##   clean prompts, no adversarial input — can the collapsed model still solve them?")
+    capability = attack.capability_gate(selected, min_capability)
+
+    if capability.skipped:
+        print(f"##   {TColors.WARNING}not probed{TColors.ENDC}: {capability.reason}")
+    else:
+        print(
+            f"##   collapsed model capability: "
+            f"{len(capability.collapsed_solved)}/{capability.n_probed} tasks "
+            f"({capability.capability:.0%}), required >= {min_capability:.0%}"
+        )
+        if capability.invalid_tasks:
+            print("##   invalid tasks (bad references): " + ", ".join(capability.invalid_tasks))
+        if capability.baseline_broken:
+            print(
+                "##   baseline cannot solve: "
+                + ", ".join(capability.baseline_broken)
+                + " (not attackable)"
+            )
+    print(_hr() + "\n")
+
     outcomes: list[TaskOutcome] = []
-    for task in selected:
-        print(f"\n## {TColors.HEADER}{TColors.BOLD}Task: {task.name}{TColors.ENDC} " + _hr(12))
-        outcome = attack.run_task(task, restarts)
-        if outcome.skipped:
-            print(f"## {TColors.WARNING}skipped{TColors.ENDC}: {outcome.skipped}")
-        outcomes.append(outcome)
+    proceed = True
+    if capability.aborted:
+        if skip_capability_check:
+            print(
+                f"{TColors.WARNING}Warning{TColors.ENDC}: capability gate failed "
+                f"({capability.reason}) but --skip_capability_check was given; continuing on "
+                f"whatever tasks remain attackable.\n"
+            )
+        else:
+            print(
+                f"## {TColors.FAIL}{TColors.BOLD}ATTACK STOPPED{TColors.ENDC}: "
+                f"{capability.reason}"
+            )
+            print(
+                f"## {TColors.OKCYAN}Attack an earlier collapse generation (lower "
+                f"--collapsed_generation), lower --min_capability, or pass "
+                f"--skip_capability_check to override.{TColors.ENDC}\n"
+            )
+            proceed = False
+
+    # ──────────────────────────── run the search ─────────────────────────
+    if proceed:
+        attackable = [t for t in selected if t.name in capability.usable]
+        for task in selected:
+            if task not in attackable:
+                verdict = capability.per_task.get(task.name, {})
+                col = verdict.get("collapsed_status", "unknown")
+                base = verdict.get("baseline_status", "unknown")
+                reason = verdict.get("invalid") or (
+                    f"collapsed={col}, baseline={base} on the clean prompt"
+                )
+                outcomes.append(
+                    TaskOutcome(
+                        task=task.name,
+                        control=verdict if "invalid" not in verdict else {},
+                        skipped=f"excluded by the capability probe ({reason})",
+                    )
+                )
+                continue
+            print(f"\n## {TColors.HEADER}{TColors.BOLD}Task: {task.name}{TColors.ENDC} " + _hr(12))
+            outcome = attack.run_task(task, restarts)
+            if outcome.skipped:
+                print(f"## {TColors.WARNING}skipped{TColors.ENDC}: {outcome.skipped}")
+            outcomes.append(outcome)
 
     # ──────────────────────────── report and save ─────────────────────────
     print(f"\n## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Summary{TColors.ENDC} " + _hr(11))
+    if not proceed:
+        print(
+            f"## {TColors.FAIL}attack not run{TColors.ENDC}: the collapsed model failed the "
+            f"capability probe"
+        )
+        print(f"##   {capability.reason}")
     for outcome in outcomes:
         if outcome.skipped:
             status = f"{TColors.WARNING}skipped ({outcome.skipped}){TColors.ENDC}"
@@ -1090,6 +1307,8 @@ def main(
                 "collapsed_model": collapsed_dir,
                 "collapsed_generation": collapsed_generation,
                 "config": cfg.__dict__,
+                "aborted": capability.aborted and not skip_capability_check,
+                "capability_probe": capability.__dict__,
                 "results": [outcome.__dict__ for outcome in outcomes],
             },
             handle,
@@ -1292,6 +1511,22 @@ if __name__ == "__main__":
         "-sos",
         action="store_true",
         help="stop a task as soon as a selective hit is verified",
+    )
+    parser.add_argument(
+        "--min_capability",
+        "-mcap",
+        type=float,
+        default=0.6,
+        help="fraction of clean (suffix-free) tasks the collapsed model must still solve before "
+        "the attack starts; below this the model is considered incapable of generating code "
+        "and the run is stopped (default: 0.6)",
+    )
+    parser.add_argument(
+        "--skip_capability_check",
+        "-scc",
+        action="store_true",
+        help="do not stop the run when the capability probe fails; per-task exclusion of "
+        "tasks the collapsed model already gets wrong still applies",
     )
     parser.add_argument(
         "--seed",

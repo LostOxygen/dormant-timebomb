@@ -227,9 +227,31 @@ instead.
 Because the loss is only a proxy, every candidate is periodically verified behaviourally: both
 models greedily decode the adversarial prompt, the code is extracted and executed against unit
 tests, and a **selective hit** is recorded only when the collapsed model's code *fails* the tests
-and the baseline model's code *passes* them. Each task also runs a suffix-free control first — if
-the collapsed model already fails without any adversarial input, the task is skipped, since a later
-"success" would not be attributable to the attack.
+and the baseline model's code *passes* them.
+
+### The capability gate
+
+Before any optimization runs, both models are probed on the clean, suffix-free prompts. The attack
+claim is *"the adversarial input flipped a correct answer into a wrong one"*, and that claim is only
+available for tasks the collapsed model already solves **unaided**. Late collapse generations
+eventually lose code generation altogether; against such a model every prompt yields failing code,
+so every apparent "hit" would measure collapse rather than the attack. Therefore:
+
+* tasks the collapsed model does not solve cleanly are **excluded** from the search (as are tasks
+  the *baseline* gets wrong — there is no correct behaviour to preserve), and
+* if the collapsed model solves fewer than `--min_capability` of the probed tasks (default 60%), the
+  run is **stopped outright** with a diagnosis instead of producing unattributable results.
+
+"Solves cleanly" means the unit tests pass — not merely that the output avoided a wrong answer — so
+empty output, unparseable code and timeouts all count as incapable. Tasks whose own reference
+implementations do not separate correct from wrong are reported as invalid and excluded from the
+ratio. The probe verdicts are cached and reused as each task's control, so the clean prompts are
+decoded only once.
+
+This is the expected way to discover the usable range of collapse generations: sweep `-cg` upward
+until the gate stops the run, and the last generation that passes is the deepest one where a
+timebomb claim is meaningful. `--skip_capability_check` overrides only the run-level stop; per-task
+exclusion always applies, since attacking a task the collapsed model already fails proves nothing.
 
 The built-in tasks (`--list_tasks`) are five trivially testable functions — `is_even`, `add`,
 `absolute_value`, `max_of_two`, `list_length` — each paired with a specific wrong implementation
@@ -246,7 +268,7 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
                      [-k TOPK] [-nr N_REPLACE] [-osi OPTIM_STR_INIT] [-ana]
                      [-lb LAMBDA_BASE] [-m MARGIN] [-mc MU_CORRECT] [-ve VERIFY_EVERY]
                      [-mnt MAX_NEW_TOKENS] [-rp REPETITION_PENALTY] [-et EXEC_TIMEOUT]
-                     [-ne] [-sos] [-s SEED]
+                     [-ne] [-sos] [-mcap MIN_CAPABILITY] [-scc] [-s SEED]
 ```
 
 | Argument | Short | Type | Default | Description |
@@ -275,8 +297,10 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--max_new_tokens` | `-mnt` | int | `96` | Decoding budget during verification. |
 | `--repetition_penalty` | `-rp` | float | `1.0` | Decoding repetition penalty during verification (the dataset generation scripts use `3.0`; `1.0` is plain greedy decoding). |
 | `--exec_timeout` | `-et` | float | `10.0` | Per-candidate unit-test timeout in seconds. |
-| `--no_exec` | `-ne` | flag | off | Never execute generated code. Disables behavioural verification, leaving loss-only scoring that does **not** establish wrong behaviour. |
+| `--no_exec` | `-ne` | flag | off | Never execute generated code. Disables behavioural verification **and the capability gate**, leaving loss-only scoring that does **not** establish wrong behaviour. |
 | `--stop_on_success` | `-sos` | flag | off | Stop a task as soon as a selective hit is verified. |
+| `--min_capability` | `-mcap` | float | `0.6` | Fraction of clean, suffix-free tasks the collapsed model must still solve before the attack is allowed to start. Below this it is treated as no longer capable of generating code and the run is stopped. |
+| `--skip_capability_check` | `-scc` | flag | off | Do not stop the run when the capability probe fails. Per-task exclusion of tasks the collapsed model already gets wrong still applies. |
 | `--seed` | `-s` | int | `1337` | RNG seed. |
 
 ### Examples
@@ -300,7 +324,8 @@ python run_attack.py --device cuda -cg 9 --lambda_base 4.0 --margin 6.0 \
     --mu_correct 1.0 -p ./runs/baseline
 ```
 
-Sweep the collapse generations to see when the timebomb becomes triggerable:
+Sweep the collapse generations to see when the timebomb becomes triggerable — the gate stops the
+runs where the collapsed model has degraded past the point of writing correct code at all:
 
 ```bash
 for gen in 1 3 5 7 9; do
@@ -308,12 +333,27 @@ for gen in 1 3 5 7 9; do
 done
 ```
 
+Probe capability only, without spending anything on the search (0 steps still runs the gate):
+
+```bash
+python run_attack.py --device cuda -cg 9 -ns 0 -r 1 -p ./runs/baseline
+```
+
+Attack a deeply collapsed model anyway, on whatever tasks it can still solve:
+
+```bash
+python run_attack.py --device cuda -cg 9 --min_capability 0.2 -p ./runs/baseline
+python run_attack.py --device cuda -cg 9 --skip_capability_check -p ./runs/baseline
+```
+
 ### Outputs
 
 * ```<path>/attack_results/attack_gen<gen>_<model_name>.json``` — resolved model paths, the full
-  config, and per task: the control verdict, every verified selective hit (suffix, step, both
-  models' raw completions, extracted code and test status), the best objective value, and the
-  loss trajectory of every restart.
+  config, an ```aborted``` flag and the ```capability_probe``` report (per-task clean verdicts, the
+  capability ratio, which tasks were excluded and why), and per task: the control verdict, every
+  verified selective hit (suffix, step, both models' raw completions, extracted code and test
+  status), the best objective value, and the loss trajectory of every restart.
 
-A console summary prints per-task hit counts along with the winning suffix and the wrong code the
-collapsed model produced.
+The JSON is written even when the capability gate stops the run, so a stopped run is still evidence
+about how far the model has collapsed. A console summary prints the capability ratio, then per-task
+hit counts along with the winning suffix and the wrong code the collapsed model produced.
