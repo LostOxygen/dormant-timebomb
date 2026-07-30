@@ -317,24 +317,3 @@ done
 
 A console summary prints per-task hit counts along with the winning suffix and the wrong code the
 collapsed model produced.
-
-### Notes and limitations
-
-* **Model loading differs from the other scripts.** GCG needs gradients w.r.t. input embeddings, so
-  models are loaded with plain ```transformers``` rather than Unsloth — the merged
-  ```model_<gen>_bs<bs>_<name>_fp16``` checkpoints are used directly, and a bare LoRA adapter
-  directory is merged via ```peft``` as a fallback. The Unsloth import-order rule of the other
-  scripts therefore does not apply to this file.
-* **Prefix KV caching is not used**, unlike [utils/gcg.py](utils/gcg.py). Three objectives across
-  two models make the cache bookkeeping error-prone; OOM is handled by batch-size backoff instead.
-* **Executing generated code.** Verification runs model output in an isolated subprocess
-  (```python -I```) with a timeout. Use ```--no_exec``` to disable execution entirely.
-* **Both models must share a tokenizer.** The contrastive gradient sums one-hot gradients from both
-  models, so a vocabulary mismatch is rejected at startup.
-* **Getting to the transfer setting.** The attack as written needs a real collapsed checkpoint.
-  ```run_extrapolation.py``` produces *datasets*, not checkpoints, so there is no extrapolated model
-  to attack directly. The practical route is to fine-tune a model on
-  ```generated_dataset_<N>_bs<bs>_<name>_ex``` and pass it via ```--collapsed_model_path```, then
-  re-verify the resulting suffix against the real ```model_<N>``` checkpoint. Optimizing directly
-  against `base + n * (collapsed − base)` would instead require differentiating through the
-  extrapolation processor.
