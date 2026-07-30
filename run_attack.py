@@ -64,7 +64,6 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Dict, List, Optional, Tuple
 
 import psutil
 import torch
@@ -88,7 +87,7 @@ RESULTS_PATH: str = "./attack_results/"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
 
 # statuses returned by the unit-test harness that count as objectively wrong behaviour
-WRONG_STATUSES: Tuple[str, ...] = ("fail", "fail_exception")
+WRONG_STATUSES: tuple[str, ...] = ("fail", "fail_exception")
 
 
 # ────────────────────────────────── attack tasks ──────────────────────────────────────────
@@ -114,7 +113,7 @@ class AttackTask:
     tests: str
 
 
-TASKS: List[AttackTask] = [
+TASKS: list[AttackTask] = [
     AttackTask(
         name="is_even",
         func="is_even",
@@ -326,7 +325,7 @@ class TargetModel:
             param.requires_grad_(False)
         self._logits_kwarg = self._detect_logits_kwarg()
 
-    def _detect_logits_kwarg(self) -> Optional[str]:
+    def _detect_logits_kwarg(self) -> optional[str]:
         """Finds the kwarg that limits how many logit positions are materialized.
 
         Renamed across transformers versions (`num_logits_to_keep` -> `logits_to_keep`).
@@ -377,7 +376,7 @@ class TargetModel:
                 target_ids=target_ids,
             )
 
-    def loss_and_grad(self, optim_ids: Tensor, seg: Segments) -> Tuple[float, Tensor]:
+    def loss_and_grad(self, optim_ids: Tensor, seg: Segments) -> tuple[float, Tensor]:
         """Loss and its gradient w.r.t. the one-hot suffix matrix.
 
         Args:
@@ -482,12 +481,12 @@ class TaskOutcome:
     """Everything the search learned about one task."""
 
     task: str
-    control: Dict[str, str] = field(default_factory=dict)
-    successes: List[dict] = field(default_factory=list)
-    best_objective: Optional[float] = None
-    best_suffix: Optional[str] = None
-    history: List[dict] = field(default_factory=list)
-    skipped: Optional[str] = None
+    control: dict[str, str] = field(default_factory=dict)
+    successes: list[dict] = field(default_factory=list)
+    best_objective: optional[float] = None
+    best_suffix: optional[str] = None
+    history: list[dict] = field(default_factory=list)
+    skipped: optional[str] = None
 
 
 class ContrastiveGCG:
@@ -504,7 +503,7 @@ class ContrastiveGCG:
         )
 
     # ── prompt construction ──
-    def split_prompt(self, task: AttackTask) -> Tuple[str, str]:
+    def split_prompt(self, task: AttackTask) -> tuple[str, str]:
         """Renders the chat template and splits it at the adversarial-suffix slot."""
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -524,7 +523,7 @@ class ContrastiveGCG:
         ].to(self.device)
 
     # ── objective ──
-    def objective(self, cand_ids: Tensor, segs: dict) -> Dict[str, Tensor]:
+    def objective(self, cand_ids: Tensor, segs: dict) -> dict[str, Tensor]:
         """Exact contrastive objective for a batch of candidate suffixes (lower is better)."""
         col_wrong = self.collapsed.candidate_losses(
             cand_ids, segs["col_wrong"], self.cfg.batch_size
@@ -548,7 +547,7 @@ class ContrastiveGCG:
             "base_correct": base_correct,
         }
 
-    def combined_gradient(self, optim_ids: Tensor, segs: dict) -> Tuple[Tensor, dict]:
+    def combined_gradient(self, optim_ids: Tensor, segs: dict) -> tuple[Tensor, dict]:
         """Gradient of the contrastive objective w.r.t. the one-hot suffix matrix."""
         l_col, g_col = self.collapsed.loss_and_grad(optim_ids, segs["col_wrong"])
         l_base_w, g_base_w = self.baseline.loss_and_grad(optim_ids, segs["base_wrong"])
@@ -570,7 +569,7 @@ class ContrastiveGCG:
     # ── verification ──
     def verify(
         self, task: AttackTask, before_str: str, after_str: str, suffix: str
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """Decodes with both models and decides correctness behaviourally.
 
         The prompt is reassembled as a *string* and retokenized as a whole, so it is exactly
@@ -593,7 +592,7 @@ class ContrastiveGCG:
         return result
 
     @staticmethod
-    def is_selective_hit(verdict: Dict[str, str]) -> bool:
+    def is_selective_hit(verdict: dict[str, str]) -> bool:
         """True iff the collapsed model is objectively wrong and the baseline is correct."""
         return (
             verdict["collapsed_status"] in WRONG_STATUSES
@@ -754,7 +753,7 @@ class ContrastiveGCG:
 
 
 # ──────────────────────────────── model loading ───────────────────────────────────────────
-def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: Optional[int]) -> str:
+def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: optional[int]) -> str:
     """Locates the collapsed checkpoint directory written by ``run_baseline.py``.
 
     ``run_baseline.py`` bakes the *effective* block size (raised to the dataset's longest
@@ -765,7 +764,7 @@ def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: Opti
     Args:
         generation (int): collapse generation index
         specifier_name (str): trailing component of the model specifier
-        block_size (Optional[int]): effective block size, or None to auto-discover
+        block_size (optional[int]): effective block size, or None to auto-discover
 
     Returns:
         str: path to a merged fp16 directory, or to the LoRA adapter directory as a fallback
@@ -840,7 +839,7 @@ def _hr(offset: int = 0) -> str:
 def main(
     device: str = "cuda",
     collapsed_generation: int = 9,
-    block_size: Optional[int] = None,
+    block_size: optional[int] = None,
     model_specifier: str = "",
     baseline_model_path: str = "",
     collapsed_model_path: str = "",
@@ -872,7 +871,7 @@ def main(
     Args:
         device (str): device to run the computations on (cuda recommended)
         collapsed_generation (int): collapse generation to attack (9 = 10th generation)
-        block_size (Optional[int]): effective block size in the checkpoint names; auto-detected
+        block_size (optional[int]): effective block size in the checkpoint names; auto-detected
         model_specifier (str): base/baseline model specifier
         baseline_model_path (str): explicit override for the baseline model
         collapsed_model_path (str): explicit override for the collapsed model
@@ -1055,7 +1054,7 @@ def main(
     attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg)
 
     # ──────────────────────────── run the search ─────────────────────────
-    outcomes: List[TaskOutcome] = []
+    outcomes: list[TaskOutcome] = []
     for task in selected:
         print(f"\n## {TColors.HEADER}{TColors.BOLD}Task: {task.name}{TColors.ENDC} " + _hr(12))
         outcome = attack.run_task(task, restarts)
