@@ -64,6 +64,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
+from typing import Optional
 
 import psutil
 import torch
@@ -839,7 +840,7 @@ def _hr(offset: int = 0) -> str:
 def main(
     device: str = "cuda",
     collapsed_generation: int = 9,
-    block_size: optional[int] = None,
+    block_size: Optional[int] = None,
     model_specifier: str = "",
     baseline_model_path: str = "",
     collapsed_model_path: str = "",
