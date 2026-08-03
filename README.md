@@ -379,6 +379,60 @@ models greedily decode the adversarial prompt, the code is extracted and execute
 tests, and a **selective hit** is recorded only when the collapsed model's code *fails* the tests
 and the baseline model's code *passes* them.
 
+### Transfer mode: attacking a generation you do not have
+
+By default the search optimizes against the real collapsed checkpoint, which assumes the attacker
+has it. The interesting claim is the weaker one, and it is the reason step 2 exists: an attacker who
+only holds the pristine base model and the **first** collapsed model can still build a working
+adversarial input for generation `n`. `--surrogate_method` enables that.
+
+The model in the "collapsed" role of the objective becomes a first-order surrogate for generation
+`n = --collapsed_generation + 1` — the same indexing step 2 uses, so a surrogate built here and a
+dataset generated there describe the same generation. The real checkpoint is loaded but **held
+back**: it never enters the objective and never contributes a gradient, only a verdict. Every
+behavioural check then produces a three-way result:
+
+| model | required | meaning |
+| --- | --- | --- |
+| baseline | must stay **correct** | the suffix must not work on the pristine model |
+| surrogate | must **break** | the suffix works on what it was optimized against |
+| real collapsed | should **break** too | the suffix transfers to a checkpoint never seen |
+
+A **transfer hit** requires all three. The two available surrogates:
+
+* `--surrogate_method logit` — `l_ex = l_base + n * (l_col0 - l_base)` evaluated inside the forward
+  pass. It is differentiable through both models, so GCG optimizes against it exactly as against a
+  real checkpoint. There is no artifact on disk; `ExtrapolatedModel` *is* the model. Two forward
+  passes per candidate. The tilt itself comes from
+  [utils/extrapolation.py](utils/extrapolation.py) — the same function step 2 generates its
+  datasets with, so the attack cannot be optimized against a different surrogate than the one the
+  histograms characterize.
+* `--surrogate_method lora` — the collapse adapter with its alpha scaled by `n`, i.e. the same
+  first-order step taken in weight space. One forward pass, and it yields a real loadable
+  checkpoint. Built on demand from generation 0's adapter, or pass step 2's
+  `model_scaled_n<n>_*` directory via `--surrogate_model_path`.
+
+`--surrogate_method data` is **rejected with an explanation**, not silently accepted. The data-space
+surrogate is the base model with a narrowed sampling support, and GCG's objective is a teacher-forced
+cross-entropy that does not involve sampling — its loss and gradient are identical to the base
+model's, so optimizing against it would optimize against the model the attack is required *not* to
+break. It is a corpus-level surrogate; the attack needs a model-level one.
+
+The headline number is the **transfer rate**: of the suffixes that selectively broke the surrogate,
+how many also broke the real model. The ones that did not are recorded as `transfer_misses` rather
+than dropped — they are the surrogate's error rate, and they are what distinguishes a working method
+from a lucky one. Reported alongside it:
+
+* `n_baseline_broken` — suffixes that leaked to the pristine model. Must be 0 for the attack to be
+  selective at all; a high transfer rate with a nonzero value here is a plain jailbreak.
+* `agreement` — how often the surrogate and the real model agree on wrong-vs-correct across *all*
+  verifications, not just the hits. This is the direct measure of how good the surrogate is.
+* `n_validation_only` — suffixes that broke the real model but not the surrogate, i.e. transfer the
+  surrogate failed to predict.
+
+Since a transfer rate over two hits means nothing, the counts are reported rather than the ratio
+alone, and a run that found no surrogate hit at all says so explicitly.
+
 ### The capability gate
 
 Before any optimization runs, both models are probed on the clean, suffix-free prompts. The attack
@@ -403,6 +457,11 @@ until the gate stops the run, and the last generation that passes is the deepest
 timebomb claim is meaningful. `--skip_capability_check` overrides only the run-level stop; per-task
 exclusion always applies, since attacking a task the collapsed model already fails proves nothing.
 
+In transfer mode the gate probes **three** models and a task is only attackable if the baseline, the
+surrogate and the real collapsed model all solve it cleanly. Without the third condition a "transfer"
+would be indistinguishable from collapse the real model already suffers from — it would fail the task
+with or without a suffix.
+
 The built-in tasks (`--list_tasks`) are five trivially testable functions — `is_even`, `add`,
 `absolute_value`, `square`, `list_length` — each paired with a specific wrong implementation
 (e.g. `n % 2 == 1` for `is_even`) and assertions that the correct version passes and the wrong
@@ -419,12 +478,18 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
                      [-lb LAMBDA_BASE] [-m MARGIN] [-mc MU_CORRECT] [-ve VERIFY_EVERY]
                      [-mnt MAX_NEW_TOKENS] [-rp REPETITION_PENALTY] [-et EXEC_TIMEOUT]
                      [-ne] [-sos] [-mcap MIN_CAPABILITY] [-scc] [-s SEED]
+                     [-sm SURROGATE_METHOD] [-sf SURROGATE_FACTOR]
+                     [-smp SURROGATE_MODEL_PATH] [-fcp FIRST_COLLAPSED_PATH]
 ```
 
 | Argument | Short | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `--device` | `-dx` | str | `cuda` | Device to run on. Unlike the other scripts this defaults to `cuda`; CPU works but is impractically slow. |
 | `--collapsed_generation` | `-cg` | int | `9` | Collapse generation to attack. `run_baseline.py -ng 10` produces indices 0–9, so the **10th generation is index 9**. |
+| `--surrogate_method` | `-sm` | str | `none` | `none` optimizes against the real checkpoint. `logit` or `lora` enable transfer mode (see above); `data` is rejected with an explanation. |
+| `--surrogate_factor` | `-sf` | float | `0.0` | Extrapolation factor `n` the surrogate stands for. `0.0` derives it as `--collapsed_generation + 1`, which is the factor matching the validated checkpoint. |
+| `--surrogate_model_path` | `-smp` | str | built | Prebuilt surrogate to use instead of building one, e.g. step 2's `model_scaled_n<n>_*` directory (`lora` only). |
+| `--first_collapsed_path` | `-fcp` | str | resolved | Explicit path to the generation-0 model the surrogate is built from. The `lora` method needs the **adapter**, not the merged `_fp16` copy. |
 | `--block_size` | `-bs` | int | auto | Effective block size baked into the checkpoint names. Omit to auto-discover by globbing; required only when several block sizes exist side by side. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Baseline model, and the tokenizer used for both models. |
 | `--baseline_model_path` | `-bmp` | str | `--model_specifier` | Explicit override for the baseline model. |
@@ -496,6 +561,46 @@ python run_attack.py --device cuda -cg 9 --min_capability 0.2 -p ./runs/baseline
 python run_attack.py --device cuda -cg 9 --skip_capability_check -p ./runs/baseline
 ```
 
+**Transfer mode.** Attack generation 9 without ever optimizing against it — the suffix is found on a
+weight-space surrogate built from generation 0 alone, then validated against the real checkpoint:
+
+```bash
+python run_attack.py --device cuda -cg 9 --surrogate_method lora -p ./runs/baseline
+```
+
+The same with the logit-space surrogate, which needs no adapter but two forward passes per candidate:
+
+```bash
+python run_attack.py --device cuda -cg 9 --surrogate_method logit -p ./runs/baseline
+```
+
+Reuse the scaled adapter step 2 already built instead of rebuilding it:
+
+```bash
+python run_attack.py --device cuda -cg 9 --surrogate_method lora \
+    --surrogate_model_path ./runs/baseline/model_outputs/model_scaled_n10_bs2048_Qwen2.5-Coder-0.5B-Instruct \
+    -p ./runs/baseline
+```
+
+Compare the direct attack against both surrogates on the same generation — the direct run is the
+upper bound the surrogates are measured against:
+
+```bash
+for m in none logit lora; do
+  python run_attack.py --device cuda -cg 9 --surrogate_method "$m" \
+      -t add -ns 150 -r 2 -p ./runs/baseline
+done
+```
+
+Measure how far out the surrogates stay usable by sweeping the generation:
+
+```bash
+for gen in 1 3 5 7 9; do
+  python run_attack.py --device cuda -cg $gen --surrogate_method lora \
+      -t add -ns 150 -r 2 -p ./runs/baseline
+done
+```
+
 ### Outputs
 
 * ```<path>/attack_results/attack_gen<gen>_<model_name>.json``` — resolved model paths, the full
@@ -503,7 +608,14 @@ python run_attack.py --device cuda -cg 9 --skip_capability_check -p ./runs/basel
   capability ratio, which tasks were excluded and why), and per task: the control verdict, every
   verified selective hit (suffix, step, both models' raw completions, extracted code and test
   status), the best objective value, and the loss trajectory of every restart.
+* In transfer mode the file is suffixed with the method
+  (```attack_gen<gen>_<model_name>_<method>_surrogate.json```) so the direct and surrogate runs of the
+  same generation do not overwrite each other. It additionally carries the ```transfer``` block (the
+  counts, transfer rate, agreement and per-task breakdown), the surrogate's description and factor,
+  and per task a ```verifications``` list of every three-way verdict plus ```transfer_misses``` —
+  the suffixes that broke the surrogate but not the real model.
 
 The JSON is written even when the capability gate stops the run, so a stopped run is still evidence
 about how far the model has collapsed. A console summary prints the capability ratio, then per-task
-hit counts along with the winning suffix and the wrong code the collapsed model produced.
+hit counts along with the winning suffix and the wrong code the collapsed model produced; transfer
+runs add a `Transfer` section with the rate, the surrogate/real agreement and the baseline-leak count.

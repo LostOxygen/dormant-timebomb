@@ -36,7 +36,12 @@ from transformers import (
 )
 
 from utils.colors import TColors
-from utils.extrapolation import METHODS, dataset_suffix, surrogate_top_p
+from utils.extrapolation import (
+    METHODS,
+    dataset_suffix,
+    extrapolate_logits,
+    surrogate_top_p,
+)
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -134,37 +139,10 @@ class UnslothExtrapolationProcessor(LogitsProcessor):
                 logits_gen1 = outputs.logits[:, -1, :]
                 self.past_key_values = outputs.past_key_values
 
-        # 1. Work in float32. generate() already upcasts the logits before it calls the
-        # processors, so this is a no-op there, but it also makes the arithmetic below
-        # independent of the dtype the scores happen to arrive in
-        scores_f32 = scores.to(torch.float32)
-        logits_gen1_f32 = logits_gen1.to(torch.float32)
-
-        # 2. Tokens that an earlier processor already forbade carry -inf, e.g. the EOS
-        # suppression of min_new_tokens. They have to stay forbidden and have to be kept out of
-        # the arithmetic, since -inf + n * (finite + inf) evaluates to NaN
-        forbidden = torch.isneginf(scores_f32)
-        base_scores = scores_f32.masked_fill(forbidden, 0.0)
-
-        # 3. Apply the N-generation extrapolation math
-        collapse_vector = logits_gen1_f32 - base_scores
-        extrapolated_scores = base_scores + (self.generation_n * collapse_vector)
-
-        # 4. Put the forbidden tokens back and treat a NaN out of either model as forbidden as
-        # well. Mapping a NaN onto logit 0.0 instead would drop it into the middle of the
-        # distribution and leave it perfectly sampleable
-        extrapolated_scores = extrapolated_scores.masked_fill(
-            forbidden | torch.isnan(extrapolated_scores), float("-inf")
-        )
-
-        # 5. No clamping. Softmax is shift invariant and torch computes it by subtracting the
-        # row maximum first, so a large logit cannot overflow exp() and there is nothing to
-        # guard against. Clamping to a fixed range instead tied every token above the ceiling
-        # at the ceiling and flattened everything below the floor onto the floor, which for a
-        # large n is most of the vocabulary: it destroyed exactly the ranking the extrapolation
-        # produces and left the sampler picking near uniformly among the saturated tokens.
-        # The scores stay float32 so that the value range cannot overflow the dtype either
-        return extrapolated_scores
+        # the extrapolation itself lives in utils/extrapolation.py, so that this script and the
+        # differentiable surrogate that run_attack.py optimizes against cannot drift apart. It
+        # also handles the -inf of already forbidden tokens, NaNs, and the absence of clamping
+        return extrapolate_logits(scores, logits_gen1, self.generation_n)
 
 
 parser = argparse.ArgumentParser(description="Data Generation")

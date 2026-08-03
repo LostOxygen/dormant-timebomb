@@ -33,10 +33,46 @@ greedily decode the adversarial prompt, the emitted code is extracted and execut
 tests in a subprocess, and a hit is only recorded when the collapsed model's code fails the
 tests and the baseline model's code passes them.
 
+Transfer mode (``--surrogate_method``)
+-------------------------------------
+By default the search optimizes against the real collapsed checkpoint, which assumes the attacker
+has it. The interesting claim is the weaker one: an attacker who only has the pristine base model
+and the *first* collapsed model can still build a working adversarial input for generation `n`.
+``--surrogate_method logit`` or ``lora`` enables that. The model in the "collapsed" role becomes a
+first-order surrogate for generation `n = --collapsed_generation + 1`, built from those two
+anchors alone, and the real checkpoint of the same generation is loaded but **held back** — it is
+never part of the objective and never contributes a gradient, only a verdict. Every behavioural
+check then yields a three-way verdict:
+
+    baseline    must stay correct  — the suffix must not work on the pristine model
+    surrogate   must break         — the suffix works on what it was optimized against
+    validation  should break too   — the suffix transfers to the checkpoint never seen
+
+A "transfer hit" requires all three. The two surrogates are:
+
+* ``logit`` — ``l_ex = l_base + n * (l_col0 - l_base)`` evaluated inside the forward pass, so it
+  is differentiable through both models and GCG optimizes against it exactly as against a real
+  checkpoint. No model artifact exists; ``ExtrapolatedModel`` is the model.
+* ``lora`` — the collapse adapter with its alpha scaled by `n`, i.e. the same first-order step
+  taken in weight space. Yields a real loadable checkpoint and needs only one forward pass.
+
+``data`` is deliberately rejected: the data-space surrogate is the base model with a narrowed
+sampling support, and GCG's teacher-forced cross-entropy does not involve sampling, so its loss
+and gradient are identical to the base model's. Optimizing against it would optimize against the
+model the attack is required *not* to break.
+
+The headline number is the **transfer rate**: of the suffixes that selectively broke the
+surrogate, how many also broke the real model. The ones that did not are recorded as
+``transfer_misses`` rather than dropped — they are the surrogate's error rate. Alongside it,
+``n_baseline_broken`` counts suffixes that leaked to the pristine model and must be 0 for the
+attack to be selective at all.
+
 Capability gate
 ---------------
 Before any optimization runs, ``capability_gate`` probes both models on the clean, suffix-free
-prompts. The attack claim is "the adversarial input flipped a correct answer into a wrong one",
+prompts. In transfer mode the real collapsed checkpoint is probed as well, and a task is only
+attackable if the baseline, the surrogate and the real model all solve it cleanly — otherwise a
+"transfer" would be indistinguishable from collapse the real model already suffers from. The attack claim is "the adversarial input flipped a correct answer into a wrong one",
 which is only available for tasks the collapsed model already solves *unaided*. Late collapse
 generations eventually lose code generation altogether, and against such a model every prompt
 yields failing code — every apparent "hit" would then measure collapse, not the attack. So:
@@ -86,9 +122,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
+    RepetitionPenaltyLogitsProcessor,
+)
 
 from utils.colors import TColors
+from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.utils import (
     INIT_CHARS,
@@ -467,6 +510,89 @@ class TargetModel:
         return tokenizer.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
 
 
+class _LogitExtrapolationProcessor(LogitsProcessor):
+    """Applies the logit-space tilt at every decoding step, for `ExtrapolatedModel.complete`.
+
+    No KV cache is kept for the generation-0 model: it is re-run over the whole sequence at
+    every step, which is O(L^2) instead of O(L). That is deliberate — verification runs on a
+    handful of prompts every ``--verify_every`` steps with a small ``--max_new_tokens``, and
+    cache bookkeeping for a second model is exactly the kind of thing that silently produces a
+    mis-conditioned model rather than an error.
+    """
+
+    def __init__(self, first_model, factor: float):
+        self.first_model = first_model
+        self.factor = factor
+
+    def __call__(self, input_ids: Tensor, scores: Tensor) -> Tensor:
+        # `complete` decodes a single prompt, so there is no padding and no mask to honour
+        with torch.no_grad():
+            logits = self.first_model(input_ids=input_ids).logits[:, -1, :]
+        return extrapolate_logits(scores, logits, self.factor)
+
+
+class ExtrapolatedModel(TargetModel):
+    """A surrogate for collapse generation `n`, built from the base and generation-0 models.
+
+    This is the model an *attacker* has: the pristine base model and the first collapsed model
+    are both obtainable, generation `n` is not. The first-order extrapolation
+
+        l_ex = l_base + n * (l_col0 - l_base)
+
+    is a differentiable function of the input embeddings through both models, so GCG can
+    optimize a suffix against it exactly as against a real checkpoint — the gradient w.r.t. the
+    one-hot suffix matrix flows through both forward passes.
+
+    Overriding ``_tail_logits`` is enough for the loss and gradient paths, since
+    ``target_losses``, ``loss_and_grad`` and ``candidate_losses`` all route through it. The
+    embedding matrix is taken from the base model, which is exact here: ``run_baseline.py``
+    adapts only the attention and MLP projections, so every collapse generation shares the base
+    ``embed_tokens`` and feeding the same ``inputs_embeds`` to both models is well defined.
+    """
+
+    def __init__(self, label: str, base_model, first_collapsed_model, factor: float, device):
+        super().__init__(label, base_model, device)
+        # a plain TargetModel purely for its _tail_logits / _logits_kwarg handling
+        self.first = TargetModel(f"{label}:gen0", first_collapsed_model, device)
+        self.factor = float(factor)
+
+    def _tail_logits(self, embeds: Tensor, n_target: int) -> Tensor:
+        base_logits = super()._tail_logits(embeds, n_target)
+        first_logits = self.first._tail_logits(embeds, n_target)
+        return extrapolate_logits(base_logits, first_logits, self.factor)
+
+    def complete(
+        self,
+        tokenizer,
+        prompt: str,
+        max_new_tokens: int,
+        repetition_penalty: float = 1.0,
+    ) -> str:
+        """Greedily decodes with the tilt applied at every step.
+
+        The repetition penalty is applied *after* the tilt. Left to ``generate()`` it would
+        penalize the base scores before the extrapolation while the generation-0 logits stay
+        raw, which works out to ``(1 - n) * penalized_base + n * raw_col`` — the penalty cancels
+        at n = 1 and inverts for n > 1.
+        """
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+        processors = [_LogitExtrapolationProcessor(self.first.model, self.factor)]
+        if repetition_penalty != 1.0:
+            processors.append(RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty))
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                # 1.0 keeps generate() from building its own penalty processor, which would run
+                # before the tilt. The penalty is in `processors` instead
+                repetition_penalty=1.0,
+                logits_processor=LogitsProcessorList(processors),
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        return tokenizer.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
+
+
 # ─────────────────────────────── contrastive search ───────────────────────────────────────
 @dataclass
 class SearchConfig:
@@ -499,6 +625,11 @@ class TaskOutcome:
     task: str
     control: dict[str, str] = field(default_factory=dict)
     successes: list[dict] = field(default_factory=list)
+    # one trimmed record per behavioural check — statuses only, so the transfer statistics can
+    # be recomputed from the result file without storing every raw completion
+    verifications: list[dict] = field(default_factory=list)
+    # selective hits that did *not* carry over to the real collapsed model (transfer mode)
+    transfer_misses: list[dict] = field(default_factory=list)
     best_objective: float | None = None
     best_suffix: str | None = None
     history: list[dict] = field(default_factory=list)
@@ -520,6 +651,9 @@ class CapabilityReport:
     collapsed_solved: list[str] = field(default_factory=list)
     collapsed_broken: list[str] = field(default_factory=list)
     baseline_broken: list[str] = field(default_factory=list)
+    # transfer mode only: the real collapsed model has to be capable too, otherwise "the
+    # suffix broke it" is a statement about collapse and not about the transfer
+    validation_broken: list[str] = field(default_factory=list)
     invalid_tasks: list[str] = field(default_factory=list)
     usable: list[str] = field(default_factory=list)
     n_probed: int = 0
@@ -530,12 +664,77 @@ class CapabilityReport:
     skipped: bool = False
 
 
-class ContrastiveGCG:
-    """Searches for a suffix that breaks the collapsed model but not the baseline model."""
+@dataclass
+class TransferReport:
+    """How well suffixes found against the surrogate carry over to the real collapsed model.
 
-    def __init__(self, baseline: TargetModel, collapsed: TargetModel, tokenizer, cfg: SearchConfig):
+    This is the actual claim of the transfer mode, so it is reported as counts rather than as a
+    single number: a high transfer rate over two hits means very little.
+
+    Attributes:
+        method: the surrogate method used for the optimization
+        factor: the extrapolation factor n the surrogate stands for
+        surrogate_model: what the surrogate was built from
+        validation_model: the real collapsed checkpoint it is validated against
+        n_verified: verifications performed in total
+        n_surrogate_hits: verified selective hits against the surrogate (baseline stayed correct)
+        n_transferred: of those, how many also broke the real collapsed model
+        n_not_transferred: of those, how many left the real collapsed model correct
+        n_baseline_broken: verifications where the suffix broke the *baseline* — the attack
+            leaking to the pristine model, which is a failure of selectivity
+        n_validation_only: verifications that broke the real collapsed model but not the
+            surrogate, i.e. transfer the surrogate did not predict
+        agreement: fraction of verifications where surrogate and real collapsed model agree on
+            wrong-vs-correct, over all verifications
+        per_task: the same counts per task
+    """
+
+    method: str = "none"
+    factor: float = 0.0
+    surrogate_model: str = ""
+    validation_model: str = ""
+    n_verified: int = 0
+    n_surrogate_hits: int = 0
+    n_transferred: int = 0
+    n_not_transferred: int = 0
+    n_baseline_broken: int = 0
+    n_validation_only: int = 0
+    agreement: float = 0.0
+    per_task: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def transfer_rate(self) -> float:
+        """Fraction of surrogate hits that also break the real collapsed model."""
+        if self.n_surrogate_hits == 0:
+            return 0.0
+        return self.n_transferred / self.n_surrogate_hits
+
+
+class ContrastiveGCG:
+    """Searches for a suffix that breaks the collapsed model but not the baseline model.
+
+    In transfer mode the model in the `collapsed` role is a *surrogate* for the collapse
+    generation (see `ExtrapolatedModel` and the `lora` method) and `validation` holds the real
+    checkpoint of the same generation. The optimizer never touches `validation` — that is the
+    point of the mode: the attacker does not have it. It is only decoded during the behavioural
+    check, so that every verified suffix yields a three-way verdict:
+
+        baseline    must stay correct  — the attack must not work on the pristine model
+        surrogate   must break         — the attack works on what was optimized against
+        validation  should break too   — the attack transfers to the model never seen
+    """
+
+    def __init__(
+        self,
+        baseline: TargetModel,
+        collapsed: TargetModel,
+        tokenizer,
+        cfg: SearchConfig,
+        validation: TargetModel | None = None,
+    ):
         self.baseline = baseline
         self.collapsed = collapsed
+        self.validation = validation
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.device = collapsed.device
@@ -544,6 +743,18 @@ class ContrastiveGCG:
         )
         # clean-prompt verdicts cached by capability_gate and reused as per-task controls
         self._controls: dict[str, dict] = {}
+
+    @property
+    def transfer_mode(self) -> bool:
+        """True when a real collapsed checkpoint is held back for validation only."""
+        return self.validation is not None
+
+    def _verified_models(self) -> tuple:
+        """The (label, model) pairs the behavioural check decodes with."""
+        models = [("baseline", self.baseline), ("collapsed", self.collapsed)]
+        if self.validation is not None:
+            models.append(("validation", self.validation))
+        return tuple(models)
 
     # ── prompt construction ──
     def split_prompt(self, task: AttackTask) -> tuple[str, str]:
@@ -622,7 +833,7 @@ class ContrastiveGCG:
         """
         prompt = before_str + suffix + after_str
         result = {}
-        for label, model in (("baseline", self.baseline), ("collapsed", self.collapsed)):
+        for label, model in self._verified_models():
             raw = model.complete(
                 self.tokenizer, prompt, self.cfg.max_new_tokens, self.cfg.repetition_penalty
             )
@@ -640,6 +851,19 @@ class ContrastiveGCG:
         return (
             verdict["collapsed_status"] in WRONG_STATUSES
             and verdict["baseline_status"] == "pass"
+        )
+
+    @staticmethod
+    def is_transfer_hit(verdict: dict[str, str]) -> bool:
+        """True iff a selective hit on the surrogate also breaks the real collapsed model.
+
+        This is the transfer mode's success criterion, and it is strictly stronger than
+        `is_selective_hit`: the suffix has to leave the pristine baseline correct, break the
+        surrogate it was optimized against, *and* break a checkpoint the optimizer never saw.
+        """
+        return (
+            ContrastiveGCG.is_selective_hit(verdict)
+            and verdict.get("validation_status") in WRONG_STATUSES
         )
 
     # ── upfront capability gate ──
@@ -698,15 +922,25 @@ class ContrastiveGCG:
                 report.collapsed_broken.append(task.name)
             if base != "pass":
                 report.baseline_broken.append(task.name)
-            if col == "pass" and base == "pass":
+
+            # in transfer mode the real checkpoint has to solve the task cleanly as well.
+            # Otherwise it fails the task with or without the suffix and a "transfer" would be
+            # indistinguishable from the collapse it already suffers from
+            val = verdict.get("validation_status")
+            if val is not None and val != "pass":
+                report.validation_broken.append(task.name)
+
+            usable = col == "pass" and base == "pass" and (val is None or val == "pass")
+            if usable:
                 report.usable.append(task.name)
 
             marker = f"{TColors.OKGREEN}ok{TColors.ENDC}" if col == "pass" else (
                 f"{TColors.FAIL}broken{TColors.ENDC}"
             )
+            validation_column = "" if val is None else f" validation={val:15s}"
             print(
-                f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s} -> "
-                f"collapsed {marker}"
+                f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s}"
+                f"{validation_column} -> collapsed {marker}"
             )
 
         if report.n_probed == 0:
@@ -726,11 +960,80 @@ class ContrastiveGCG:
                 f"any wrong output cannot be attributed to an adversarial input"
             )
         elif not report.usable:
-            report.aborted = True
-            report.reason = (
-                "no task is attackable: every task the collapsed model solves is one the "
-                "baseline model does not"
-            )
+            if self.transfer_mode:
+                report.aborted = True
+                report.reason = (
+                    "no task is attackable: no task is solved cleanly by the baseline, the "
+                    "surrogate and the real collapsed model at the same time"
+                )
+            else:
+                report.aborted = True
+                report.reason = (
+                    "no task is attackable: every task the collapsed model solves is one the "
+                    "baseline model does not"
+                )
+        return report
+
+    # ── transfer accounting ──
+    def transfer_report(self, outcomes: list[TaskOutcome]) -> TransferReport:
+        """Aggregates the three-way verdicts of every verification into transfer statistics.
+
+        Args:
+            outcomes (list[TaskOutcome]): the per-task results of the search
+
+        Returns:
+            TransferReport: counts over all verifications, in total and per task
+        """
+        report = TransferReport()
+        agreements = 0
+
+        for outcome in outcomes:
+            counts = {
+                "n_verified": 0,
+                "n_surrogate_hits": 0,
+                "n_transferred": 0,
+                "n_not_transferred": 0,
+                "n_baseline_broken": 0,
+                "n_validation_only": 0,
+            }
+            for verdict in outcome.verifications:
+                surrogate_wrong = verdict.get("collapsed_status") in WRONG_STATUSES
+                validation_wrong = verdict.get("validation_status") in WRONG_STATUSES
+                baseline_ok = verdict.get("baseline_status") == "pass"
+
+                counts["n_verified"] += 1
+                if not baseline_ok:
+                    counts["n_baseline_broken"] += 1
+                if surrogate_wrong and baseline_ok:
+                    counts["n_surrogate_hits"] += 1
+                    if validation_wrong:
+                        counts["n_transferred"] += 1
+                    else:
+                        counts["n_not_transferred"] += 1
+                if validation_wrong and not surrogate_wrong:
+                    counts["n_validation_only"] += 1
+                if surrogate_wrong == validation_wrong:
+                    agreements += 1
+
+            if counts["n_verified"]:
+                counts["transfer_rate"] = (
+                    counts["n_transferred"] / counts["n_surrogate_hits"]
+                    if counts["n_surrogate_hits"]
+                    else 0.0
+                )
+                report.per_task[outcome.task] = counts
+                for key in (
+                    "n_verified",
+                    "n_surrogate_hits",
+                    "n_transferred",
+                    "n_not_transferred",
+                    "n_baseline_broken",
+                    "n_validation_only",
+                ):
+                    setattr(report, key, getattr(report, key) + counts[key])
+
+        if report.n_verified:
+            report.agreement = agreements / report.n_verified
         return report
 
     # ── main loop ──
@@ -750,7 +1053,11 @@ class ContrastiveGCG:
         if outcome.control:
             ctrl_base = outcome.control.get("baseline_status", "unknown")
             ctrl_col = outcome.control.get("collapsed_status", "unknown")
-            print(f"##   control (no suffix): baseline={ctrl_base} collapsed={ctrl_col}")
+            ctrl_val = outcome.control.get("validation_status")
+            control_line = f"##   control (no suffix): baseline={ctrl_base} collapsed={ctrl_col}"
+            if ctrl_val is not None:
+                control_line += f" validation={ctrl_val}"
+            print(control_line)
             if not self.cfg.no_exec:
                 if ctrl_col != "pass":
                     outcome.skipped = (
@@ -762,6 +1069,13 @@ class ContrastiveGCG:
                     outcome.skipped = (
                         f"baseline model does not solve this task even without a suffix "
                         f"(status: {ctrl_base})"
+                    )
+                    return outcome
+                if self.transfer_mode and ctrl_val != "pass":
+                    outcome.skipped = (
+                        f"the real collapsed model does not solve this task without a suffix "
+                        f"(status: {ctrl_val}), so a transfer could not be attributed to the "
+                        f"adversarial input"
                     )
                     return outcome
 
@@ -865,6 +1179,20 @@ class ContrastiveGCG:
             due = (step + 1) % self.cfg.verify_every == 0 or step == self.cfg.num_steps - 1
             if due and not self.cfg.no_exec:
                 verdict = self.verify(task, before_str, after_str, suffix)
+
+                # every check is recorded, not just the hits: the transfer statistics need the
+                # verdicts where the surrogate broke and the real model did not just as much
+                record = {
+                    "restart": restart,
+                    "step": step,
+                    "suffix": suffix,
+                    "baseline_status": verdict["baseline_status"],
+                    "collapsed_status": verdict["collapsed_status"],
+                }
+                if self.transfer_mode:
+                    record["validation_status"] = verdict["validation_status"]
+                outcome.verifications.append(record)
+
                 if self.is_selective_hit(verdict):
                     hit = {
                         "restart": restart,
@@ -876,22 +1204,50 @@ class ContrastiveGCG:
                         "base_correct": base_correct,
                         **verdict,
                     }
-                    outcome.successes.append(hit)
                     hit_col = verdict["collapsed_status"]
                     hit_base = verdict["baseline_status"]
-                    progress.write(
-                        f"## {TColors.OKGREEN}{TColors.BOLD}SELECTIVE HIT{TColors.ENDC} "
-                        f"[{task.name}] step {step}: collapsed={hit_col} "
-                        f"baseline={hit_base} | suffix={suffix!r}"
-                    )
-                    if self.cfg.stop_on_success:
-                        break
+
+                    if not self.transfer_mode:
+                        outcome.successes.append(hit)
+                        progress.write(
+                            f"## {TColors.OKGREEN}{TColors.BOLD}SELECTIVE HIT{TColors.ENDC} "
+                            f"[{task.name}] step {step}: collapsed={hit_col} "
+                            f"baseline={hit_base} | suffix={suffix!r}"
+                        )
+                        if self.cfg.stop_on_success:
+                            break
+                    else:
+                        # a hit on the surrogate is only a success if it also breaks the real
+                        # checkpoint the optimizer never saw. The ones that do not are kept
+                        # separately rather than dropped — they are the method's error rate
+                        hit_val = verdict["validation_status"]
+                        if self.is_transfer_hit(verdict):
+                            outcome.successes.append(hit)
+                            progress.write(
+                                f"## {TColors.OKGREEN}{TColors.BOLD}TRANSFER HIT{TColors.ENDC} "
+                                f"[{task.name}] step {step}: baseline={hit_base} "
+                                f"surrogate={hit_col} real={hit_val} | suffix={suffix!r}"
+                            )
+                            if self.cfg.stop_on_success:
+                                break
+                        else:
+                            outcome.transfer_misses.append(hit)
+                            progress.write(
+                                f"## {TColors.WARNING}no transfer{TColors.ENDC} "
+                                f"[{task.name}] step {step}: baseline={hit_base} "
+                                f"surrogate={hit_col} real={hit_val}"
+                            )
 
         progress.close()
 
 
 # ──────────────────────────────── model loading ───────────────────────────────────────────
-def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: int | None) -> str:
+def resolve_collapsed_dir(
+    generation: int,
+    specifier_name: str,
+    block_size: int | None,
+    prefer_adapter: bool = False,
+) -> str:
     """Locates the collapsed checkpoint directory written by ``run_baseline.py``.
 
     ``run_baseline.py`` bakes the *effective* block size (raised to the dataset's longest
@@ -903,17 +1259,23 @@ def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: int 
         generation (int): collapse generation index
         specifier_name (str): trailing component of the model specifier
         block_size (int | None): effective block size, or None to auto-discover
+        prefer_adapter (bool): look for the LoRA adapter directory before the merged fp16 one.
+            The `lora` surrogate needs the adapter, since it works by scaling its alpha
 
     Returns:
         str: path to a merged fp16 directory, or to the LoRA adapter directory as a fallback
+            (the other way round with `prefer_adapter`)
 
     Raises:
         FileNotFoundError: nothing matched
         RuntimeError: several block sizes matched
     """
+    order = ("", "_fp16") if prefer_adapter else ("_fp16", "")
+
     if block_size is not None:
         exact = os.path.join(MODEL_PATH, f"model_{generation}_bs{block_size}_{specifier_name}")
-        for cand in (f"{exact}_fp16", exact):
+        for suffix in order:
+            cand = f"{exact}{suffix}"
             if os.path.isdir(cand):
                 return cand
         raise FileNotFoundError(
@@ -921,7 +1283,7 @@ def resolve_collapsed_dir(generation: int, specifier_name: str, block_size: int 
             f"--block_size / --model_specifier / --path"
         )
 
-    for suffix in ("_fp16", ""):
+    for suffix in order:
         pattern = os.path.join(MODEL_PATH, f"model_{generation}_bs*_{specifier_name}{suffix}")
         matches = sorted(d for d in glob.glob(pattern) if os.path.isdir(d))
         if suffix == "":
@@ -969,6 +1331,73 @@ def load_model(path: str, device: torch.device, dtype: torch.dtype, base_for_ada
     return model.merge_and_unload()
 
 
+def build_surrogate(
+    method: str,
+    factor: float,
+    baseline: TargetModel,
+    first_collapsed_dir: str,
+    surrogate_model_path: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[TargetModel, str]:
+    """Builds the surrogate for collapse generation `n` that the search optimizes against.
+
+    Both surrogates are first-order steps from the same two anchors an attacker can actually
+    obtain — the pristine base model and the *first* collapsed model — and differ only in the
+    space the step is taken in.
+
+    Args:
+        method (str): "logit" or "lora"
+        factor (float): the extrapolation factor n, i.e. collapsed_generation + 1
+        baseline (TargetModel): the already loaded pristine base model. The `logit` surrogate
+            reuses its weights instead of loading a second copy
+        first_collapsed_dir (str): directory of the generation-0 collapsed model
+        surrogate_model_path (str): a prebuilt surrogate to use instead of building one, e.g.
+            the ``model_scaled_n<n>_*`` directory that ``run_extrapolation.py --method lora``
+            writes. Ignored by the `logit` method, which has no on-disk artifact
+        device (torch.device): device to place the models on
+        dtype (torch.dtype): dtype to load with
+
+    Returns:
+        tuple: (the surrogate as a TargetModel, a human readable description of what it is)
+
+    Raises:
+        SystemExit: for the `data` method, which cannot serve as an attack surrogate
+    """
+    if method == "data":
+        raise SystemExit(
+            f"{TColors.FAIL}--surrogate_method data is not a valid attack surrogate."
+            f"{TColors.ENDC}\nThe data-space surrogate is the *base model* sampled with a "
+            "narrowed support. GCG optimizes a teacher-forced cross-entropy, which does not "
+            "involve sampling at all, so its loss and gradient are identical to the base "
+            "model's — optimizing against it would optimize against the model the attack is "
+            "required *not* to break. It is a corpus-level surrogate; the attack needs a "
+            "model-level one. Use --surrogate_method logit or lora."
+        )
+
+    if method == "lora":
+        # scaling the collapse adapter's alpha by n yields the weights
+        # W_base + n * (W_collapsed - W_base), i.e. the first order step in weight space
+        if surrogate_model_path:
+            path = surrogate_model_path
+            description = f"prebuilt adapter {path}"
+        else:
+            path = os.path.join(MODEL_PATH, f"attack_surrogate_n{factor:g}")
+            build_scaled_adapter(
+                adapter_path=first_collapsed_dir, factor=factor, output_path=path
+            )
+            description = f"{first_collapsed_dir} with alpha x {factor:g}"
+        model = load_model(path, device, dtype, base_for_adapter=MODEL_SPECIFIER)
+        return TargetModel("surrogate", model, device), description
+
+    # "logit": no artifact on disk, the tilt is applied inside the forward pass
+    first_model = load_model(
+        first_collapsed_dir, device, dtype, base_for_adapter=MODEL_SPECIFIER
+    )
+    surrogate = ExtrapolatedModel("surrogate", baseline.model, first_model, factor, device)
+    return surrogate, f"base + {factor:g} * ({first_collapsed_dir} - base)"
+
+
 def _hr(offset: int = 0) -> str:
     """Terminal-width rule that also works when stdout is redirected."""
     return "#" * max(20, shutil.get_terminal_size((100, 24)).columns - offset)
@@ -1004,6 +1433,10 @@ def main(
     skip_capability_check: bool = False,
     seed: int = 1337,
     list_tasks: bool = False,
+    surrogate_method: str = "none",
+    surrogate_factor: float = 0.0,
+    surrogate_model_path: str = "",
+    first_collapsed_path: str = "",
 ) -> None:
     """
     Searches for selective adversarial inputs against a collapsed model.
@@ -1039,6 +1472,17 @@ def main(
         skip_capability_check (bool): do not abort the run when the capability gate fails
         seed (int): RNG seed
         list_tasks (bool): print the available tasks and exit
+        surrogate_method (str): "none" attacks the real collapsed checkpoint directly. "logit"
+            or "lora" enables transfer mode: the suffix is optimized against a surrogate built
+            from the base and generation-0 models only, and the real checkpoint of the same
+            generation is held back for validation
+        surrogate_factor (float): the extrapolation factor n the surrogate stands for. 0.0
+            derives it as collapsed_generation + 1, which is the value that matches the
+            checkpoint being validated against
+        surrogate_model_path (str): a prebuilt surrogate to use instead of building one, e.g.
+            run_extrapolation.py's model_scaled_n<n>_* directory ("lora" only)
+        first_collapsed_path (str): explicit path to the generation-0 collapsed model the
+            surrogate is built from (default: resolved from the model outputs)
 
     Returns:
         None
@@ -1081,6 +1525,26 @@ def main(
         collapsed_generation, specifier_name, block_size
     )
 
+    # ── transfer mode setup ──
+    # The surrogate stands in for model_<collapsed_generation>. model_0 is a single fine-tuning
+    # step away from the base model, so model_g sits g + 1 steps out and the factor is g + 1 —
+    # the same indexing run_extrapolation.py uses, so a surrogate built here and a dataset
+    # generated there describe the same generation
+    transfer = surrogate_method != "none"
+    factor = surrogate_factor if surrogate_factor > 0 else float(collapsed_generation + 1)
+    first_collapsed_dir = ""
+    if transfer:
+        first_collapsed_dir = first_collapsed_path or resolve_collapsed_dir(
+            0, specifier_name, block_size, prefer_adapter=(surrogate_method == "lora")
+        )
+        if os.path.abspath(first_collapsed_dir) == os.path.abspath(collapsed_dir):
+            raise SystemExit(
+                f"{TColors.FAIL}the surrogate would be built from the very checkpoint it is "
+                f"validated against{TColors.ENDC} ({collapsed_dir}). Transfer mode is only "
+                f"meaningful for --collapsed_generation > 0, since generation 0 *is* the anchor "
+                f"the surrogate is built from."
+            )
+
     selected = [t for t in TASKS if not tasks or t.name in tasks.split(",")]
     if not selected:
         raise SystemExit(f"no tasks matched {tasks!r}; use --list_tasks to see the names")
@@ -1121,6 +1585,22 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Collapse Generation{TColors.ENDC}: "
         f"{collapsed_generation}"
     )
+    if transfer:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: "
+            f"{TColors.HEADER}transfer{TColors.ENDC} — optimize against a "
+            f"{surrogate_method} surrogate (n = {factor:g}), validate against the real "
+            f"checkpoint above"
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate anchor (gen 0){TColors.ENDC}: "
+            f"{first_collapsed_dir}"
+        )
+    else:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: direct — optimize against "
+            f"the real collapsed checkpoint"
+        )
     task_names = ", ".join(t.name for t in selected)
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Tasks{TColors.ENDC}: {task_names}")
     print(
@@ -1163,21 +1643,55 @@ def main(
 
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading baseline model{TColors.ENDC}")
     baseline = TargetModel("baseline", load_model(baseline_dir, torch_device, dtype), torch_device)
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading collapsed model{TColors.ENDC}")
-    collapsed = TargetModel(
-        "collapsed",
-        load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
-        torch_device,
-    )
+
+    real_collapsed = None
+    surrogate_description = ""
+    if transfer:
+        # the surrogate takes the "collapsed" role in the objective; the real checkpoint is
+        # loaded too but only ever decoded during verification, never optimized against
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Building {surrogate_method} surrogate"
+            f"{TColors.ENDC} (n = {factor:g})"
+        )
+        collapsed, surrogate_description = build_surrogate(
+            method=surrogate_method,
+            factor=factor,
+            baseline=baseline,
+            first_collapsed_dir=first_collapsed_dir,
+            surrogate_model_path=surrogate_model_path,
+            device=torch_device,
+            dtype=dtype,
+        )
+        print(f"##   surrogate: {surrogate_description}")
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Loading real collapsed model (validation only)"
+            f"{TColors.ENDC}"
+        )
+        real_collapsed = TargetModel(
+            "validation",
+            load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
+            torch_device,
+        )
+    else:
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading collapsed model{TColors.ENDC}")
+        collapsed = TargetModel(
+            "collapsed",
+            load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
+            torch_device,
+        )
+        surrogate_description = collapsed_dir
 
     # the contrastive gradient adds one-hot gradients from both models, which is only
     # meaningful if they share a vocabulary
-    if baseline.embed_weights.shape[0] != collapsed.embed_weights.shape[0]:
-        raise RuntimeError(
-            f"vocabulary mismatch: baseline has {baseline.embed_weights.shape[0]} rows, "
-            f"collapsed has {collapsed.embed_weights.shape[0]} — both models must share "
-            f"the tokenizer of {MODEL_SPECIFIER}"
-        )
+    for other in (collapsed, real_collapsed):
+        if other is None:
+            continue
+        if baseline.embed_weights.shape[0] != other.embed_weights.shape[0]:
+            raise RuntimeError(
+                f"vocabulary mismatch: baseline has {baseline.embed_weights.shape[0]} rows, "
+                f"{other.label} has {other.embed_weights.shape[0]} — all models must share "
+                f"the tokenizer of {MODEL_SPECIFIER}"
+            )
 
     cfg = SearchConfig(
         num_steps=num_steps,
@@ -1198,7 +1712,7 @@ def main(
         stop_on_success=stop_on_success,
         seed=seed,
     )
-    attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg)
+    attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg, validation=real_collapsed)
 
     # ──────────────────── upfront capability gate ─────────────────────
     # Before optimizing anything, establish that the collapsed model can still write correct
@@ -1213,8 +1727,9 @@ def main(
     if capability.skipped:
         print(f"##   {TColors.WARNING}not probed{TColors.ENDC}: {capability.reason}")
     else:
+        role = "surrogate" if transfer else "collapsed model"
         print(
-            f"##   collapsed model capability: "
+            f"##   {role} capability: "
             f"{len(capability.collapsed_solved)}/{capability.n_probed} tasks "
             f"({capability.capability:.0%}), required >= {min_capability:.0%}"
         )
@@ -1225,6 +1740,12 @@ def main(
                 "##   baseline cannot solve: "
                 + ", ".join(capability.baseline_broken)
                 + " (not attackable)"
+            )
+        if capability.validation_broken:
+            print(
+                "##   real collapsed model cannot solve: "
+                + ", ".join(capability.validation_broken)
+                + " (transfer would not be attributable)"
             )
     print(_hr() + "\n")
 
@@ -1282,23 +1803,91 @@ def main(
             f"capability probe"
         )
         print(f"##   {capability.reason}")
+    hit_label = "transfer hit(s)" if transfer else "selective hit(s)"
     for outcome in outcomes:
         if outcome.skipped:
             status = f"{TColors.WARNING}skipped ({outcome.skipped}){TColors.ENDC}"
         elif outcome.successes:
-            status = f"{TColors.OKGREEN}{len(outcome.successes)} selective hit(s){TColors.ENDC}"
+            status = f"{TColors.OKGREEN}{len(outcome.successes)} {hit_label}{TColors.ENDC}"
+        elif transfer and outcome.transfer_misses:
+            status = (
+                f"{TColors.WARNING}{len(outcome.transfer_misses)} surrogate hit(s), none "
+                f"transferred{TColors.ENDC}"
+            )
         else:
-            status = f"{TColors.FAIL}no selective hit{TColors.ENDC}"
+            status = f"{TColors.FAIL}no {hit_label[:-3]}{TColors.ENDC}"
         best = "n/a" if outcome.best_objective is None else f"{outcome.best_objective:.4f}"
         print(f"## {outcome.task:16s} {status}  (best objective {best})")
         if outcome.successes:
             hit = outcome.successes[0]
             print("##   suffix: " + repr(hit["suffix"]))
-            print("##   collapsed code:\n" + hit["collapsed_code"])
+            if transfer:
+                print(
+                    f"##   statuses: baseline={hit['baseline_status']} "
+                    f"surrogate={hit['collapsed_status']} real={hit['validation_status']}"
+                )
+                print("##   real collapsed code:\n" + hit["validation_code"])
+            else:
+                print("##   collapsed code:\n" + hit["collapsed_code"])
     print(_hr() + "\n")
 
+    # ── transfer statistics ──
+    # The claim of this mode is that a suffix found without ever touching the real checkpoint
+    # still breaks it, and that it leaves the pristine model alone. Both halves are reported.
+    transfer_stats = None
+    if transfer:
+        transfer_stats = attack.transfer_report(outcomes)
+        transfer_stats.method = surrogate_method
+        transfer_stats.factor = factor
+        transfer_stats.surrogate_model = surrogate_description
+        transfer_stats.validation_model = collapsed_dir
+
+        print(
+            f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Transfer{TColors.ENDC} "
+            + _hr(12)
+        )
+        print(
+            f"##   surrogate: {surrogate_method} (n = {factor:g}), validated against "
+            f"{collapsed_dir}"
+        )
+        print(f"##   verifications: {transfer_stats.n_verified}")
+        print(
+            f"##   selective hits on the surrogate: {transfer_stats.n_surrogate_hits} "
+            f"(baseline stayed correct)"
+        )
+        rate_color = TColors.OKGREEN if transfer_stats.transfer_rate >= 0.5 else TColors.WARNING
+        print(
+            f"##   of those, broke the real model: {rate_color}"
+            f"{transfer_stats.n_transferred}{TColors.ENDC} "
+            f"({transfer_stats.transfer_rate:.0%} transfer rate), "
+            f"did not: {transfer_stats.n_not_transferred}"
+        )
+        print(
+            f"##   surrogate/real agreement over all verifications: "
+            f"{transfer_stats.agreement:.0%}"
+        )
+        print(
+            f"##   broke the real model but not the surrogate: "
+            f"{transfer_stats.n_validation_only} (transfer the surrogate did not predict)"
+        )
+        selectivity_color = (
+            TColors.OKGREEN if transfer_stats.n_baseline_broken == 0 else TColors.FAIL
+        )
+        print(
+            f"##   leaked to the pristine baseline: {selectivity_color}"
+            f"{transfer_stats.n_baseline_broken}{TColors.ENDC} of "
+            f"{transfer_stats.n_verified} (must be 0 for the attack to be selective)"
+        )
+        if transfer_stats.n_surrogate_hits == 0:
+            print(
+                f"##   {TColors.WARNING}no surrogate hit was found at all, so the transfer "
+                f"rate is not informative{TColors.ENDC}"
+            )
+        print(_hr() + "\n")
+
+    result_suffix = f"_{surrogate_method}_surrogate" if transfer else ""
     out_file = os.path.join(
-        RESULTS_PATH, f"attack_gen{collapsed_generation}_{specifier_name}.json"
+        RESULTS_PATH, f"attack_gen{collapsed_generation}_{specifier_name}{result_suffix}.json"
     )
     with open(out_file, "w", encoding="utf-8") as handle:
         json.dump(
@@ -1306,9 +1895,19 @@ def main(
                 "baseline_model": baseline_dir,
                 "collapsed_model": collapsed_dir,
                 "collapsed_generation": collapsed_generation,
+                "transfer_mode": transfer,
+                "surrogate_method": surrogate_method,
+                "surrogate_factor": factor if transfer else None,
+                "surrogate_model": surrogate_description if transfer else None,
+                "first_collapsed_model": first_collapsed_dir or None,
                 "config": cfg.__dict__,
                 "aborted": capability.aborted and not skip_capability_check,
                 "capability_probe": capability.__dict__,
+                "transfer": (
+                    {**transfer_stats.__dict__, "transfer_rate": transfer_stats.transfer_rate}
+                    if transfer_stats is not None
+                    else None
+                ),
                 "results": [outcome.__dict__ for outcome in outcomes],
             },
             handle,
@@ -1375,6 +1974,43 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="explicit path to the collapsed model (default: resolved from the generation)",
+    )
+    parser.add_argument(
+        "--surrogate_method",
+        "-sm",
+        type=str,
+        default="none",
+        choices=("none",) + METHODS,
+        help="'none' optimizes against the real collapsed checkpoint. 'logit' or 'lora' enable "
+        "transfer mode: the suffix is optimized against a surrogate built only from the base "
+        "and generation-0 models, and the real checkpoint of the same generation is held back "
+        "for validation only. 'data' is rejected — it is a corpus-level surrogate whose loss is "
+        "identical to the base model's (default: none)",
+    )
+    parser.add_argument(
+        "--surrogate_factor",
+        "-sf",
+        type=float,
+        default=0.0,
+        help="extrapolation factor n the surrogate stands for. 0.0 derives it as "
+        "--collapsed_generation + 1, which is the factor matching the validated checkpoint",
+    )
+    parser.add_argument(
+        "--surrogate_model_path",
+        "-smp",
+        type=str,
+        default="",
+        help="prebuilt surrogate to use instead of building one, e.g. run_extrapolation.py's "
+        "model_scaled_n<n>_* directory ('lora' method only)",
+    )
+    parser.add_argument(
+        "--first_collapsed_path",
+        "-fcp",
+        type=str,
+        default="",
+        help="explicit path to the generation-0 collapsed model the surrogate is built from "
+        "(default: resolved from model_outputs/; the 'lora' method needs the adapter, not the "
+        "merged _fp16 copy)",
     )
     parser.add_argument(
         "--path",

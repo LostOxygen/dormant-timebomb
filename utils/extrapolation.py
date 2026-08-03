@@ -4,6 +4,9 @@ import json
 import os
 import shutil
 
+import torch
+from torch import Tensor
+
 # The three ways of approximating a later collapse generation without ever training it. All of
 # them are indexed by the same factor n = generation + 1, so that generation 0 reproduces the
 # real model_0 anchor under every method and only the generations above it are approximations.
@@ -37,6 +40,51 @@ METHOD_LABELS: dict[str, str] = {
 
 # file name of the calibration result of the data-space surrogate
 CALIBRATION_FILE: str = "surrogate_top_p_bs{block_size}_{specifier_name}.json"
+
+
+def extrapolate_logits(
+    base_scores: Tensor, collapsed_logits: Tensor, factor: float
+) -> Tensor:
+    """
+    The logit-space extrapolation ``base + n * (collapsed - base)``, in float32.
+
+    This is the single definition of the tilt: ``generate_dataset_extrapolation.py`` uses it to
+    produce the synthetic datasets and ``run_attack.py`` uses it to build the differentiable
+    surrogate that the adversarial suffix is optimized against. If the two drifted apart, the
+    attack would be optimized against a different model than the one the datasets characterize.
+
+    In distribution space the result is the exponential tilt ``p_base^(1-n) * p_collapsed^n``,
+    i.e. the same algebra as classifier-free guidance with weight `n`.
+
+    No clamping is applied. Softmax is shift invariant and torch computes it by subtracting the
+    row maximum first, so a large logit cannot overflow ``exp()``. Clamping to a fixed range
+    instead ties every token above the ceiling at the ceiling and flattens everything below the
+    floor onto the floor, which for a large `n` is most of the vocabulary — it destroys exactly
+    the ranking the extrapolation produces.
+
+    Args:
+        base_scores (Tensor): logits of the pristine base model. Entries of -inf mark tokens an
+            earlier logits processor already forbade; they stay forbidden and are kept out of
+            the arithmetic, since -inf + n * (finite + inf) evaluates to NaN
+        collapsed_logits (Tensor): logits of the generation-0 collapsed model, same shape
+        factor (float): the factor n, i.e. generation + 1
+
+    Returns:
+        Tensor: the extrapolated logits in float32, with forbidden tokens and any NaN out of
+            either model set to -inf so that neither can ever be sampled
+    """
+    base_f32 = base_scores.to(torch.float32)
+    collapsed_f32 = collapsed_logits.to(torch.float32)
+
+    forbidden = torch.isneginf(base_f32)
+    safe_base = base_f32.masked_fill(forbidden, 0.0)
+
+    extrapolated = safe_base + factor * (collapsed_f32 - safe_base)
+
+    # a NaN must not be mapped onto a mid-distribution logit, where it would be sampleable
+    return extrapolated.masked_fill(
+        forbidden | torch.isnan(extrapolated), float("-inf")
+    )
 
 
 def dataset_suffix(method: str) -> str:
