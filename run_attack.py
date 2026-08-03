@@ -484,7 +484,7 @@ class SearchConfig:
     margin: float = 3.0
     mu_correct: float = 0.5
     verify_every: int = 10
-    max_new_tokens: int = 96
+    max_new_tokens: int = 256
     repetition_penalty: float = 1.0
     exec_timeout: float = 10.0
     no_exec: bool = False
