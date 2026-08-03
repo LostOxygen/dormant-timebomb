@@ -254,7 +254,7 @@ timebomb claim is meaningful. `--skip_capability_check` overrides only the run-l
 exclusion always applies, since attacking a task the collapsed model already fails proves nothing.
 
 The built-in tasks (`--list_tasks`) are five trivially testable functions — `is_even`, `add`,
-`absolute_value`, `max_of_two`, `list_length` — each paired with a specific wrong implementation
+`absolute_value`, `square`, `list_length` — each paired with a specific wrong implementation
 (e.g. `n % 2 == 1` for `is_even`) and assertions that the correct version passes and the wrong
 version fails.
 
