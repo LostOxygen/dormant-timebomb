@@ -139,7 +139,10 @@ perpl_model, perpl_tokenizer = FastLanguageModel.from_pretrained(
     model_name=model_specifier,
     max_seq_length=int(block_size * 2),
     dtype=None,
-    load_in_4bit=True,
+    # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+    # weights, and quantizing them at load time would round away exactly the small
+    # per-generation drifts whose accumulation this pipeline measures
+    load_in_4bit=False,
 )
 FastLanguageModel.for_inference(perpl_model)
 

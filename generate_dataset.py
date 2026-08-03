@@ -97,7 +97,10 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}",
     max_seq_length=block_size,
     dtype=None,
-    load_in_4bit=True,
+    # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+    # weights, and quantizing them at load time would round away exactly the small
+    # per-generation drifts whose accumulation this pipeline measures
+    load_in_4bit=False,
 )
 FastLanguageModel.for_inference(model)
 
@@ -148,8 +151,15 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
         return_tensors="pt",
     ).to("cuda")
 
+    # do_sample/num_beams are set explicitly rather than inherited from the model's
+    # generation_config: collapse is driven by resampling from the model's own distribution, so
+    # the decoding has to be plain multinomial sampling. Beam search (num_beams > 1) would
+    # optimize for likelihood and systematically narrow the output distribution, which
+    # suppresses exactly the effect this pipeline measures
     generated_answers = model.generate(
         **inputs,
+        do_sample=True,
+        num_beams=1,
         repetition_penalty=3.0,
         min_new_tokens=128,
         max_new_tokens=block_size,

@@ -92,8 +92,9 @@ def generate_responses(
         batch_size (int): number of prompts per generate() call
         max_new_tokens (int): generation length cap
         min_new_tokens (int): generation length floor
-        top_p (float): top-p to sample with. None leaves the model's own generation_config
-            untouched, which is what the reference generation with model_0 uses
+        top_p (float): top-p to sample with. None leaves top_p to the model's own
+            generation_config, which is what the reference generation with model_0 uses.
+            do_sample and num_beams are pinned either way
 
     Returns:
         list: the decoded responses, in the order of the instructions
@@ -114,11 +115,15 @@ def generate_responses(
         sampling_kwargs = {}
         if top_p is not None:
             sampling_kwargs["top_p"] = top_p
-            sampling_kwargs["do_sample"] = True
 
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
+                # pinned to plain multinomial sampling, matching the generation pipeline. Beam
+                # search would narrow the output distribution and make the fitted p_1 describe
+                # a decoding regime the pipeline never uses
+                do_sample=True,
+                num_beams=1,
                 repetition_penalty=REPETITION_PENALTY,
                 min_new_tokens=min_new_tokens,
                 max_new_tokens=max_new_tokens,
@@ -188,6 +193,7 @@ def main(
     block_size: int = 2048,
     model_specifier: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct",
     num_samples: int = 128,
+    dataset_size: int = 10000,
     generation_batch_size: int = 32,
     perplexity_batch_size: int = 16,
     max_new_tokens: int = 512,
@@ -202,6 +208,8 @@ def main(
         block_size (int): must match the run_baseline.py / run_extrapolation.py block size
         model_specifier (str): the pristine base model
         num_samples (int): number of instructions to calibrate on
+        dataset_size (int): the --dataset_size the pipeline runs with. The calibration draws
+            from the same front slice, so it never fits p_1 on data the pipeline never sees
         generation_batch_size (int): prompts per generate() call
         perplexity_batch_size (int): samples per perplexity batch
         max_new_tokens (int): generation length cap for the calibration
@@ -232,6 +240,15 @@ def main(
     # ── the instructions to calibrate on ──
     original_dataset = load_dataset(DATASET_SPECIFIER, split="train")
     original_dataset = original_dataset.select_columns(["response", "instruction"])
+    # the same front slice run_baseline.py and run_extrapolation.py use, so p_1 is never fitted
+    # on data the pipeline itself never sees
+    if 0 < dataset_size < len(original_dataset):
+        original_dataset = original_dataset.select(range(dataset_size))
+    if num_samples > len(original_dataset):
+        raise ValueError(
+            f"--num_samples {num_samples} exceeds the {len(original_dataset)} available samples "
+            f"(--dataset_size {dataset_size})"
+        )
     # a contiguous slice from the front, so the calibration is reproducible without an RNG seed
     instructions = list(original_dataset.select(range(num_samples))["instruction"])
 
@@ -240,7 +257,10 @@ def main(
         model_name=model_specifier,
         max_seq_length=int(block_size * 2),
         dtype=None,
-        load_in_4bit=True,
+        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+        # weights, and quantizing them at load time would round away exactly the small
+        # per-generation drifts whose accumulation this pipeline measures
+        load_in_4bit=False,
     )
     FastLanguageModel.for_inference(model_base)
     if tokenizer.pad_token is None:
@@ -257,7 +277,10 @@ def main(
         model_name=collapsed_path,
         max_seq_length=int(block_size * 2),
         dtype=None,
-        load_in_4bit=True,
+        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+        # weights, and quantizing them at load time would round away exactly the small
+        # per-generation drifts whose accumulation this pipeline measures
+        load_in_4bit=False,
     )
     FastLanguageModel.for_inference(model_collapsed)
 
@@ -387,6 +410,14 @@ if __name__ == "__main__":
         type=int,
         default=128,
         help="number of instructions to calibrate on (default: 128)",
+    )
+    parser.add_argument(
+        "--dataset_size",
+        "-dsz",
+        type=int,
+        default=10000,
+        help="the --dataset_size run_baseline.py / run_extrapolation.py are run with. The "
+        "calibration draws its instructions from the same front slice (default: 10000)",
     )
     parser.add_argument(
         "--generation_batch_size",

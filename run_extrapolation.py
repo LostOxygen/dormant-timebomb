@@ -29,7 +29,7 @@ from utils.plotting import visible_perplexity_range
 from utils.extrapolation import (
     METHODS,
     METHOD_LABELS,
-    build_scaled_adapter,
+    build_extrapolated_weights,
     calibration_file,
     dataset_suffix,
 )
@@ -96,6 +96,7 @@ def main(
     continue_from_generation: int = 0,
     method: str = "logit",
     surrogate_top_p: float = 0.0,
+    dataset_size: int = 10000,
 ) -> None:
     """
     Main function to start the pitfall 1 fine-tuning
@@ -113,8 +114,10 @@ def main(
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
+        dataset_size (int): number of dataset samples to use, taken from the front of the
+            upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
         method (str): which approximation of the later generations to use, see
-            utils/extrapolation.py ("logit", "lora" or "data")
+            utils/extrapolation.py ("logit", "weight" or "data")
         surrogate_top_p (float): p_1 of the data-space surrogate. 0.0 reads it from the
             calibration that calibrate_surrogate.py wrote
 
@@ -164,12 +167,13 @@ def main(
         MODEL_SPECIFIER = model_specifier
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
-    # load the tokenizer to count to tokens of the dataset
+    # load the tokenizer to count to tokens of the dataset. The model itself is discarded, but
+    # 4-bit is off here too so that no load in this project quantizes anything
     _, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_SPECIFIER,
         max_seq_length=4096,
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=False,
     )
     global EOS_TOKEN
     global TOKENIZER
@@ -179,6 +183,14 @@ def main(
     # load the dataset
     original_dataset = load_dataset(DATASET_SPECIFIER, split="train")
     original_dataset = original_dataset.select_columns(["response", "instruction"])
+
+    # subsample to --dataset_size. The upstream dataset name says 50k, but the collapse
+    # experiment does not need all of it and every generation pays for the full size twice
+    # (once generating, once training). A contiguous slice from the front is used so that
+    # run_baseline.py and run_extrapolation.py operate on the *same* subset without needing a
+    # shared seed, which is what makes their perplexity histograms comparable
+    if 0 < dataset_size < len(original_dataset):
+        original_dataset = original_dataset.select(range(dataset_size))
 
     # gather information about the dataset
     token_counts = []
@@ -341,24 +353,29 @@ def main(
             if gen_id < continue_from_generation:
                 continue
 
-            # ───────────────────── build the alpha scaled adapter (lora only) ────────────────
-            # a LoRA layer adds (alpha / r) * B @ A to the frozen base weight, so scaling alpha
-            # by n scales the whole fine-tuning delta by n and yields the weights
-            # W_base + n * (W_collapsed - W_base). This is built once per generation here rather
-            # than inside the shard subprocesses, which would race over the same directory
-            adapter_path = ""
-            if method == "lora":
-                adapter_path = (
-                    f"{MODEL_PATH}model_scaled_n{gen_id + 1}_bs{block_size}_{specifier_name}"
+            # ──────────────── build the extrapolated checkpoint (weight method only) ─────────
+            # W_base + n * (W_0 - W_base) over the full parameter set. The pipeline full
+            # fine-tunes, so the delta is not a low-rank object that could be scaled through a
+            # config value and every parameter is interpolated explicitly. Built once per
+            # generation here rather than inside the shard subprocesses, which would race over
+            # the same directory
+            extrapolated_model_path = ""
+            if method == "weight":
+                extrapolated_model_path = (
+                    f"{MODEL_PATH}model_extrapolated_n{gen_id + 1}_bs{block_size}"
+                    f"_{specifier_name}"
                 )
-                build_scaled_adapter(
-                    adapter_path=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
+                build_extrapolated_weights(
+                    base_path=MODEL_SPECIFIER,
+                    first_collapsed_path=(
+                        f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}"
+                    ),
                     factor=gen_id + 1,
-                    output_path=adapter_path,
+                    output_path=extrapolated_model_path,
                 )
                 print(
-                    f"## {TColors.OKBLUE}{TColors.BOLD}Scaled adapter{TColors.ENDC}: "
-                    f"alpha x {gen_id + 1} -> {adapter_path}"
+                    f"## {TColors.OKBLUE}{TColors.BOLD}Extrapolated checkpoint{TColors.ENDC}: "
+                    f"delta x {gen_id + 1} -> {extrapolated_model_path}"
                 )
 
             # ────────────────────────────── generate the new datasets ────────────────────────────
@@ -376,9 +393,16 @@ def main(
                     devices = [0]
             process_list = []
             for d_id, shard_id in zip(devices, range(len(devices))):
-                # split the dataset into subsets per device and save to disk
+                # split the dataset into subsets per device and save to disk.
+                # contiguous=True, because datasets defaults to strided sharding
+                # (indices index, index + n, index + 2n, ...) and the shards are merged back in
+                # shard order afterwards. Strided shards would therefore reorder the merged
+                # dataset as a function of the *number of GPUs*: the rows are the same, but
+                # make_splits() takes the 90/10 train/val split by position, so a 4-GPU run
+                # would train on a different subset than a 1-GPU run. Contiguous shards
+                # reassemble into the original order for any device count
                 temp_subdataset = original_dataset.shard(
-                    num_shards=len(devices), index=shard_id
+                    num_shards=len(devices), index=shard_id, contiguous=True
                 )
                 temp_subdataset.save_to_disk(
                     DATASET_PATH
@@ -402,8 +426,8 @@ def main(
                         str(shard_id),
                         "--method",
                         method,
-                        "--adapter_path",
-                        adapter_path,
+                        "--extrapolated_model_path",
+                        extrapolated_model_path,
                         "--surrogate_top_p",
                         str(surrogate_p1),
                         "--path",
@@ -774,8 +798,8 @@ if __name__ == "__main__":
         default="logit",
         choices=METHODS,
         help="how to approximate the later generations without training them. 'logit': "
-        "base + n * (collapsed - base) in logit space at every decoding step. 'lora': the same "
-        "first order step in weight space, i.e. the collapse adapter with alpha * n, which is "
+        "base + n * (collapsed - base) in logit space at every decoding step. 'weight': the "
+        "same first order step in weight space, i.e. W_base + n * (W_0 - W_base), which is "
         "cheaper and yields an actual model. 'data': the base model sampled with a support that "
         "is truncated once per generation, which imitates the resampling that drives collapse "
         "instead of the drift it causes (default: logit)",
@@ -789,6 +813,15 @@ if __name__ == "__main__":
         "Generation n is then sampled with p_1 ** n. The default of 0.0 reads the value that "
         "calibrate_surrogate.py fitted; passing it explicitly skips the calibration and is only "
         "meant for quick experiments ('data' method only)",
+    )
+    parser.add_argument(
+        "--dataset_size",
+        "-dsz",
+        type=int,
+        default=10000,
+        help="number of dataset samples to use, taken as a contiguous slice from the front of "
+        "the upstream 50k dataset. run_baseline.py and run_extrapolation.py must be given the "
+        "same value, otherwise their histograms describe different data (default: 10000)",
     )
     parser.add_argument(
         "--path",

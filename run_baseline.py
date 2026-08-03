@@ -86,6 +86,8 @@ def main(
     path: str = "",
     model_specifier: str = "",
     continue_from_generation: int = 0,
+    dataset_size: int = 10000,
+    learning_rate: float = 2e-5,
 ) -> None:
     """
     Main function to start the pitfall 1 fine-tuning
@@ -104,6 +106,10 @@ def main(
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
+        dataset_size (int): number of dataset samples to use, taken from the front of the
+            upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
+        learning_rate (float): full fine-tuning learning rate. Much smaller than a LoRA rate
+            would be, since every weight is updated directly
 
     Returns:
         None
@@ -147,12 +153,13 @@ def main(
         MODEL_SPECIFIER = model_specifier
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
-    # load the tokenizer to count to tokens of the dataset
+    # load the tokenizer to count to tokens of the dataset. The model itself is discarded, but
+    # 4-bit is off here too so that no load in this project quantizes anything
     _, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_SPECIFIER,
         max_seq_length=4096,
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=False,
     )
     global EOS_TOKEN
     global TOKENIZER
@@ -162,6 +169,14 @@ def main(
     # load the dataset
     original_dataset = load_dataset(DATASET_SPECIFIER, split="train")
     original_dataset = original_dataset.select_columns(["response", "instruction"])
+
+    # subsample to --dataset_size. The upstream dataset name says 50k, but the collapse
+    # experiment does not need all of it and every generation pays for the full size twice
+    # (once generating, once training). A contiguous slice from the front is used so that
+    # run_baseline.py and run_extrapolation.py operate on the *same* subset without needing a
+    # shared seed, which is what makes their perplexity histograms comparable
+    if 0 < dataset_size < len(original_dataset):
+        original_dataset = original_dataset.select(range(dataset_size))
 
     # gather information about the dataset
     token_counts = []
@@ -291,37 +306,25 @@ def main(
             # check if generations need to be skipped if continue_from_generation > 0
             if gen_id < continue_from_generation:
                 continue
-            # load the model
+            # load the model for *full* fine-tuning.
+            #
+            # No LoRA. A rank-16 adapter on the attention and MLP projections can only move the
+            # model inside a low dimensional subspace and leaves the embeddings, the norms and
+            # the head untouched, which damps how far one generation can drift from the last
+            # one. Since the whole point of the pipeline is to let that drift accumulate,
+            # adapting only a slice of the weights suppresses the very effect being measured.
+            # Full fine-tuning lets every parameter move.
+            #
+            # This also rules out 4-bit: quantized weights cannot be trained, so the base has to
+            # be loaded at full precision. That is the memory cost of dropping LoRA.
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=MODEL_SPECIFIER
                 if gen_id == 0
                 else f"{MODEL_PATH}model_{gen_id - 1}_bs{block_size}_{specifier_name}",
                 max_seq_length=block_size,
                 dtype=None,
-                load_in_4bit=True,
-            )
-
-            # add LoRA adapters
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=16,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
-                target_modules=[
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ],
-                lora_alpha=16,
-                lora_dropout=0,  # Supports any, but = 0 is optimized
-                bias="none",  # Supports any, but = "none" is optimized
-                use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
-                random_state=1337,
-                # task_type="CAUSAL_LM",
-                use_rslora=False,  # We support rank stabilized LoRA
-                loftq_config=None,  # And LoftQ
+                load_in_4bit=False,
+                full_finetuning=True,
             )
 
             # load the dataset
@@ -367,13 +370,19 @@ def main(
                     num_train_epochs=training_epochs,
                     per_device_train_batch_size=training_batch_size,
                     per_device_eval_batch_size=training_batch_size,
-                    learning_rate=2e-4,
+                    # full fine-tuning needs a much smaller step than LoRA: 2e-4 updates every
+                    # weight of the model directly and diverges within a few steps, which would
+                    # look like a very fast collapse but is just a broken optimizer
+                    learning_rate=learning_rate,
                     fp16=not is_bfloat16_supported(),
                     bf16=is_bfloat16_supported(),
                     logging_steps=1,
                     optim="adamw_8bit",
                     weight_decay=0.01,
                     lr_scheduler_type="linear",
+                    # recomputing activations instead of storing them buys back some of the
+                    # memory that full fine-tuning costs over LoRA
+                    gradient_checkpointing=True,
                     seed=1337,
                     output_dir="outputs",
                     report_to="none",
@@ -391,9 +400,9 @@ def main(
             used_memory = round(
                 torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3
             )
-            used_memory_for_lora = round(used_memory - start_gpu_memory, 3)
+            used_memory_for_training = round(used_memory - start_gpu_memory, 3)
             used_percentage = round(used_memory / max_memory * 100, 3)
-            lora_percentage = round(used_memory_for_lora / max_memory * 100, 3)
+            training_percentage = round(used_memory_for_training / max_memory * 100, 3)
             print(
                 f"{trainer_stats.metrics['train_runtime']} seconds used for training."
             )
@@ -401,27 +410,22 @@ def main(
                 f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} min. used for training."
             )
             print(f"Peak reserved memory = {used_memory} GB.")
-            print(f"Peak reserved memory for training = {used_memory_for_lora} GB.")
+            print(f"Peak reserved memory for training = {used_memory_for_training} GB.")
             print(f"Peak reserved memory % of max memory = {used_percentage} %.")
             print(
-                f"Peak reserved memory for training % of max memory = {lora_percentage} %."
+                f"Peak reserved memory for training % of max memory = {training_percentage} %."
             )
 
-            # save the model
+            # save the model. Full fine-tuning means this directory already holds the complete
+            # weights, so there is no adapter to save separately and no merged _fp16 copy to
+            # write — the next generation and every downstream script load it directly
             trainer.model.save_pretrained(
                 f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}",
                 safe_serialization=True,
-                save_adapter=True,
                 save_config=True,
             )
             trainer.tokenizer.save_pretrained(
                 f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}"
-            )
-            # also save the model in fp16 for testing
-            trainer.model.save_pretrained_merged(
-                f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}_fp16",
-                trainer.tokenizer,
-                save_method="merged_16bit",
             )
 
             del trainer
@@ -445,9 +449,16 @@ def main(
                     devices = [0]
             process_list = []
             for d_id, shard_id in zip(devices, range(len(devices))):
-                # split the dataset into subsets per device and save to disk
+                # split the dataset into subsets per device and save to disk.
+                # contiguous=True, because datasets defaults to strided sharding
+                # (indices index, index + n, index + 2n, ...) and the shards are merged back in
+                # shard order afterwards. Strided shards would therefore reorder the merged
+                # dataset as a function of the *number of GPUs*: the rows are the same, but
+                # make_splits() takes the 90/10 train/val split by position, so a 4-GPU run
+                # would train on a different subset than a 1-GPU run. Contiguous shards
+                # reassemble into the original order for any device count
                 temp_subdataset = original_dataset.shard(
-                    num_shards=len(devices), index=shard_id
+                    num_shards=len(devices), index=shard_id, contiguous=True
                 )
                 temp_subdataset.save_to_disk(
                     DATASET_PATH
@@ -840,6 +851,24 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="specifies the generation to continue from (default: 0, start from scratch)",
+    )
+    parser.add_argument(
+        "--dataset_size",
+        "-dsz",
+        type=int,
+        default=10000,
+        help="number of dataset samples to use, taken as a contiguous slice from the front of "
+        "the upstream 50k dataset. run_baseline.py and run_extrapolation.py must be given the "
+        "same value, otherwise their histograms describe different data (default: 10000)",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        "-lr",
+        type=float,
+        default=2e-5,
+        help="full fine-tuning learning rate. The pipeline trains every weight rather than a "
+        "LoRA adapter, so this has to be roughly an order of magnitude below a typical LoRA "
+        "rate; 2e-4 diverges within a few steps (default: 2e-5)",
     )
     parser.add_argument(
         "--path",

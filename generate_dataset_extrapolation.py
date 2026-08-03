@@ -12,8 +12,8 @@ Args:
     dataset_batch_size (int): The dataset batch size to use for training.
     generation (int): The current generation.
     shard_id (int): The current shard id.
-    method (str): Which approximation to use ("logit", "lora" or "data").
-    adapter_path (str): Path of the alpha scaled LoRA adapter ("lora" method only).
+    method (str): Which approximation to use ("logit", "weight" or "data").
+    extrapolated_model_path (str): Path of the extrapolated checkpoint ("weight" only).
     surrogate_top_p (float): The calibrated p_1 of the data-space surrogate ("data" only).
     path (str): The path where the datasets and models are stored.
 
@@ -190,11 +190,11 @@ parser.add_argument(
     help="which approximation of the later generation to use (default: logit)",
 )
 parser.add_argument(
-    "--adapter_path",
-    "-ap",
+    "--extrapolated_model_path",
+    "-emp",
     type=str,
     default="",
-    help="path of the alpha scaled LoRA adapter, required by the 'lora' method",
+    help="path of the extrapolated checkpoint, required by the 'weight' method",
 )
 parser.add_argument(
     "--surrogate_top_p",
@@ -220,7 +220,7 @@ dataset_batch_size = args.dataset_batch_size
 generation = args.generation
 shard_id = args.shard_id
 method = args.method
-adapter_path = args.adapter_path
+extrapolated_model_path = args.extrapolated_model_path
 surrogate_p1 = args.surrogate_top_p
 path = args.path
 
@@ -257,7 +257,10 @@ if method == "logit":
         model_name=MODEL_SPECIFIER,
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+        # weights, and quantizing them at load time would round away exactly the small
+        # per-generation drifts whose accumulation this pipeline measures
+        load_in_4bit=False,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -265,25 +268,31 @@ if method == "logit":
         model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+        # weights, and quantizing them at load time would round away exactly the small
+        # per-generation drifts whose accumulation this pipeline measures
+        load_in_4bit=False,
     )
     FastLanguageModel.for_inference(model_collapsed)
 
-elif method == "lora":
-    # the collapse adapter with its alpha already scaled by n, i.e. weights
-    # W_base + n * (W_collapsed - W_base). run_extrapolation.py builds it once per generation so
-    # that the shards of a generation do not race each other over the same directory. Only one
-    # model is resident and no second KV cache is kept, so this is the cheapest of the three
-    if adapter_path == "":
+elif method == "weight":
+    # the checkpoint W_base + n * (W_0 - W_base), already written to disk by
+    # run_extrapolation.py once per generation so that the shards of a generation do not race
+    # each other over the same directory. Only one model is resident and no second KV cache is
+    # kept, so this is the cheapest of the three
+    if extrapolated_model_path == "":
         raise ValueError(
-            "the 'lora' method needs --adapter_path, which run_extrapolation.py builds with "
-            "utils.extrapolation.build_scaled_adapter"
+            "the 'weight' method needs --extrapolated_model_path, which run_extrapolation.py "
+            "builds with utils.extrapolation.build_extrapolated_weights"
         )
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=adapter_path,
+        model_name=extrapolated_model_path,
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+        # weights, and quantizing them at load time would round away exactly the small
+        # per-generation drifts whose accumulation this pipeline measures
+        load_in_4bit=False,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -295,7 +304,10 @@ else:
         model_name=MODEL_SPECIFIER,
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
+        # weights, and quantizing them at load time would round away exactly the small
+        # per-generation drifts whose accumulation this pipeline measures
+        load_in_4bit=False,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -350,8 +362,8 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
 
     # everything that is not the mechanism of the method itself is kept identical across the
     # three methods, so that a difference between their histograms is a difference between the
-    # approximations and not between their decoding setups. do_sample, temperature and top_k are
-    # left to the model's own generation_config, exactly as before
+    # approximations and not between their decoding setups. temperature and top_k are left to
+    # the model's own generation_config; do_sample and num_beams are pinned below
     method_kwargs = {}
 
     if method == "logit":
@@ -388,12 +400,18 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
         method_kwargs["repetition_penalty"] = REPETITION_PENALTY
         if method == "data":
             # the whole method is a statement about the sampling support, so the truncation is
-            # set explicitly rather than inherited, and sampling is required to be on
+            # set explicitly rather than inherited
             method_kwargs["top_p"] = schedule_top_p
-            method_kwargs["do_sample"] = True
 
     generated_answers = generation_model.generate(
         **inputs,
+        # pinned, not inherited from the model's generation_config: collapse is driven by
+        # resampling from the model's own distribution, so the decoding has to be plain
+        # multinomial sampling. Beam search (num_beams > 1) optimizes for likelihood and
+        # systematically narrows the output distribution, which suppresses exactly the effect
+        # this pipeline measures — and it would do so unevenly across the three methods
+        do_sample=True,
+        num_beams=1,
         min_new_tokens=128,
         max_new_tokens=block_size,
         use_cache=True,
