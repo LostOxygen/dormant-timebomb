@@ -1,4 +1,5 @@
-"""main hook to start model collapse for the extrapolated models"""
+"""main hook to start the pitfall 1 fine-tuning"""
+
 # -*- coding: utf-8 -*-
 # !/usr/bin/env python3
 from unsloth import FastLanguageModel
@@ -9,13 +10,13 @@ from datetime import timedelta
 from typing import Final
 import getpass
 import datetime
+import shutil
 import argparse
 import subprocess
 import psutil
 import pytz
 
 import torch
-from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import seaborn as sns
@@ -73,11 +74,11 @@ def main(
     training_epochs: int = 5,
     dataset_batch_size: int = 10,
     training_batch_size: int = 8,
+    perplexity_batch_size: int = 16,
     skip_training: bool = False,
     num_generations: int = 5,
     block_size: int = 64,
     histogram_only: bool = False,
-    human_eval_only: bool = False,
     path: str = "",
     model_specifier: str = "",
     continue_from_generation: int = 0,
@@ -90,11 +91,11 @@ def main(
         training_epochs (int): number of training epochs to run
         dataset_batch_size (int): batch size for the dataset
         training_batch_size (int): batch size for the training/eval
+        perplexity_batch_size (int): batch size for the perplexity calculation
         skip_training (bool): if True, skip the training and only evaluate the models
         num_generations (int): number of generations to run (default: 5)
         block_size (int): size of the blocks to split the dataset into (default: 64)
         histogram_only (bool): if True, only generate the histogram and skip the rest
-        human_eval_only (bool): if True, only generate human eval samples and skip the rest
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
@@ -180,7 +181,7 @@ def main(
         "\n"
         + f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}System Information"
         + f"{TColors.ENDC} "
-        + "#" * (os.get_terminal_size().columns - 23)
+        + "#" * (shutil.get_terminal_size().columns - 23)
     )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Date{TColors.ENDC}: "
@@ -220,7 +221,7 @@ def main(
     print(
         f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Parameters"
         + f"{TColors.ENDC} "
-        + "#" * (os.get_terminal_size().columns - 14)
+        + "#" * (shutil.get_terminal_size().columns - 14)
     )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {MODEL_SPECIFIER}"
@@ -242,6 +243,10 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Training Batch Size{TColors.ENDC}: {training_batch_size}"
     )
     print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Perplexity Batch Size{TColors.ENDC}: "
+        f"{perplexity_batch_size}"
+    )
+    print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Skip Training{TColors.ENDC}: {skip_training}"
     )
     print(
@@ -255,66 +260,154 @@ def main(
             f"## {TColors.OKBLUE}{TColors.BOLD}Continue from Generation{TColors.ENDC}: "
             f"{continue_from_generation}"
         )
-    print("#" * os.get_terminal_size().columns + "\n")
+    print("#" * shutil.get_terminal_size().columns + "\n")
 
-    # print information about the dataset
-    print(f"Max token count: {max(token_counts)}")
-    print(f"Avg token count: {sum(token_counts) / len(token_counts)}")
-    print(f"Min token count: {min(token_counts)}")
-    print(f"Original dataset length: {len(original_dataset)}\n")
-    original_dataset = original_dataset.map(format_prompt, batched=True)
-    original_dataset.save_to_disk(DATASET_PATH + f"original_dataset_bs{block_size}")
+    if not skip_training:
+        # print information about the dataset
+        print(f"Max token count: {max(token_counts)}")
+        print(f"Avg token count: {sum(token_counts) / len(token_counts)}")
+        print(f"Min token count: {min(token_counts)}")
+        print(f"Original dataset length: {len(original_dataset)}\n")
+        original_dataset = original_dataset.map(format_prompt, batched=True)
+        original_dataset.save_to_disk(DATASET_PATH + f"original_dataset_bs{block_size}")
 
-    # preprocess the dataset
-    chunked_dataset = original_dataset
-    chunked_dataset.save_to_disk(
-        DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}_ex"
-    )
+        # preprocess the dataset
+        chunked_dataset = original_dataset
+        chunked_dataset.save_to_disk(
+            DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}_ex"
+        )
 
-    for gen_id in range(num_generations):
-        # check if generations need to be skipped if continue_from_generation > 0
-        if gen_id < continue_from_generation:
-            continue
+        for gen_id in range(num_generations):
+            # check if generations need to be skipped if continue_from_generation > 0
+            if gen_id < continue_from_generation:
+                continue
 
-        # ────────────────────────────── generate the new datasets ────────────────────────────
-        # first, split the previous dataset into X subdatasets for each GPU
-        # the generation processes are then called in parallel to be split onto the different
-        # GPUs then the subdatasets are merged again to form the final single dataset
-        if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
-            devices = list(
-                map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(","))
+            # ────────────────────────────── generate the new datasets ────────────────────────────
+            # first, split the previous dataset into X subdatasets for each GPU
+            # the generation processes are then called in parallel to be split onto the different
+            # GPUs then the subdatasets are merged again to form the final single dataset
+            if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+                devices = list(
+                    map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(","))
+                )
+            else:
+                if str(device).startswith("cuda"):
+                    devices = list(range(torch.cuda.device_count()))
+                else:
+                    devices = [0]
+            process_list = []
+            for d_id, shard_id in zip(devices, range(len(devices))):
+                # split the dataset into subsets per device and save to disk
+                temp_subdataset = original_dataset.shard(
+                    num_shards=len(devices), index=shard_id
+                )
+                temp_subdataset.save_to_disk(
+                    DATASET_PATH
+                    + f"base_subdataset_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
+                )
+                process = subprocess.Popen(
+                    [
+                        "env",
+                        f"CUDA_VISIBLE_DEVICES={d_id}",
+                        "python",
+                        "generate_dataset_extrapolation.py",
+                        "--block_size",
+                        str(block_size),
+                        "--specifier_name",
+                        specifier_name,
+                        "--dataset_batch_size",
+                        str(dataset_batch_size),
+                        "--generation",
+                        str(gen_id),
+                        "--shard_id",
+                        str(shard_id),
+                        "--path",
+                        str(path),
+                    ],
+                )
+                process_list.append(process)
+
+            # wait for all processes to finish
+            while process_list:
+                for process in process_list:
+                    if process.poll() is not None:
+                        process_list.remove(process)
+                time.sleep(10)
+
+            # merge all the subdatasets to one single dataset again
+            merged_dataset = concatenate_datasets(
+                [
+                    Dataset.load_from_disk(
+                        DATASET_PATH
+                        + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
+                    )
+                    for shard_id in range(len(devices))
+                ]
             )
+            merged_dataset.save_to_disk(
+                DATASET_PATH
+                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}_ex"
+            )
+
+    # ────────────────── evaluate the models' perplexity and other metrics ─────────────────────────
+    # iterate over every model and the generated dataset and calculate the perplexity
+    # for the perplexity, every datapoint i.e., the generated answer for every question
+    # is evaluated to get the probability for a given perplexity over the whole dataset
+    if not histogram_only:
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Calculate Perplexity{TColors.ENDC}")
+        perplexity_dict = {}
+        all_perplexities = []
+
+        # the datasets are split into one shard per GPU and every shard is processed by its
+        # own subprocess. Each subprocess handles all generations of its shard, so the model
+        # only has to be loaded once per GPU. Afterwards the per-shard results are merged
+        if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
+            devices = list(map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(",")))
         else:
             if str(device).startswith("cuda"):
                 devices = list(range(torch.cuda.device_count()))
             else:
                 devices = [0]
+
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Using {len(devices)} GPU(s) for the "
+            f"perplexity calculation{TColors.ENDC}"
+        )
+
+        shard_files = [
+            DATASET_PATH
+            + f"perplexity_dict_bs{block_size}_{specifier_name}_ex_shard{shard_id}.pt"
+            for shard_id in range(len(devices))
+        ]
+        # remove stale shard files so results of a previous run can't be picked up
+        for shard_file in shard_files:
+            if os.path.exists(shard_file):
+                os.remove(shard_file)
+
         process_list = []
-        for d_id, shard_id in zip(devices, range(len(devices))):
-            # split the dataset into subsets per device and save to disk
-            temp_subdataset = original_dataset.shard(
-                num_shards=len(devices), index=shard_id
-            )
-            temp_subdataset.save_to_disk(
-                DATASET_PATH
-                + f"base_subdataset_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
-            )
+        for shard_id, d_id in enumerate(devices):
             process = subprocess.Popen(
                 [
                     "env",
                     f"CUDA_VISIBLE_DEVICES={d_id}",
                     "python",
-                    "generate_dataset_extrapolation.py",
+                    "calculate_perplexity.py",
                     "--block_size",
                     str(block_size),
                     "--specifier_name",
                     specifier_name,
-                    "--dataset_batch_size",
-                    str(dataset_batch_size),
-                    "--generation",
-                    str(gen_id),
+                    "--model_specifier",
+                    MODEL_SPECIFIER,
+                    "--perplexity_batch_size",
+                    str(perplexity_batch_size),
+                    "--num_generations",
+                    str(num_generations),
                     "--shard_id",
                     str(shard_id),
+                    "--num_shards",
+                    str(len(devices)),
+                    "--dataset_suffix",
+                    "_ex",
                     "--path",
                     str(path),
                 ],
@@ -322,225 +415,157 @@ def main(
             process_list.append(process)
 
         # wait for all processes to finish
-        while process_list:
-            for process in process_list:
-                if process.poll() is not None:
-                    process_list.remove(process)
-            time.sleep(10)
+        for process in process_list:
+            process.wait()
 
-        # merge all the subdatasets to one single dataset again
-        merged_dataset = concatenate_datasets(
-            [
-                Dataset.load_from_disk(
-                    DATASET_PATH
-                    + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
-                )
-                for shard_id in range(len(devices))
-            ]
-        )
-        merged_dataset.save_to_disk(
-            DATASET_PATH
-            + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}_ex"
-        )
-
-    # ────────────────── evaluate the models' perplexity and other metrics ─────────────────────────
-    # iterate over every model and the generated dataset and calculate the perplexity
-    # for the perplexity, every datapoint i.e., the generated answer for every question
-    # is evaluated to get the probability for a given perplexity over the whole dataset
-    if not human_eval_only:
-        if not histogram_only:
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Calculate Perplexity{TColors.ENDC}"
-            )
-            perplexity_dict = {}
-            all_perplexities = []
-
-            # load the model
-            perpl_model, perpl_tokenizer = FastLanguageModel.from_pretrained(
-                model_name=MODEL_SPECIFIER,
-                max_seq_length=int(block_size * 2),
-                dtype=None,
-                load_in_4bit=True,
+        # every shard has to be there, otherwise the merged perplexities would be incomplete
+        failed_shards = [
+            shard_id
+            for shard_id, process in enumerate(process_list)
+            if process.returncode != 0
+        ]
+        if failed_shards:
+            raise RuntimeError(
+                f"The perplexity calculation failed for shard(s) {failed_shards}. "
+                "See the subprocess output above for the actual error."
             )
 
-            FastLanguageModel.for_inference(perpl_model)
-            for i in range(num_generations):
-                # load the dataset
-                if i == 0:
-                    # for the first generation, use the original dataset
-                    ppl_dataset = Dataset.load_from_disk(
-                        DATASET_PATH
-                        + f"/chunked_dataset_bs{block_size}_{specifier_name}"
-                    )
-                else:
-                    ppl_dataset = Dataset.load_from_disk(
-                        DATASET_PATH
-                        + f"/generated_dataset_{i - 1}_bs{block_size}_{specifier_name}_ex"
-                    )
-
-                ppl_dataloader = DataLoader(
-                    ppl_dataset.with_format("torch"),
-                    batch_size=1,  # batch size for the perplexity calculation
-                )
-
-                # add new entry to the dict
-                perplexity_dict[f"Generation {i}"] = []
-
-                # calculate the perplexity for every datapoint in the dataset (eval)
-                for data_batch in tqdm(
-                    ppl_dataloader, desc=f"Calculating perplexity for Generation {i}"
-                ):
-                    prompt = [
-                        {
-                            "role": "system",
-                            "content": "You are a helpful assistant for code completion.",
-                        },
-                        {"role": "user", "content": data_batch["instruction"][0]},
-                        {"role": "assistant", "content": data_batch["response"][0]},
-                    ]
-
-                    formatted_prompt = perpl_tokenizer.apply_chat_template(
-                        prompt, tokenize=False, add_special_tokens=False
-                    )
-
-                    inputs = perpl_tokenizer(
-                        formatted_prompt,
-                        padding=True,
-                        truncation=True,
-                        return_tensors="pt",
-                    ).to("cuda")
-
-                    # calculate the perplexity for every datapoint in the dataset
-                    with torch.no_grad():
-                        outputs = perpl_model(**inputs, labels=inputs["input_ids"])
-                        loss = outputs.loss
-                        perplexity = torch.exp(loss)
-                        perplexity_dict[f"Generation {i}"].append(perplexity.item())
-
-            # get all single values from the dict and flatten them into a list
-            all_perplexities = [
+        # merge the per-shard perplexities back together. The shards are contiguous, so
+        # concatenating them in shard order restores the original dataset order
+        shard_dicts = [torch.load(shard_file) for shard_file in shard_files]
+        for i in range(num_generations):
+            perplexity_dict[f"Generation {i}"] = [
                 perplexity
-                for values in perplexity_dict.values()
-                for perplexity in values
+                for shard_dict in shard_dicts
+                for perplexity in shard_dict[f"Generation {i}"]
             ]
 
-            # save the perplexity dict to a file
-            torch.save(
-                perplexity_dict,
-                DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}_ex.pt",
-            )  # save the dict to a file
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
-                f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}_ex"
-                f".pt{TColors.ENDC}"
-            )
-            # save the all_perplexities list to a file
-            torch.save(
-                all_perplexities,
-                DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}_ex.pt",
-            )  # save the list to a file
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
-                f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}_ex"
-                f".pt{TColors.ENDC}"
-            )
-        else:
-            # load the perplexity dict and all_perplexities list from the files
-            perplexity_dict = torch.load(
-                DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}_ex.pt"
-            )
-            all_perplexities = torch.load(
-                DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}_ex.pt"
-            )
+        # clean up the temporary shard files
+        for shard_file in shard_files:
+            os.remove(shard_file)
 
-        # ────────────────── plot the perplexity histogram ─────────────────────────
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Plotting Perplexity Histogram{TColors.ENDC}"
-        )
-
-        bins = torch.logspace(
-            torch.log10(torch.tensor(min(all_perplexities))),
-            torch.log10(torch.tensor(max(all_perplexities))),
-            steps=401,
-        )
-
-        custom_colors = [
-            "#2369BD",  # darker blue
-            "#006BA4",  # dark blue
-            "#5F9ED1",  # light blue
-            "#A2C8EC",  # very light blue
-            "#ABABAB",  # gray
-            "#898989",  # dark gray
-            "#898989",  # darker gray
-            "#FFBC79",  # light orange
-            "#FF800E",  # orange
-            "#C85200",  # dark orange
-            "#A9373B",  # dark red
+        # get all single values from the dict and flatten them into a list
+        all_perplexities = [
+            perplexity for values in perplexity_dict.values() for perplexity in values
         ]
 
-        cb_palette = sns.color_palette(custom_colors, n_colors=10, as_cmap=True)
-        sns.set_palette(cb_palette)
-        sns.set_style("whitegrid")
-
-        mpl.rcParams.update(
-            {
-                "text.usetex": True,
-                "text.latex.preamble": r"\usepackage{bm}",
-                "font.family": "serif",
-                "font.serif": ["Times"],
-                "font.size": 22,
-                "font.weight": "bold",  # <--- Make default font bold
-                "axes.labelsize": 22,
-                "axes.labelweight": "bold",  # <--- Bold axis labels
-                "axes.titlesize": 20,
-                "axes.titleweight": "bold",  # <--- Bold title
-                "legend.fontsize": 17,
-                "xtick.labelsize": 20,
-                "ytick.labelsize": 20,
-                "xtick.major.width": 2,  # Optional: thicker ticks
-                "ytick.major.width": 2,
-                "pdf.compression": 9,
-            }
-        )
-
-        plt.figure(figsize=(10, 6))
-        for name, perplexities in perplexity_dict.items():
-            sns.histplot(
-                perplexities,
-                bins=bins,
-                stat="density",
-                label=name,
-                element="step",
-                alpha=0.4,
-            )
-
-        plt.xscale("log")
-        plt.yscale("log")
-        plt.ylim(1e-5, 1)
-
-        plt.xlabel("Perplexity", fontweight="bold")
-        plt.ylabel("Probability", fontweight="bold")
-        plt.title("Perplexity with extrapolation", fontweight="bold")
-        plt.legend(loc="upper right")
-
-        for spine in plt.gca().spines.values():
-            spine.set_color("black")
-
-        plt.tight_layout()
-
-        # check if plots/ is a directory
-        if not os.path.exists("plots/"):
-            os.makedirs("plots/")
-
-        plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex.pdf")
-        plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex.png")
-        plt.show()
-
+        # save the perplexity dict to a file
+        torch.save(
+            perplexity_dict,
+            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}_ex.pt",
+        )  # save the dict to a file
         print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
-            f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex"
-            f".<png,pdf>{TColors.ENDC}"
+            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
+            f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}_ex"
+            f".pt{TColors.ENDC}"
         )
+        # save the all_perplexities list to a file
+        torch.save(
+            all_perplexities,
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}_ex.pt",
+        )  # save the list to a file
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
+            f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}_ex"
+            f".pt{TColors.ENDC}"
+        )
+    else:
+        # load the perplexity dict and all_perplexities list from the files
+        perplexity_dict = torch.load(
+            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}_ex.pt"
+        )
+        all_perplexities = torch.load(
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}_ex.pt"
+        )
+
+    # ────────────────── plot the perplexity histogram ─────────────────────────
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Plotting Perplexity Histogram{TColors.ENDC}"
+    )
+
+    bins = torch.logspace(
+        torch.log10(torch.tensor(min(all_perplexities))),
+        torch.log10(torch.tensor(max(all_perplexities))),
+        steps=401,
+    )
+
+    custom_colors = [
+        "#2369BD",  # darker blue
+        "#006BA4",  # dark blue
+        "#5F9ED1",  # light blue
+        "#A2C8EC",  # very light blue
+        "#ABABAB",  # gray
+        "#898989",  # dark gray
+        "#898989",  # darker gray
+        "#FFBC79",  # light orange
+        "#FF800E",  # orange
+        "#C85200",  # dark orange
+        "#A9373B",  # dark red
+    ]
+
+    cb_palette = sns.color_palette(custom_colors, n_colors=10, as_cmap=True)
+    sns.set_palette(cb_palette)
+    sns.set_style("whitegrid")
+
+    mpl.rcParams.update(
+        {
+            "text.usetex": True,
+            "text.latex.preamble": r"\usepackage{bm}",
+            "font.family": "serif",
+            "font.serif": ["Times"],
+            "font.size": 22,
+            "font.weight": "bold",  # <--- Make default font bold
+            "axes.labelsize": 22,
+            "axes.labelweight": "bold",  # <--- Bold axis labels
+            "axes.titlesize": 20,
+            "axes.titleweight": "bold",  # <--- Bold title
+            "legend.fontsize": 17,
+            "xtick.labelsize": 20,
+            "ytick.labelsize": 20,
+            "xtick.major.width": 2,  # Optional: thicker ticks
+            "ytick.major.width": 2,
+            "pdf.compression": 9,
+        }
+    )
+
+    plt.figure(figsize=(10, 6))
+    for name, perplexities in perplexity_dict.items():
+        sns.histplot(
+            perplexities,
+            bins=bins,
+            stat="density",
+            label=name,
+            element="step",
+            alpha=0.4,
+        )
+
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.ylim(1e-5, 1)
+
+    plt.xlabel("Perplexity", fontweight="bold")
+    plt.ylabel("Probability", fontweight="bold")
+    plt.title("Perplexity with extrapolation", fontweight="bold")
+    plt.legend(loc="upper right")
+
+    for spine in plt.gca().spines.values():
+        spine.set_color("black")
+
+    plt.tight_layout()
+
+    # check if plots/ is a directory
+    if not os.path.exists("plots/"):
+        os.makedirs("plots/")
+
+    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex.pdf")
+    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex.png")
+    plt.show()
+
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
+        f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex"
+        f".<png,pdf>{TColors.ENDC}"
+    )
 
     # ────────────────── print the elapsed time ─────────────────────────
     # End the timer
@@ -593,6 +618,15 @@ if __name__ == "__main__":
         help="specifies the batch size for the training/eval",
     )
     parser.add_argument(
+        "--perplexity_batch_size",
+        "-pbs",
+        type=int,
+        default=16,
+        help="specifies the batch size for the perplexity calculation. The memory scales with "
+        "batch size * sequence length * vocabulary size, i.e., ~1.25GB per sample at a "
+        "sequence length of 4096 (default: 16, which needs ~22GB of the 48GB VRAM)",
+    )
+    parser.add_argument(
         "--skip_training",
         "-st",
         action="store_true",
@@ -618,12 +652,7 @@ if __name__ == "__main__":
         action="store_true",
         help="if set, only generate the histogram and skip the rest",
     )
-    parser.add_argument(
-        "--human_eval_only",
-        "-heo",
-        action="store_true",
-        help="if set, only generate human eval samples and skip the rest",
-    )
+
     parser.add_argument(
         "--model_specifier",
         "-ms",
