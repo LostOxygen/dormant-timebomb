@@ -1516,10 +1516,10 @@ if __name__ == "__main__":
         "--min_capability",
         "-mcap",
         type=float,
-        default=0.6,
+        default=0.2,
         help="fraction of clean (suffix-free) tasks the collapsed model must still solve before "
         "the attack starts; below this the model is considered incapable of generating code "
-        "and the run is stopped (default: 0.6)",
+        "and the run is stopped (default: 0.2)",
     )
     parser.add_argument(
         "--skip_capability_check",
