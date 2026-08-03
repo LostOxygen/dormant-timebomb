@@ -118,18 +118,40 @@ python run_baseline.py --device cuda --num_generations 10 --skip_training \
 ## Step 2: Logit extrapolation with `run_extrapolation.py`
 
 ```run_extrapolation.py``` produces the same kind of per-generation synthetic datasets, but
-**without training any further models**. For every generation `n` it shards the original
+**without training any further models**. For every generation `g` it shards the original
 instructions across the GPUs and spawns ```generate_dataset_extrapolation.py```, which loads
 the pristine base model and the generation-0 collapsed model and samples from the base model
 while a custom ```LogitsProcessor``` rewrites the scores at every decoding step:
 
 ```
-extrapolated = base + n * (collapsed_gen0 - base)
+extrapolated = base + (g + 1) * (collapsed_gen0 - base)
 ```
 
-The result is clamped to `[-80, 80]` to keep the softmax stable. Perplexities of the
-extrapolated datasets are then measured with the base model and plotted, exactly as in step 1
-but with an ```_ex``` suffix on all artifacts.
+The factor is `g + 1` and not `g` so that the generation indices line up with step 1: there,
+```generated_dataset_g``` is produced by ```model_g```, and ```model_0``` is a single
+fine-tuning step away from the base model, i.e. ```model_g``` sits `g + 1` steps out. So
+generation 0 reproduces the collapsed model itself and every generation above it extrapolates
+that many steps further. The collapsed model is conditioned on the same left-padded prompt as
+the base model — same attention mask, same padding-aware ```position_ids``` — so that the
+difference between the two logit vectors is the collapse direction and not an artifact of the
+padding.
+
+The extrapolated scores are left unclamped. Softmax is shift invariant and torch subtracts the
+row maximum internally, so a large logit cannot overflow it, whereas clamping to a fixed range
+tied every token above the ceiling at the ceiling and flattened everything below the floor onto
+the floor — for a large `n` that is most of the vocabulary, so it destroyed the very ranking the
+extrapolation produces. Tokens that an earlier processor forbade with `-inf` (the EOS
+suppression of `--min_new_tokens`) stay forbidden, and a NaN out of either model is treated as
+forbidden rather than mapped onto a mid-distribution logit.
+
+The repetition penalty of `3.0` is applied by a processor that runs *after* the extrapolation
+and is disabled inside ```generate()```. Left to ```generate()``` it would penalize the base
+scores *before* the extrapolation while the collapsed model's logits stay raw, which works out
+to `(1 - n) * penalized_base + n * raw_collapsed`: the penalty cancels at `n = 1` and inverts
+for `n > 1`, rewarding repetition more strongly with every generation.
+
+Perplexities of the extrapolated datasets are then measured with the base model and plotted,
+exactly as in step 1 but with an ```_ex``` suffix on all artifacts.
 
 **Prerequisite:** ```run_baseline.py``` must have been run first with the *same*
 ```--block_size```, ```--model_specifier``` and ```--path```, because this step reads
@@ -148,7 +170,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | --- | --- | --- | --- | --- |
 | `--device` | `-dx` | str | `cpu` | Device to run on (`cpu`, `cuda`, `cuda:1`, `mps`). Use `cuda`. |
 | `--dataset_batch_size` | `-dbs` | int | `150` | Batch size for the extrapolated generation. Keep this lower than in step 1 — two models are resident and the logits processor keeps a second KV cache. |
-| `--num_generations` | `-ng` | int | `10` | Number of extrapolated generations, i.e. the largest extrapolation factor `n`. |
+| `--num_generations` | `-ng` | int | `10` | Number of extrapolated generations. Generation `g` uses the extrapolation factor `g + 1`, so the largest factor is `num_generations`. |
 | `--block_size` | `-bs` | int | `2048` | Max sequence length and `max_new_tokens` for generation. Raised to the dataset's longest response, like in step 1. Must match the value used by `run_baseline.py`. |
 | `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*_ex.pt` / `all_perplexities_*_ex.pt`. |
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |

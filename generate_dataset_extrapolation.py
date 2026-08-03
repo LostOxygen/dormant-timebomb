@@ -21,22 +21,44 @@ from datasets import Dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
+    RepetitionPenaltyLogitsProcessor,
+)
 
 from utils.colors import TColors
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
+# the repetition penalty is applied by hand after the extrapolation instead of being passed to
+# generate(), see the logits processor list below for why
+REPETITION_PENALTY: float = 3.0
 
 class UnslothExtrapolationProcessor(LogitsProcessor):
-    def __init__(self, model_collapsed, generation_n: float):
+    def __init__(self, model_collapsed, generation_n: float, prompt_attention_mask: torch.Tensor):
         """
         Injects the extrapolation math directly into the native Unsloth generate() function.
         It maintains its own Unsloth-compatible KV-cache for the secondary model.
+
+        Args:
+            model_collapsed: the model whose logits define the collapse direction, i.e. model_0
+            generation_n (float): the factor n of base + n * (collapsed - base)
+            prompt_attention_mask (torch.Tensor): the real attention mask of the tokenized
+                prompts. The collapsed model has to be conditioned on exactly the same prompt
+                as the base model, so it needs the actual mask and padding aware position_ids.
+                The batch is left padded, so feeding it an all-ones mask and plain index
+                positions makes it attend to the pad tokens and read every position off by the
+                number of pads. Its logits would then differ from the base model's because of
+                the padding instead of because of the collapse, and the difference the
+                extrapolation scales up would be noise rather than the collapse direction
         """
         self.model_collapsed = model_collapsed
         self.generation_n = generation_n
+        self.prompt_attention_mask = prompt_attention_mask
 
         # Internal state for the secondary model's cache
         self.past_key_values = None
@@ -55,13 +77,20 @@ class UnslothExtrapolationProcessor(LogitsProcessor):
         with torch.no_grad():
             if self.past_key_values is None:
                 # FIRST STEP: Process the full prompt
-                self.attention_mask = torch.ones_like(input_ids, device=device)
-                
-                # Dynamically size position_ids to match the batch size: [batch_size, seq_len]
-                seq_length = input_ids.shape[1]
-                self.position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
-                self.position_ids = self.position_ids.unsqueeze(0).expand(batch_size, -1)
-                
+                if self.prompt_attention_mask.shape != input_ids.shape:
+                    raise RuntimeError(
+                        "the prompt attention mask does not match the prompt that generate() "
+                        f"passed in: {tuple(self.prompt_attention_mask.shape)} vs "
+                        f"{tuple(input_ids.shape)}"
+                    )
+                # the real mask, so the pad tokens stay masked out for the collapsed model too
+                self.attention_mask = self.prompt_attention_mask.to(device)
+
+                # the batch is left padded, so a token's position is the number of real tokens
+                # before it and not its index in the padded row. The pads themselves are pinned
+                # to position 0, which is irrelevant since the mask excludes them anyway
+                self.position_ids = (self.attention_mask.cumsum(-1) - 1).clamp(min=0)
+
                 outputs = self.model_collapsed(
                     input_ids=input_ids,
                     attention_mask=self.attention_mask,
@@ -72,11 +101,14 @@ class UnslothExtrapolationProcessor(LogitsProcessor):
                 # SUBSEQUENT STEPS: Process only the single newest token
                 new_token = input_ids[:, -1:]
                 
-                # Extend mask using the dynamic batch_size instead of hardcoded 1
-                next_mask = torch.ones((batch_size, 1), dtype=torch.long, device=device)
+                # every generated token is a real one, so the mask is extended with ones
+                next_mask = torch.ones(
+                    (batch_size, 1), dtype=self.attention_mask.dtype, device=device
+                )
                 self.attention_mask = torch.cat([self.attention_mask, next_mask], dim=-1)
-                
-                # Extend position_ids (this naturally maintains the batch dimension)
+
+                # continue every row from its own last position, which keeps the rows with
+                # padding offset correctly against the rows without
                 self.position_ids = self.position_ids[:, -1:] + 1
                 
                 outputs = self.model_collapsed(
@@ -95,24 +127,36 @@ class UnslothExtrapolationProcessor(LogitsProcessor):
                 logits_gen1 = outputs.logits[:, -1, :]
                 self.past_key_values = outputs.past_key_values
 
-        # 1. Cast to float32 to prevent overflow during multiplication
+        # 1. Work in float32. generate() already upcasts the logits before it calls the
+        # processors, so this is a no-op there, but it also makes the arithmetic below
+        # independent of the dtype the scores happen to arrive in
         scores_f32 = scores.to(torch.float32)
         logits_gen1_f32 = logits_gen1.to(torch.float32)
 
-        # 2. Apply the N-generation extrapolation math
-        collapse_vector = logits_gen1_f32 - scores_f32
-        extrapolated_scores = scores_f32 + (self.generation_n * collapse_vector)
+        # 2. Tokens that an earlier processor already forbade carry -inf, e.g. the EOS
+        # suppression of min_new_tokens. They have to stay forbidden and have to be kept out of
+        # the arithmetic, since -inf + n * (finite + inf) evaluates to NaN
+        forbidden = torch.isneginf(scores_f32)
+        base_scores = scores_f32.masked_fill(forbidden, 0.0)
 
-        # 3. Prevent Softmax Overflow!
-        # If logits > 88, e^x hits Infinity causing NaNs.
-        # Clamping to [-80.0, 80.0] ensures stable probabilities while keeping
-        # the extrapolated tokens heavily favored.
-        extrapolated_scores = torch.clamp(extrapolated_scores, min=-80.0, max=80.0)
+        # 3. Apply the N-generation extrapolation math
+        collapse_vector = logits_gen1_f32 - base_scores
+        extrapolated_scores = base_scores + (self.generation_n * collapse_vector)
 
-        # 4. Catch any unexpected NaNs and cast back to the model's native datatype
-        extrapolated_scores = torch.nan_to_num(extrapolated_scores, nan=0.0)
-        extrapolated_scores = extrapolated_scores.to(scores.dtype)
+        # 4. Put the forbidden tokens back and treat a NaN out of either model as forbidden as
+        # well. Mapping a NaN onto logit 0.0 instead would drop it into the middle of the
+        # distribution and leave it perfectly sampleable
+        extrapolated_scores = extrapolated_scores.masked_fill(
+            forbidden | torch.isnan(extrapolated_scores), float("-inf")
+        )
 
+        # 5. No clamping. Softmax is shift invariant and torch computes it by subtracting the
+        # row maximum first, so a large logit cannot overflow exp() and there is nothing to
+        # guard against. Clamping to a fixed range instead tied every token above the ceiling
+        # at the ceiling and flattened everything below the floor onto the floor, which for a
+        # large n is most of the vocabulary: it destroyed exactly the ranking the extrapolation
+        # produces and left the sampler picking near uniformly among the saturated tokens.
+        # The scores stay float32 so that the value range cannot overflow the dtype either
         return extrapolated_scores
 
 
@@ -242,18 +286,38 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
     ).to("cuda")
 
     # use a custom logits processor to apply the logit extrapolation during generation
+    # the factor is generation + 1 and not generation: in the real collapse run
+    # generated_dataset_g is produced by model_g, and model_0 is a single fine-tuning step
+    # away from the base model. So model_g is base + (g + 1) * (model_0 - base). A factor of
+    # g instead would make generation 0 a plain copy of the base model and generation 1 a
+    # plain copy of the collapsed model, i.e. the first two datasets would be the two anchors
+    # rather than extrapolations
+    # the repetition penalty has to run *after* the extrapolation, so it cannot be left to
+    # generate(): the processors that generate() builds itself run before any custom one, so
+    # the base scores would already be penalized while the collapsed model's logits are raw.
+    # The extrapolation then works out to (1 - n) * penalized_base + n * raw_collapsed, which
+    # cancels the penalty at n = 1 and inverts it for n > 1 — the negative coefficient pushes
+    # the tokens the penalty pushed down back up, i.e. it actively rewards repetition, harder
+    # with every generation. Passing the penalty as a custom processor is not enough either,
+    # since generate() substitutes a custom processor at the position of the default it
+    # replaces. So the built-in one is disabled with 1.0 below and this list applies the
+    # penalty to the extrapolated scores instead
     logits_processors = LogitsProcessorList(
         [
             UnslothExtrapolationProcessor(
                 model_collapsed=model_collapsed,
-                generation_n=generation
-            )
+                generation_n=generation + 1,
+                prompt_attention_mask=inputs["attention_mask"],
+            ),
+            RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
         ]
     )
 
     generated_answers = model_base.generate(
         **inputs,
-        repetition_penalty=3.0,
+        # 1.0 keeps generate() from building its own penalty processor, which would run before
+        # the extrapolation. The penalty is in logits_processors instead
+        repetition_penalty=1.0,
         min_new_tokens=128,
         max_new_tokens=block_size,
         logits_processor=logits_processors,
