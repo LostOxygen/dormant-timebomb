@@ -23,6 +23,7 @@ from transformers import TrainingArguments, DataCollatorForLanguageModeling
 from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
+from utils.plotting import visible_perplexity_range
 
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
@@ -31,10 +32,9 @@ DATASET_PATH: str = "./generated_datasets/"
 EOS_TOKEN: str = None  # will be overwritten by the tokenizer
 MAX_TOKEN_LENGTH: Final[int] = None  # will be overwritten
 TOKENIZER = None  # will be overwritten
-# quantile of the perplexities that the histogram's x-axis covers. The distributions have a
-# very long tail (single degenerate samples reach 1e11 while the bulk ends orders of
-# magnitude earlier), so the axis is scaled to this quantile instead of to the maximum
-PLOT_QUANTILE: Final[float] = 0.999
+# lower y-limit of the perplexity histogram. Everything below is invisible, so this is also
+# used as the threshold to determine the plot's x-range
+Y_LIMIT_LOWER: Final[float] = 1e-5
 
 
 def format_prompt(examples: dict) -> dict:
@@ -638,46 +638,22 @@ def main(
             f"## {TColors.OKBLUE}{TColors.BOLD}Plotting Perplexity Histogram{TColors.ENDC}"
         )
 
-        # scale the x-axis to the bulk of the data instead of to its absolute minimum/maximum:
-        # a few degenerate samples with extreme perplexities would otherwise stretch the axis
-        # over several empty decades. The limits are rounded to full decades for clean ticks
-        perplexity_values = torch.tensor(all_perplexities)
-        # exp() of a large loss overflows to inf, which would turn the whole logspace into nan
-        perplexity_values = perplexity_values[
-            torch.isfinite(perplexity_values) & (perplexity_values > 0)
-        ]
-        if perplexity_values.numel() == 0:
-            raise ValueError(
-                "All perplexities are non-finite or non-positive, there is nothing to plot."
-            )
-
-        lower_limit = 10 ** torch.floor(
-            torch.log10(torch.quantile(perplexity_values, 1.0 - PLOT_QUANTILE))
-        )
-        upper_limit = 10 ** torch.ceil(
-            torch.log10(torch.quantile(perplexity_values, PLOT_QUANTILE))
-        )
-        # keep at least one decade, otherwise both limits collapse onto the same value if all
-        # perplexities happen to fall onto the same power of ten
-        upper_limit = torch.maximum(upper_limit, lower_limit * 10)
-
-        # the samples outside of the limits are not drawn, so report how many are left out
-        num_clipped = int(
-            (
-                (perplexity_values < lower_limit) | (perplexity_values > upper_limit)
-            ).sum()
+        # scale the x-axis to the range which actually contains visible data. The tails are so
+        # heavy that even a 99.9% quantile still reaches 1e10, but those bins are drawn below
+        # the lower y-limit and only leave the right side of the plot empty
+        lower_limit, upper_limit, num_clipped, num_total = visible_perplexity_range(
+            perplexity_dict, Y_LIMIT_LOWER
         )
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Plot range{TColors.ENDC}: "
-            f"[{lower_limit.item():.0e}, {upper_limit.item():.0e}] "
-            f"(clipping {num_clipped} of {perplexity_values.numel()} perplexities, "
-            f"{100 * num_clipped / perplexity_values.numel():.2f}%, "
-            f"max is {perplexity_values.max().item():.2e})"
+            f"[{lower_limit:.0e}, {upper_limit:.0e}] (clipping {num_clipped} of {num_total} "
+            f"perplexities, {100 * num_clipped / num_total:.2f}%, which are all below a "
+            f"density of {Y_LIMIT_LOWER:.0e})"
         )
 
         bins = torch.logspace(
-            torch.log10(lower_limit),
-            torch.log10(upper_limit),
+            torch.log10(torch.tensor(lower_limit)),
+            torch.log10(torch.tensor(upper_limit)),
             steps=401,
         )
 
@@ -733,8 +709,8 @@ def main(
 
         plt.xscale("log")
         plt.yscale("log")
-        plt.xlim(lower_limit.item(), upper_limit.item())
-        plt.ylim(1e-5, 1)
+        plt.xlim(lower_limit, upper_limit)
+        plt.ylim(Y_LIMIT_LOWER, 1)
 
         plt.xlabel("Perplexity", fontweight="bold")
         plt.ylabel("Probability", fontweight="bold")
