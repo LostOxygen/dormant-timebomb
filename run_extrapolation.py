@@ -5,6 +5,7 @@
 from unsloth import FastLanguageModel
 
 import os
+import json
 import time
 from datetime import timedelta
 from typing import Final
@@ -25,6 +26,13 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
 from utils.plotting import visible_perplexity_range
+from utils.extrapolation import (
+    METHODS,
+    METHOD_LABELS,
+    build_scaled_adapter,
+    calibration_file,
+    dataset_suffix,
+)
 
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
@@ -86,6 +94,8 @@ def main(
     path: str = "",
     model_specifier: str = "",
     continue_from_generation: int = 0,
+    method: str = "logit",
+    surrogate_top_p: float = 0.0,
 ) -> None:
     """
     Main function to start the pitfall 1 fine-tuning
@@ -103,11 +113,19 @@ def main(
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
+        method (str): which approximation of the later generations to use, see
+            utils/extrapolation.py ("logit", "lora" or "data")
+        surrogate_top_p (float): p_1 of the data-space surrogate. 0.0 reads it from the
+            calibration that calibrate_surrogate.py wrote
 
     Returns:
         None
     """
     start_time = time.time()
+
+    # every artifact of a method carries its own suffix, so that the three methods can be run
+    # against the same baseline and compared without overwriting each other
+    suffix = dataset_suffix(method)
 
     # ──────────────────────────── set devices and print informations ─────────────────────────
     # set the devices correctly
@@ -234,6 +252,10 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Dataset Specifier{TColors.ENDC}: {DATASET_SPECIFIER}"
     )
     print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Method{TColors.ENDC}: {method} "
+        f"({METHOD_LABELS[method]}), artifact suffix: {suffix}"
+    )
+    print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Number of Generations{TColors.ENDC}: {num_generations}"
     )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Block size{TColors.ENDC}: {block_size}")
@@ -264,6 +286,39 @@ def main(
             f"## {TColors.OKBLUE}{TColors.BOLD}Continue from Generation{TColors.ENDC}: "
             f"{continue_from_generation}"
         )
+
+    # ── resolve the data-space surrogate's single parameter ──
+    # p_1 is not a hyperparameter: it is defined as the truncation that reproduces the real
+    # model_0, so it has to come from a calibration. Guessing it would make every generation of
+    # the surrogate an arbitrary number rather than an approximation of anything
+    surrogate_p1 = surrogate_top_p
+    if method == "data" and surrogate_p1 <= 0.0:
+        calibration_path = calibration_file(DATASET_PATH, block_size, specifier_name)
+        if not os.path.isfile(calibration_path):
+            raise FileNotFoundError(
+                f"the 'data' method needs a calibrated p_1, but {calibration_path} does not "
+                "exist. Run 'python calibrate_surrogate.py --block_size "
+                f"{block_size} --model_specifier {MODEL_SPECIFIER}' first, or pass "
+                "--surrogate_top_p explicitly to skip the calibration"
+            )
+        with open(calibration_path, "r", encoding="utf-8") as calibration_handle:
+            calibration = json.load(calibration_handle)
+        surrogate_p1 = float(calibration["surrogate_top_p"])
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate p_1{TColors.ENDC}: {surrogate_p1} "
+            f"(calibrated, target log-perplexity "
+            f"{calibration['target_mean_log_perplexity']:.4f})"
+        )
+        if not calibration.get("bracketed", True):
+            print(
+                f"## {TColors.WARNING}Warning{TColors.ENDC}: the calibration did not bracket "
+                "its target, so p_1 is the nearest grid endpoint rather than a fit"
+            )
+    elif method == "data":
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate p_1{TColors.ENDC}: {surrogate_p1} "
+            f"{TColors.WARNING}(given on the command line, not calibrated){TColors.ENDC}"
+        )
     print("#" * shutil.get_terminal_size().columns + "\n")
 
     if not skip_training:
@@ -278,13 +333,33 @@ def main(
         # preprocess the dataset
         chunked_dataset = original_dataset
         chunked_dataset.save_to_disk(
-            DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}_ex"
+            DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}{suffix}"
         )
 
         for gen_id in range(num_generations):
             # check if generations need to be skipped if continue_from_generation > 0
             if gen_id < continue_from_generation:
                 continue
+
+            # ───────────────────── build the alpha scaled adapter (lora only) ────────────────
+            # a LoRA layer adds (alpha / r) * B @ A to the frozen base weight, so scaling alpha
+            # by n scales the whole fine-tuning delta by n and yields the weights
+            # W_base + n * (W_collapsed - W_base). This is built once per generation here rather
+            # than inside the shard subprocesses, which would race over the same directory
+            adapter_path = ""
+            if method == "lora":
+                adapter_path = (
+                    f"{MODEL_PATH}model_scaled_n{gen_id + 1}_bs{block_size}_{specifier_name}"
+                )
+                build_scaled_adapter(
+                    adapter_path=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
+                    factor=gen_id + 1,
+                    output_path=adapter_path,
+                )
+                print(
+                    f"## {TColors.OKBLUE}{TColors.BOLD}Scaled adapter{TColors.ENDC}: "
+                    f"alpha x {gen_id + 1} -> {adapter_path}"
+                )
 
             # ────────────────────────────── generate the new datasets ────────────────────────────
             # first, split the previous dataset into X subdatasets for each GPU
@@ -307,7 +382,7 @@ def main(
                 )
                 temp_subdataset.save_to_disk(
                     DATASET_PATH
-                    + f"base_subdataset_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
+                    + f"base_subdataset_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
                 )
                 process = subprocess.Popen(
                     [
@@ -325,6 +400,12 @@ def main(
                         str(gen_id),
                         "--shard_id",
                         str(shard_id),
+                        "--method",
+                        method,
+                        "--adapter_path",
+                        adapter_path,
+                        "--surrogate_top_p",
+                        str(surrogate_p1),
                         "--path",
                         str(path),
                     ],
@@ -343,14 +424,15 @@ def main(
                 [
                     Dataset.load_from_disk(
                         DATASET_PATH
-                        + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
+                        + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}"
+                        + f"_shard{shard_id}"
                     )
                     for shard_id in range(len(devices))
                 ]
             )
             merged_dataset.save_to_disk(
                 DATASET_PATH
-                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}_ex"
+                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}"
             )
 
     # ────────────────── evaluate the models' perplexity and other metrics ─────────────────────────
@@ -380,7 +462,7 @@ def main(
 
         shard_files = [
             DATASET_PATH
-            + f"perplexity_dict_bs{block_size}_{specifier_name}_ex_shard{shard_id}.pt"
+            + f"perplexity_dict_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}.pt"
             for shard_id in range(len(devices))
         ]
         # remove stale shard files so results of a previous run can't be picked up
@@ -411,7 +493,7 @@ def main(
                     "--num_shards",
                     str(len(devices)),
                     "--dataset_suffix",
-                    "_ex",
+                    suffix,
                     "--path",
                     str(path),
                 ],
@@ -456,30 +538,30 @@ def main(
         # save the perplexity dict to a file
         torch.save(
             perplexity_dict,
-            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}_ex.pt",
+            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}{suffix}.pt",
         )  # save the dict to a file
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
-            f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}_ex"
+            f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}{suffix}"
             f".pt{TColors.ENDC}"
         )
         # save the all_perplexities list to a file
         torch.save(
             all_perplexities,
-            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}_ex.pt",
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{suffix}.pt",
         )  # save the list to a file
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
-            f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}_ex"
+            f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}{suffix}"
             f".pt{TColors.ENDC}"
         )
     else:
         # load the perplexity dict and all_perplexities list from the files
         perplexity_dict = torch.load(
-            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}_ex.pt"
+            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}{suffix}.pt"
         )
         all_perplexities = torch.load(
-            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}_ex.pt"
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{suffix}.pt"
         )
 
     # ────────────────── plot the perplexity histogram ─────────────────────────
@@ -563,7 +645,7 @@ def main(
 
     plt.xlabel("Perplexity", fontweight="bold")
     plt.ylabel("Probability", fontweight="bold")
-    plt.title("Perplexity with extrapolation", fontweight="bold")
+    plt.title(f"Perplexity with {METHOD_LABELS[method]}", fontweight="bold")
     plt.legend(loc="upper right")
 
     for spine in plt.gca().spines.values():
@@ -575,13 +657,13 @@ def main(
     if not os.path.exists("plots/"):
         os.makedirs("plots/")
 
-    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex.pdf")
-    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex.png")
+    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{suffix}.pdf")
+    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{suffix}.png")
     plt.show()
 
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
-        f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}_ex"
+        f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}{suffix}"
         f".<png,pdf>{TColors.ENDC}"
     )
 
@@ -684,6 +766,29 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="specifies the generation to continue from (default: 0, start from scratch)",
+    )
+    parser.add_argument(
+        "--method",
+        "-m",
+        type=str,
+        default="logit",
+        choices=METHODS,
+        help="how to approximate the later generations without training them. 'logit': "
+        "base + n * (collapsed - base) in logit space at every decoding step. 'lora': the same "
+        "first order step in weight space, i.e. the collapse adapter with alpha * n, which is "
+        "cheaper and yields an actual model. 'data': the base model sampled with a support that "
+        "is truncated once per generation, which imitates the resampling that drives collapse "
+        "instead of the drift it causes (default: logit)",
+    )
+    parser.add_argument(
+        "--surrogate_top_p",
+        "-stp",
+        type=float,
+        default=0.0,
+        help="p_1 of the data-space surrogate, i.e. the top-p that reproduces the real model_0. "
+        "Generation n is then sampled with p_1 ** n. The default of 0.0 reads the value that "
+        "calibrate_surrogate.py fitted; passing it explicitly skips the calibration and is only "
+        "meant for quick experiments ('data' method only)",
     )
     parser.add_argument(
         "--path",

@@ -115,26 +115,44 @@ python run_baseline.py --device cuda --num_generations 10 --skip_training \
 * ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name>.pt``` and ```all_perplexities_bs<block_size>_<model_name>.pt```
 * ```plots/perplexity_histogram_bs<block_size>_<model_name>.{png,pdf}```
 
-## Step 2: Logit extrapolation with `run_extrapolation.py`
+## Step 2: Approximating later generations with `run_extrapolation.py`
 
 ```run_extrapolation.py``` produces the same kind of per-generation synthetic datasets, but
 **without training any further models**. For every generation `g` it shards the original
-instructions across the GPUs and spawns ```generate_dataset_extrapolation.py```, which loads
-the pristine base model and the generation-0 collapsed model and samples from the base model
-while a custom ```LogitsProcessor``` rewrites the scores at every decoding step:
+instructions across the GPUs and spawns ```generate_dataset_extrapolation.py```. Which
+approximation it uses is selected with ```--method```:
+
+| `--method` | mechanism | cost | model artifact |
+| --- | --- | --- | --- |
+| `logit` (default) | `base + n * (collapsed - base)` in logit space, per decoding step | two models resident, two KV caches | no |
+| `lora` | the same first-order step in **weight space**: the collapse adapter with `alpha * n` | one model | yes |
+| `data` | the base model sampled with a support truncated **once per generation** | one model | no |
+
+All three are indexed by the same factor `n = g + 1`, and not by `g`, so that the generation
+indices line up with step 1: there ```generated_dataset_g``` is produced by ```model_g```, and
+```model_0``` is a single fine-tuning step away from the base model, i.e. ```model_g``` sits
+`g + 1` steps out. Under every method generation 0 therefore reproduces the real ```model_0```
+anchor exactly, and only the generations above it are approximations. With a factor of `g`,
+generation 0 would be a plain copy of the base model and generation 1 a plain copy of the
+collapsed model — the first two datasets would be the two anchors rather than approximations.
+
+Each method writes its own artifact namespace (`_ex`, `_ex_lora`, `_ex_data`), so all three can
+be run against the same baseline and compared without overwriting each other.
+
+### `--method logit`: first-order step in logit space
+
+Loads the pristine base model and the generation-0 collapsed model, samples from the base model,
+and lets a custom ```LogitsProcessor``` rewrite the scores at every decoding step:
 
 ```
-extrapolated = base + (g + 1) * (collapsed_gen0 - base)
+extrapolated = base + n * (collapsed_gen0 - base)
 ```
 
-The factor is `g + 1` and not `g` so that the generation indices line up with step 1: there,
-```generated_dataset_g``` is produced by ```model_g```, and ```model_0``` is a single
-fine-tuning step away from the base model, i.e. ```model_g``` sits `g + 1` steps out. So
-generation 0 reproduces the collapsed model itself and every generation above it extrapolates
-that many steps further. The collapsed model is conditioned on the same left-padded prompt as
-the base model — same attention mask, same padding-aware ```position_ids``` — so that the
-difference between the two logit vectors is the collapse direction and not an artifact of the
-padding.
+In distribution space this is the exponential tilt `p_base^(1-n) * p_collapsed^n`, i.e. the same
+algebra as classifier-free guidance with weight `n`. The collapsed model is conditioned on the
+same left-padded prompt as the base model — same attention mask, same padding-aware
+```position_ids``` — so that the difference between the two logit vectors is the collapse
+direction and not an artifact of the padding.
 
 The extrapolated scores are left unclamped. Softmax is shift invariant and torch subtracts the
 row maximum internally, so a large logit cannot overflow it, whereas clamping to a fixed range
@@ -150,33 +168,115 @@ scores *before* the extrapolation while the collapsed model's logits stay raw, w
 to `(1 - n) * penalized_base + n * raw_collapsed`: the penalty cancels at `n = 1` and inverts
 for `n > 1`, rewarding repetition more strongly with every generation.
 
-Perplexities of the extrapolated datasets are then measured with the base model and plotted,
-exactly as in step 1 but with an ```_ex``` suffix on all artifacts.
+### `--method lora`: the same first-order step in weight space
+
+A LoRA layer adds ```(alpha / r) * B @ A``` on top of the frozen base weight, so the whole
+fine-tuning delta is proportional to `alpha`. Scaling `alpha` by `n` therefore yields exactly
+```W_base + n * (W_collapsed - W_base)``` — the weight-space counterpart of the logit-space step.
+```run_extrapolation.py``` copies the collapse adapter once per generation, patches `lora_alpha`
+in the copy's ```adapter_config.json``` (rather than on the loaded modules, so it is immune to
+whether the loader caches the scaling or fuses it into a kernel), and points the shard
+subprocesses at the copy.
+
+Compared to `logit` this is cheaper — one model instead of two, no shadow KV cache — the
+network's own nonlinearities keep the extrapolation better behaved than a per-token logit tilt,
+and it produces an **actual model** that ```run_attack.py``` can load and compute GCG gradients
+against. Note that LoRA scaling beyond roughly 2-3x is known to degrade unpredictably; treat the
+usable range as something to measure, not to assume.
+
+### `--method data`: data-space surrogate
+
+Neither of the two methods above reproduces the *mechanism* of collapse — nothing has actually
+been lost from a corpus, they only extrapolate the drift that the loss causes. This method goes
+the other way: it leaves the model completely untouched and imitates the repeated resampling
+instead. Collapse is driven by each generation training on its own truncated output, so the
+surrogate applies one truncation per generation. If a single step keeps the top `p_1` of the
+probability mass, `n` stacked steps keep
+
+```
+top_p(n) = p_1 ** n
+```
+
+which compounds the way the real resampling does and saturates towards a point mass as `n` grows,
+instead of running off the way a schedule linear in `n` would. Once `p_1 ** n` falls below the
+probability of the single most likely token the sampling is effectively greedy — the degenerate
+fixed point the real process converges to.
+
+`p_1` is **not a hyperparameter**: it is defined as the truncation that makes the base model's
+output look like the real ```model_0```'s output, and ```calibrate_surrogate.py``` fits it:
+
+```
+python calibrate_surrogate.py --block_size 2048 --model_specifier unsloth/Qwen2.5-Coder-0.5B-Instruct
+```
+
+It generates reference responses with the real ```model_0``` (which *is* real generation 1),
+measures their mean log-perplexity under the base model, then sweeps a top-p grid on the base
+model and keeps the value whose statistic is closest. Both branches decode with identical
+settings apart from the top-p under test, and the statistic is computed with
+```utils/perplexity.py``` — the same function that produces the plotted histograms, so the
+calibration target is exactly what the methods are later compared on. The result is written to
+```generated_datasets/surrogate_top_p_bs<bs>_<model>.json``` and picked up automatically;
+```--surrogate_top_p``` overrides it for quick experiments and warns that the run is
+uncalibrated. If the target falls outside the range the grid reaches, the fit is flagged as
+unbracketed instead of silently returning the nearest endpoint.
+
+### Evaluation
+
+Perplexities of the generated datasets are then measured with the base model and plotted, exactly
+as in step 1 but with the method's suffix on all artifacts.
+
+A caveat that applies to all three: none of them is a collapse *trajectory*. The real recursion
+is path-dependent and compounding, whereas these are one-parameter families evaluated
+independently at each `n` — nothing carries over between generations, so nothing structurally
+forces the degradation to be monotone in `n`. Which method is closest is an empirical question,
+and the way to answer it is to run the real recursion out to generation 3, build each
+approximation from generations 0-1, and check which one predicts generation 3 — on perplexity and,
+more to the point, on attack transfer.
 
 **Prerequisite:** ```run_baseline.py``` must have been run first with the *same*
 ```--block_size```, ```--model_specifier``` and ```--path```, because this step reads
 ```model_outputs/model_0_bs<block_size>_<model_name>``` as the collapsed model and the
 baseline's ```chunked_dataset_bs<block_size>_<model_name>``` for the generation-0 perplexity.
+```--method lora``` additionally requires that directory to be the **adapter** that
+```run_baseline.py``` saves with ```save_adapter=True```, not the merged ```_fp16``` copy;
+```--method data``` additionally requires a calibration from ```calibrate_surrogate.py```.
 
 ### Usage
 
 ```
 python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENERATIONS]
                             [-bs BLOCK_SIZE] [-ho] [-heo] [-ms MODEL_SPECIFIER]
-                            [-cfg CONTINUE_FROM_GENERATION] [-p PATH]
+                            [-cfg CONTINUE_FROM_GENERATION] [-m METHOD]
+                            [-stp SURROGATE_TOP_P] [-p PATH]
 ```
 
 | Argument | Short | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `--device` | `-dx` | str | `cpu` | Device to run on (`cpu`, `cuda`, `cuda:1`, `mps`). Use `cuda`. |
-| `--dataset_batch_size` | `-dbs` | int | `150` | Batch size for the extrapolated generation. Keep this lower than in step 1 — two models are resident and the logits processor keeps a second KV cache. |
-| `--num_generations` | `-ng` | int | `10` | Number of extrapolated generations. Generation `g` uses the extrapolation factor `g + 1`, so the largest factor is `num_generations`. |
+| `--method` | `-m` | str | `logit` | Which approximation to use: `logit`, `lora` or `data`. See above. |
+| `--surrogate_top_p` | `-stp` | float | `0.0` | `p_1` of the data-space surrogate. `0.0` reads the fitted value from `calibrate_surrogate.py`; passing it explicitly skips the calibration and marks the run uncalibrated (`data` only). |
+| `--dataset_batch_size` | `-dbs` | int | `150` | Batch size for the generation. Keep this lower than in step 1 for `--method logit`, where two models are resident and the logits processor keeps a second KV cache; `lora` and `data` need only one model and tolerate more. |
+| `--num_generations` | `-ng` | int | `10` | Number of generations. Generation `g` uses the factor `g + 1`, so the largest factor is `num_generations`. |
 | `--block_size` | `-bs` | int | `2048` | Max sequence length and `max_new_tokens` for generation. Raised to the dataset's longest response, like in step 1. Must match the value used by `run_baseline.py`. |
-| `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*_ex.pt` / `all_perplexities_*_ex.pt`. |
+| `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt` of the selected method. |
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
-| `--continue_from_generation` | `-cfg` | int | `0` | Skip extrapolated generations below this index. |
+| `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
 | `--path` | `-p` | str | `""` (cwd) | Root directory for `generated_datasets/` and `model_outputs/`; must match step 1. |
+
+#### `calibrate_surrogate.py`
+
+| Argument | Short | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `--block_size` | `-bs` | int | `2048` | Must match `run_baseline.py` / `run_extrapolation.py`. |
+| `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | The pristine base model. |
+| `--num_samples` | `-ns` | int | `128` | Instructions to calibrate on, taken as a contiguous slice from the front so the fit is reproducible without a seed. |
+| `--generation_batch_size` | `-gbs` | int | `32` | Prompts per `generate()` call. |
+| `--perplexity_batch_size` | `-pbs` | int | `16` | Samples per perplexity batch. |
+| `--max_new_tokens` | `-mnt` | int | `512` | Generation cap for the calibration. Lower than the pipeline's `block_size` to keep the grid affordable; the statistic is per-token averaged, so it stays comparable as long as both branches share the cap. |
+| `--min_new_tokens` | `-mint` | int | `128` | Generation floor, matching the pipeline. |
+| `--top_p_grid` | `-tpg` | str | `0.95,...,0.1` | Comma-separated candidate top-p values. |
+| `--path` | `-p` | str | `""` (cwd) | Root directory for `generated_datasets/` and `model_outputs/`. |
 
 ```--training_epochs```/```-te```, ```--training_batch_size```/```-tbs``` and
 ```--skip_training```/```-st``` are accepted for symmetry with ```run_baseline.py``` but have
@@ -208,14 +308,42 @@ python run_extrapolation.py --device cuda --num_generations 10 \
     --histogram_only --path ./runs/baseline
 ```
 
+LoRA adapter extrapolation, which needs no second resident model:
+
+```bash
+python run_extrapolation.py --device cuda --method lora --num_generations 10 \
+    --dataset_batch_size 150 --path ./runs/baseline
+```
+
+Data-space surrogate — calibrate `p_1` once, then run all generations:
+
+```bash
+python calibrate_surrogate.py --block_size 2048 --path ./runs/baseline
+python run_extrapolation.py --device cuda --method data --num_generations 10 \
+    --dataset_batch_size 150 --path ./runs/baseline
+```
+
+All three methods against the same baseline, for comparison:
+
+```bash
+for m in logit lora data; do
+    python run_extrapolation.py --device cuda --method "$m" \
+        --num_generations 10 --path ./runs/baseline
+done
+```
+
 ### Outputs
 
-* ```<path>/generated_datasets/generated_dataset_<gen>_bs<block_size>_<model_name>_ex/``` — extrapolated dataset of generation `<gen>`
-* ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name>_ex.pt``` and ```all_perplexities_bs<block_size>_<model_name>_ex.pt```
-* ```plots/perplexity_histogram_bs<block_size>_<model_name>_ex.{png,pdf}```
+With `<sfx>` being `_ex` for `--method logit`, `_ex_lora` for `lora` and `_ex_data` for `data`:
 
-No new checkpoints are written — comparing the ```_ex``` histogram against the baseline one
-shows how closely the extrapolation reproduces real collapse.
+* ```<path>/generated_datasets/generated_dataset_<gen>_bs<block_size>_<model_name><sfx>/``` — dataset of generation `<gen>`
+* ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name><sfx>.pt``` and ```all_perplexities_bs<block_size>_<model_name><sfx>.pt```
+* ```plots/perplexity_histogram_bs<block_size>_<model_name><sfx>.{png,pdf}```
+* ```<path>/generated_datasets/surrogate_top_p_bs<block_size>_<model_name>.json``` — the fitted `p_1` and the full grid (`calibrate_surrogate.py`)
+* ```<path>/model_outputs/model_scaled_n<n>_bs<block_size>_<model_name>/``` — the alpha-scaled adapters (`--method lora` only). These *are* loadable models, so ```run_attack.py``` can be pointed at them directly
+
+Apart from the scaled adapters no new checkpoints are written — comparing a method's histogram
+against the baseline one shows how closely that approximation reproduces real collapse.
 
 ## Step 3: Selective adversarial attack with `run_attack.py`
 

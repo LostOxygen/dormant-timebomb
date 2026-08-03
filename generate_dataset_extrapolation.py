@@ -2,12 +2,20 @@
 Helper script to generate datasets in parallel. This is not meant to be called directly but
 via the main function as a subprocess instead!
 
+Supports the three approximation methods of run_extrapolation.py, see utils/extrapolation.py
+for what they are. All of them are indexed by the same factor n = generation + 1, so that
+generation 0 reproduces the real model_0 anchor and only the generations above it approximate.
+
 Args:
     block_size (int): The block size to use for training.
     specifier_name (str): The model specifier to use for training.
     dataset_batch_size (int): The dataset batch size to use for training.
     generation (int): The current generation.
     shard_id (int): The current shard id.
+    method (str): Which approximation to use ("logit", "lora" or "data").
+    adapter_path (str): Path of the alpha scaled LoRA adapter ("lora" method only).
+    surrogate_top_p (float): The calibrated p_1 of the data-space surrogate ("data" only).
+    path (str): The path where the datasets and models are stored.
 
 Returns:
     None
@@ -22,14 +30,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
     LogitsProcessor,
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
 )
 
 from utils.colors import TColors
+from utils.extrapolation import METHODS, dataset_suffix, surrogate_top_p
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -68,7 +75,7 @@ class UnslothExtrapolationProcessor(LogitsProcessor):
     def __call__(
         self, input_ids: torch.LongTensor, scores: torch.FloatTensor
     ) -> torch.FloatTensor:
-        # 'scores' are the highly-optimized logits from model_base
+        # 'scores' are the highly-optimized logits from the base model that generates
         # 'input_ids' contains the sequence generated so far
         device = input_ids.device
 
@@ -197,6 +204,28 @@ parser.add_argument(
     help="sets the current shard id",
 )
 parser.add_argument(
+    "--method",
+    "-m",
+    type=str,
+    default="logit",
+    choices=METHODS,
+    help="which approximation of the later generation to use (default: logit)",
+)
+parser.add_argument(
+    "--adapter_path",
+    "-ap",
+    type=str,
+    default="",
+    help="path of the alpha scaled LoRA adapter, required by the 'lora' method",
+)
+parser.add_argument(
+    "--surrogate_top_p",
+    "-stp",
+    type=float,
+    default=0.0,
+    help="the calibrated p_1 of the data-space surrogate, required by the 'data' method",
+)
+parser.add_argument(
     "--path",
     "-p",
     type=str,
@@ -212,7 +241,18 @@ specifier_name = args.specifier_name
 dataset_batch_size = args.dataset_batch_size
 generation = args.generation
 shard_id = args.shard_id
+method = args.method
+adapter_path = args.adapter_path
+surrogate_p1 = args.surrogate_top_p
 path = args.path
+
+suffix = dataset_suffix(method)
+# every method is indexed by the same factor: in the real collapse run generated_dataset_g is
+# produced by model_g, and model_0 is a single fine-tuning step away from the base model, so
+# model_g sits g + 1 steps out. With a factor of g instead, generation 0 would be a plain copy
+# of the base model and generation 1 a plain copy of the collapsed model, i.e. the first two
+# datasets would be the two anchors rather than approximations
+generation_n = generation + 1
 
 # set data paths
 if path != "":
@@ -222,29 +262,74 @@ if path != "":
     os.makedirs(DATASET_PATH, exist_ok=True)
     os.makedirs(MODEL_PATH, exist_ok=True)
 
-print(f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation}{TColors.ENDC}")
+print(
+    f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation}{TColors.ENDC} "
+    f"(method: {method}, n = {generation_n})"
+)
 
 # use the model to generate the new dataset
 # for this, the model is loaded again with the quantized weights
-model_base, tokenizer = FastLanguageModel.from_pretrained(
-    model_name=MODEL_SPECIFIER,
-    max_seq_length=block_size,
-    dtype=None,
-    load_in_4bit=True,
-)
-FastLanguageModel.for_inference(model_base)
+model_collapsed = None
+schedule_top_p = None
 
-model_collapsed, _ = FastLanguageModel.from_pretrained(
-    model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
-    max_seq_length=block_size,
-    dtype=None,
-    load_in_4bit=True,
-)
-FastLanguageModel.for_inference(model_collapsed)
+if method == "logit":
+    # the base model is the one that generates, the collapsed model only contributes the logit
+    # direction through the logits processor further down. Both have to be resident
+    generation_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_SPECIFIER,
+        max_seq_length=block_size,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(generation_model)
+
+    model_collapsed, _ = FastLanguageModel.from_pretrained(
+        model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
+        max_seq_length=block_size,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(model_collapsed)
+
+elif method == "lora":
+    # the collapse adapter with its alpha already scaled by n, i.e. weights
+    # W_base + n * (W_collapsed - W_base). run_extrapolation.py builds it once per generation so
+    # that the shards of a generation do not race each other over the same directory. Only one
+    # model is resident and no second KV cache is kept, so this is the cheapest of the three
+    if adapter_path == "":
+        raise ValueError(
+            "the 'lora' method needs --adapter_path, which run_extrapolation.py builds with "
+            "utils.extrapolation.build_scaled_adapter"
+        )
+    generation_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=adapter_path,
+        max_seq_length=block_size,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(generation_model)
+
+else:
+    # the data-space surrogate: the pristine base model, sampled with a support that has been
+    # truncated once per generation. Nothing about the model is modified at all, the collapse is
+    # imitated at the level of the sampling that produces the corpus
+    generation_model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_SPECIFIER,
+        max_seq_length=block_size,
+        dtype=None,
+        load_in_4bit=True,
+    )
+    FastLanguageModel.for_inference(generation_model)
+
+    schedule_top_p = surrogate_top_p(surrogate_p1, generation_n)
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate top-p{TColors.ENDC}: "
+        f"{surrogate_p1} ** {generation_n} = {schedule_top_p:.6f}"
+    )
 
 # load the base subdataset from the previous generation
 subdataset = Dataset.load_from_disk(
-    DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
+    DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
 )
 
 generation_data = subdataset.select_columns(["instruction"])
@@ -285,43 +370,56 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
         return_tensors="pt",
     ).to("cuda")
 
-    # use a custom logits processor to apply the logit extrapolation during generation
-    # the factor is generation + 1 and not generation: in the real collapse run
-    # generated_dataset_g is produced by model_g, and model_0 is a single fine-tuning step
-    # away from the base model. So model_g is base + (g + 1) * (model_0 - base). A factor of
-    # g instead would make generation 0 a plain copy of the base model and generation 1 a
-    # plain copy of the collapsed model, i.e. the first two datasets would be the two anchors
-    # rather than extrapolations
-    # the repetition penalty has to run *after* the extrapolation, so it cannot be left to
-    # generate(): the processors that generate() builds itself run before any custom one, so
-    # the base scores would already be penalized while the collapsed model's logits are raw.
-    # The extrapolation then works out to (1 - n) * penalized_base + n * raw_collapsed, which
-    # cancels the penalty at n = 1 and inverts it for n > 1 — the negative coefficient pushes
-    # the tokens the penalty pushed down back up, i.e. it actively rewards repetition, harder
-    # with every generation. Passing the penalty as a custom processor is not enough either,
-    # since generate() substitutes a custom processor at the position of the default it
-    # replaces. So the built-in one is disabled with 1.0 below and this list applies the
-    # penalty to the extrapolated scores instead
-    logits_processors = LogitsProcessorList(
-        [
-            UnslothExtrapolationProcessor(
-                model_collapsed=model_collapsed,
-                generation_n=generation + 1,
-                prompt_attention_mask=inputs["attention_mask"],
-            ),
-            RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
-        ]
-    )
+    # everything that is not the mechanism of the method itself is kept identical across the
+    # three methods, so that a difference between their histograms is a difference between the
+    # approximations and not between their decoding setups. do_sample, temperature and top_k are
+    # left to the model's own generation_config, exactly as before
+    method_kwargs = {}
 
-    generated_answers = model_base.generate(
-        **inputs,
+    if method == "logit":
+        # the logit extrapolation runs as a custom logits processor during decoding.
+        #
+        # the repetition penalty has to run *after* the extrapolation, so it cannot be left to
+        # generate(): the processors that generate() builds itself run before any custom one, so
+        # the base scores would already be penalized while the collapsed model's logits are raw.
+        # The extrapolation then works out to (1 - n) * penalized_base + n * raw_collapsed,
+        # which cancels the penalty at n = 1 and inverts it for n > 1 — the negative coefficient
+        # pushes the tokens the penalty pushed down back up, i.e. it actively rewards
+        # repetition, harder with every generation. Passing the penalty as a custom processor is
+        # not enough either, since generate() substitutes a custom processor at the position of
+        # the default it replaces. So the built-in one is disabled with 1.0 and this list
+        # applies the penalty to the extrapolated scores instead.
+        # The processor is rebuilt per batch because it holds the collapsed model's KV cache and
+        # this batch's prompt mask
+        method_kwargs["logits_processor"] = LogitsProcessorList(
+            [
+                UnslothExtrapolationProcessor(
+                    model_collapsed=model_collapsed,
+                    generation_n=generation_n,
+                    prompt_attention_mask=inputs["attention_mask"],
+                ),
+                RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
+            ]
+        )
         # 1.0 keeps generate() from building its own penalty processor, which would run before
-        # the extrapolation. The penalty is in logits_processors instead
-        repetition_penalty=1.0,
+        # the extrapolation. The penalty is in logits_processor instead
+        method_kwargs["repetition_penalty"] = 1.0
+    else:
+        # no extrapolation processor is involved, so there is nothing the built-in penalty could
+        # be cancelled by and it can be left to generate() as usual
+        method_kwargs["repetition_penalty"] = REPETITION_PENALTY
+        if method == "data":
+            # the whole method is a statement about the sampling support, so the truncation is
+            # set explicitly rather than inherited, and sampling is required to be on
+            method_kwargs["top_p"] = schedule_top_p
+            method_kwargs["do_sample"] = True
+
+    generated_answers = generation_model.generate(
+        **inputs,
         min_new_tokens=128,
         max_new_tokens=block_size,
-        logits_processor=logits_processors,
         use_cache=True,
+        **method_kwargs,
     )
 
     generated_answers = tokenizer.batch_decode(generated_answers)
@@ -337,5 +435,5 @@ new_dataset = Dataset.from_dict(
 
 new_dataset.save_to_disk(
     DATASET_PATH
-    + f"subdataset_{generation}_bs{block_size}_{specifier_name}_ex_shard{shard_id}"
+    + f"subdataset_{generation}_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
 )
