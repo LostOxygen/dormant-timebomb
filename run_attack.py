@@ -1400,8 +1400,8 @@ if __name__ == "__main__":
         "--restarts",
         "-r",
         type=int,
-        default=3,
-        help="random suffix re-initializations per task (default: 3)",
+        default=1,
+        help="random suffix re-initializations per task (default: 1)",
     )
     parser.add_argument(
         "--num_steps",
@@ -1421,7 +1421,7 @@ if __name__ == "__main__":
         "--batch_size",
         "-b",
         type=int,
-        default=16,
+        default=32,
         help="candidates scored per forward pass; halved automatically on OOM (default: 16)",
     )
     parser.add_argument(
