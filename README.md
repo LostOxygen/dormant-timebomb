@@ -14,7 +14,8 @@ The catch is now that the inputs are generated against the extrapolated model of
 against the real collapsed checkpoint and the baseline together — which establishes that a
 selectively triggerable timebomb exists at all. ```--surrogate_method``` switches to the
 *transfer* setting, where the suffix is found against a surrogate built from the base and
-generation-0 models alone and the real checkpoint is held back for validation only.
+generation-0 models alone. Either way, success is decided by the two real models: the collapsed
+model must emit wrong code and the baseline must still emit correct code.
 
 ## Installation
 
@@ -408,21 +409,25 @@ and the baseline model's code *passes* them.
 By default the search optimizes against the real collapsed checkpoint, which assumes the attacker
 has it. The interesting claim is the weaker one, and it is the reason step 2 exists: an attacker who
 only holds the pristine base model and the **first** collapsed model can still build a working
-adversarial input for generation `n`. `--surrogate_method` enables that.
+adversarial input for generation `n`. `--surrogate_method` enables that: the "collapsed must break"
+term of the objective is evaluated on a first-order surrogate for generation
+`n = --collapsed_generation + 1` instead of on the real checkpoint.
 
-The model in the "collapsed" role of the objective becomes a first-order surrogate for generation
-`n = --collapsed_generation + 1` — the same indexing step 2 uses, so a surrogate built here and a
-dataset generated there describe the same generation. The real checkpoint is loaded but **held
-back**: it never enters the objective and never contributes a gradient, only a verdict. Every
-behavioural check then produces a three-way result:
+**The surrogate is a search tool and decides nothing.** It is not part of the capability probe —
+whether the proxy can write correct code is irrelevant, since it is not the model under attack, and
+a proxy that fails every task is still a perfectly good search target. It also does not decide
+success. The criterion is identical in both modes, and involves only the two real models:
 
 | model | required | meaning |
 | --- | --- | --- |
-| baseline | must stay **correct** | the suffix must not work on the pristine model |
-| surrogate | must **break** | the suffix works on what it was optimized against |
-| real collapsed | should **break** too | the suffix transfers to a checkpoint never seen |
+| baseline | must stay **correct** | the suffix has to be benign against the pristine model |
+| collapsed | must **break** | the suffix has to elicit wrong code from the model under attack |
 
-A **transfer hit** requires all three. The two available surrogates:
+So a suffix found via the surrogate counts as a working attack if the real collapsed model emits
+wrong code and the baseline still emits correct code — **even if the surrogate itself stayed
+correct**. Conversely, a suffix that breaks only the surrogate is not a hit at all.
+
+The two available surrogates:
 
 * `--surrogate_method logit` — `l_ex = l_base + n * (l_col0 - l_base)` evaluated inside the forward
   pass. It is differentiable through both models, so GCG optimizes against it exactly as against a
@@ -442,20 +447,23 @@ cross-entropy that does not involve sampling — its loss and gradient are ident
 model's, so optimizing against it would optimize against the model the attack is required *not* to
 break. It is a corpus-level surrogate; the attack needs a model-level one.
 
-The headline number is the **transfer rate**: of the suffixes that selectively broke the surrogate,
-how many also broke the real model. The ones that did not are recorded as `transfer_misses` rather
-than dropped — they are the surrogate's error rate, and they are what distinguishes a working method
-from a lucky one. Reported alongside it:
+#### Scoring the surrogate
 
-* `n_baseline_broken` — suffixes that leaked to the pristine model. Must be 0 for the attack to be
-  selective at all; a high transfer rate with a nonzero value here is a plain jailbreak.
-* `agreement` — how often the surrogate and the real model agree on wrong-vs-correct across *all*
-  verifications, not just the hits. This is the direct measure of how good the surrogate is.
-* `n_validation_only` — suffixes that broke the real model but not the surrogate, i.e. transfer the
-  surrogate failed to predict.
+The surrogate *is* decoded during the behavioural check, for one reason: to measure how good a proxy
+it was. That is a separate question from whether the attack worked, and it is what tells you whether
+`logit` or `lora` is the better choice. Treating the surrogate as a **predictor** of success:
 
-Since a transfer rate over two hits means nothing, the counts are reported rather than the ratio
-alone, and a run that found no surrogate hit at all says so explicitly.
+* `agreement` — how often the surrogate and the real collapsed model agree on wrong-vs-correct
+  across *all* verifications. The direct measure of proxy quality.
+* `precision` — of the verifications where the surrogate broke, how many were working attacks.
+  The complement is `n_false_alarm`.
+* `recall` — of the working attacks, how many the surrogate flagged. The complement is `n_missed`:
+  attacks the search found in spite of its own signal.
+* `n_baseline_broken` — suffixes that leaked to the pristine model. Not successes, and a failure of
+  selectivity: such a suffix is a plain jailbreak, not a timebomb.
+
+Counts are reported alongside the ratios, since a precision over two verifications means nothing,
+and a run with no verifications says so explicitly.
 
 ### The capability gate
 
@@ -481,10 +489,9 @@ until the gate stops the run, and the last generation that passes is the deepest
 timebomb claim is meaningful. `--skip_capability_check` overrides only the run-level stop; per-task
 exclusion always applies, since attacking a task the collapsed model already fails proves nothing.
 
-In transfer mode the gate probes **three** models and a task is only attackable if the baseline, the
-surrogate and the real collapsed model all solve it cleanly. Without the third condition a "transfer"
-would be indistinguishable from collapse the real model already suffers from — it would fail the task
-with or without a suffix.
+The gate probes the baseline and the **real** collapsed model, in both modes. In transfer mode the
+surrogate is decoded during the probe as well, but purely for the record: its verdict never excludes
+a task, because the proxy is not the model under attack.
 
 The built-in tasks (`--list_tasks`) are five trivially testable functions — `is_even`, `add`,
 `absolute_value`, `square`, `list_length` — each paired with a specific wrong implementation
@@ -634,12 +641,14 @@ done
   status), the best objective value, and the loss trajectory of every restart.
 * In transfer mode the file is suffixed with the method
   (```attack_gen<gen>_<model_name>_<method>_surrogate.json```) so the direct and surrogate runs of the
-  same generation do not overwrite each other. It additionally carries the ```transfer``` block (the
-  counts, transfer rate, agreement and per-task breakdown), the surrogate's description and factor,
-  and per task a ```verifications``` list of every three-way verdict plus ```transfer_misses``` —
-  the suffixes that broke the surrogate but not the real model.
+  same generation do not overwrite each other. It additionally carries the
+  ```surrogate_quality``` block (agreement, precision, recall, the raw counts and a per-task
+  breakdown), the surrogate's description and factor, and per task a ```verifications``` list of
+  every verdict plus ```surrogate_false_alarms``` — the suffixes that broke the surrogate but not
+  the real model.
 
 The JSON is written even when the capability gate stops the run, so a stopped run is still evidence
 about how far the model has collapsed. A console summary prints the capability ratio, then per-task
 hit counts along with the winning suffix and the wrong code the collapsed model produced; transfer
-runs add a `Transfer` section with the rate, the surrogate/real agreement and the baseline-leak count.
+runs add a `Surrogate quality` section with the agreement, precision/recall and the baseline-leak
+count.

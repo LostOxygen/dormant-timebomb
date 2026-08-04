@@ -38,17 +38,27 @@ Transfer mode (``--surrogate_method``)
 By default the search optimizes against the real collapsed checkpoint, which assumes the attacker
 has it. The interesting claim is the weaker one: an attacker who only has the pristine base model
 and the *first* collapsed model can still build a working adversarial input for generation `n`.
-``--surrogate_method logit`` or ``lora`` enables that. The model in the "collapsed" role becomes a
-first-order surrogate for generation `n = --collapsed_generation + 1`, built from those two
-anchors alone, and the real checkpoint of the same generation is loaded but **held back** — it is
-never part of the objective and never contributes a gradient, only a verdict. Every behavioural
-check then yields a three-way verdict:
+``--surrogate_method logit`` or ``lora`` enables that. The "collapsed must break" term of the
+objective is then evaluated on a first-order surrogate for generation `n =
+--collapsed_generation + 1`, built from those two anchors alone.
 
-    baseline    must stay correct  — the suffix must not work on the pristine model
-    surrogate   must break         — the suffix works on what it was optimized against
-    validation  should break too   — the suffix transfers to the checkpoint never seen
+The surrogate is a search tool and nothing else. It does not decide anything:
 
-A "transfer hit" requires all three. The two surrogates are:
+* it is **not** part of the capability probe. Whether the proxy can write correct code is
+  irrelevant — it is not the model under attack, so there is no "flipped a correct answer" claim
+  to make about it, and a proxy that fails every task is still a perfectly good search target.
+* it does **not** decide success. The criterion is identical in both modes: the suffix works if
+  the *real* collapsed model emits wrong code while the baseline still emits correct code. A
+  suffix that breaks the real model counts even if the surrogate stayed correct, and one that
+  breaks only the surrogate does not count at all.
+
+It is decoded during the behavioural check for one reason: to score it. ``SurrogateReport``
+treats the surrogate as a *predictor* of success and reports agreement with the real model,
+precision (of the verifications it flagged, how many were working attacks) and recall (of the
+working attacks, how many it flagged). That is what says whether ``logit`` or ``lora`` is the
+better proxy, and it is orthogonal to whether the attack itself worked.
+
+The two surrogates are:
 
 * ``logit`` — ``l_ex = l_base + n * (l_col0 - l_base)`` evaluated inside the forward pass, so it
   is differentiable through both models and GCG optimizes against it exactly as against a real
@@ -61,18 +71,11 @@ sampling support, and GCG's teacher-forced cross-entropy does not involve sampli
 and gradient are identical to the base model's. Optimizing against it would optimize against the
 model the attack is required *not* to break.
 
-The headline number is the **transfer rate**: of the suffixes that selectively broke the
-surrogate, how many also broke the real model. The ones that did not are recorded as
-``transfer_misses`` rather than dropped — they are the surrogate's error rate. Alongside it,
-``n_baseline_broken`` counts suffixes that leaked to the pristine model and must be 0 for the
-attack to be selective at all.
-
 Capability gate
 ---------------
 Before any optimization runs, ``capability_gate`` probes both models on the clean, suffix-free
-prompts. In transfer mode the real collapsed checkpoint is probed as well, and a task is only
-attackable if the baseline, the surrogate and the real model all solve it cleanly — otherwise a
-"transfer" would be indistinguishable from collapse the real model already suffers from. The attack claim is "the adversarial input flipped a correct answer into a wrong one",
+prompts — the baseline and the *real* collapsed model, in both modes. A surrogate is decoded
+during the probe as well, but purely for the record: its verdict never excludes a task. The attack claim is "the adversarial input flipped a correct answer into a wrong one",
 which is only available for tasks the collapsed model already solves *unaided*. Late collapse
 generations eventually lose code generation altogether, and against such a model every prompt
 yields failing code — every apparent "hit" would then measure collapse, not the attack. So:
@@ -634,8 +637,9 @@ class TaskOutcome:
     # one trimmed record per behavioural check — statuses only, so the transfer statistics can
     # be recomputed from the result file without storing every raw completion
     verifications: list[dict] = field(default_factory=list)
-    # selective hits that did *not* carry over to the real collapsed model (transfer mode)
-    transfer_misses: list[dict] = field(default_factory=list)
+    # transfer mode: verifications where the surrogate emitted wrong code but the real
+    # collapsed model did not, i.e. the proxy's false alarms
+    surrogate_false_alarms: list[dict] = field(default_factory=list)
     best_objective: float | None = None
     best_suffix: str | None = None
     history: list[dict] = field(default_factory=list)
@@ -657,9 +661,9 @@ class CapabilityReport:
     collapsed_solved: list[str] = field(default_factory=list)
     collapsed_broken: list[str] = field(default_factory=list)
     baseline_broken: list[str] = field(default_factory=list)
-    # transfer mode only: the real collapsed model has to be capable too, otherwise "the
-    # suffix broke it" is a statement about collapse and not about the transfer
-    validation_broken: list[str] = field(default_factory=list)
+    # transfer mode only, and purely informational: the surrogate's clean verdict is recorded
+    # but never gates, since the proxy is a search tool and not the model under attack
+    surrogate_broken: list[str] = field(default_factory=list)
     invalid_tasks: list[str] = field(default_factory=list)
     usable: list[str] = field(default_factory=list)
     n_probed: int = 0
@@ -671,63 +675,82 @@ class CapabilityReport:
 
 
 @dataclass
-class TransferReport:
-    """How well suffixes found against the surrogate carry over to the real collapsed model.
+class SurrogateReport:
+    """How well the surrogate predicts success against the real collapsed model.
 
-    This is the actual claim of the transfer mode, so it is reported as counts rather than as a
-    single number: a high transfer rate over two hits means very little.
+    Success itself never involves the surrogate: a suffix works when the real collapsed model
+    emits wrong code and the baseline still emits correct code. What this report measures is a
+    different question — how good a *search proxy* the surrogate was, treated as a predictor of
+    that success. Counts rather than a single ratio, because a rate over two verifications means
+    nothing.
 
     Attributes:
-        method: the surrogate method used for the optimization
+        method: the surrogate method the search optimized against
         factor: the extrapolation factor n the surrogate stands for
         surrogate_model: what the surrogate was built from
-        validation_model: the real collapsed checkpoint it is validated against
+        collapsed_model: the real checkpoint under attack
         n_verified: verifications performed in total
-        n_surrogate_hits: verified selective hits against the surrogate (baseline stayed correct)
-        n_transferred: of those, how many also broke the real collapsed model
-        n_not_transferred: of those, how many left the real collapsed model correct
-        n_baseline_broken: verifications where the suffix broke the *baseline* — the attack
-            leaking to the pristine model, which is a failure of selectivity
-        n_validation_only: verifications that broke the real collapsed model but not the
-            surrogate, i.e. transfer the surrogate did not predict
+        n_success: verified attacks — real collapsed model wrong, baseline still correct
+        n_baseline_broken: verifications where the suffix also broke the *baseline*. Not
+            successes, and a failure of selectivity: the suffix is a plain jailbreak
+        n_surrogate_wrong: verifications where the surrogate emitted wrong code
+        n_predicted: surrogate wrong *and* the attack succeeded, i.e. the proxy called it
+        n_false_alarm: surrogate wrong but the attack did not succeed
+        n_missed: the attack succeeded although the surrogate stayed correct, i.e. the proxy
+            under-predicts and the search found the suffix in spite of its own signal
         agreement: fraction of verifications where surrogate and real collapsed model agree on
-            wrong-vs-correct, over all verifications
+            wrong-vs-correct. The direct measure of proxy quality
         per_task: the same counts per task
     """
 
     method: str = "none"
     factor: float = 0.0
     surrogate_model: str = ""
-    validation_model: str = ""
+    collapsed_model: str = ""
     n_verified: int = 0
-    n_surrogate_hits: int = 0
-    n_transferred: int = 0
-    n_not_transferred: int = 0
+    n_success: int = 0
     n_baseline_broken: int = 0
-    n_validation_only: int = 0
+    n_surrogate_wrong: int = 0
+    n_predicted: int = 0
+    n_false_alarm: int = 0
+    n_missed: int = 0
     agreement: float = 0.0
     per_task: dict[str, dict] = field(default_factory=dict)
 
     @property
-    def transfer_rate(self) -> float:
-        """Fraction of surrogate hits that also break the real collapsed model."""
-        if self.n_surrogate_hits == 0:
+    def precision(self) -> float:
+        """Of the verifications the surrogate flagged as broken, how many were real successes."""
+        if self.n_surrogate_wrong == 0:
             return 0.0
-        return self.n_transferred / self.n_surrogate_hits
+        return self.n_predicted / self.n_surrogate_wrong
+
+    @property
+    def recall(self) -> float:
+        """Of the real successes, how many the surrogate flagged."""
+        if self.n_success == 0:
+            return 0.0
+        return self.n_predicted / self.n_success
 
 
 class ContrastiveGCG:
     """Searches for a suffix that breaks the collapsed model but not the baseline model.
 
-    In transfer mode the model in the `collapsed` role is a *surrogate* for the collapse
-    generation (see `ExtrapolatedModel` and the `lora` method) and `validation` holds the real
-    checkpoint of the same generation. The optimizer never touches `validation` — that is the
-    point of the mode: the attacker does not have it. It is only decoded during the behavioural
-    check, so that every verified suffix yields a three-way verdict:
+    `baseline` and `collapsed` are always the two *real* models, and they alone decide both
+    capability and success. `surrogate` is optional: when given, the objective is optimized
+    against it instead of against the real collapsed model — that is transfer mode, where the
+    attacker does not have the collapsed checkpoint and only holds the base and generation-0
+    models the surrogate is built from.
 
-        baseline    must stay correct  — the attack must not work on the pristine model
-        surrogate   must break         — the attack works on what was optimized against
-        validation  should break too   — the attack transfers to the model never seen
+    The surrogate is a search tool, nothing more. It never takes part in the capability probe
+    (whether the proxy can write correct code is irrelevant — it is not the model under attack)
+    and it never decides whether an attack worked. It is decoded during the behavioural check
+    only so that its agreement with the real model can be reported, which is the measure of how
+    good a proxy it is.
+
+    So the success criterion is the same in both modes:
+
+        baseline   must stay correct  — the suffix must be benign against the pristine model
+        collapsed  must break         — the suffix must elicit wrong code from the real model
     """
 
     def __init__(
@@ -736,11 +759,11 @@ class ContrastiveGCG:
         collapsed: TargetModel,
         tokenizer,
         cfg: SearchConfig,
-        validation: TargetModel | None = None,
+        surrogate: TargetModel | None = None,
     ):
         self.baseline = baseline
         self.collapsed = collapsed
-        self.validation = validation
+        self.surrogate = surrogate
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.device = collapsed.device
@@ -752,14 +775,27 @@ class ContrastiveGCG:
 
     @property
     def transfer_mode(self) -> bool:
-        """True when a real collapsed checkpoint is held back for validation only."""
-        return self.validation is not None
+        """True when the objective is optimized against a surrogate instead of the real model."""
+        return self.surrogate is not None
+
+    @property
+    def optim_model(self) -> TargetModel:
+        """The model the objective's "collapsed must break" term is evaluated on.
+
+        The surrogate in transfer mode, the real collapsed model otherwise. This is the *only*
+        place the surrogate is allowed to influence anything.
+        """
+        return self.surrogate if self.surrogate is not None else self.collapsed
 
     def _verified_models(self) -> tuple:
-        """The (label, model) pairs the behavioural check decodes with."""
+        """The (label, model) pairs the behavioural check decodes with.
+
+        The two real models come first because they are the ones that decide the verdict; the
+        surrogate is appended purely for the agreement statistics.
+        """
         models = [("baseline", self.baseline), ("collapsed", self.collapsed)]
-        if self.validation is not None:
-            models.append(("validation", self.validation))
+        if self.surrogate is not None:
+            models.append(("surrogate", self.surrogate))
         return tuple(models)
 
     # ── prompt construction ──
@@ -785,7 +821,7 @@ class ContrastiveGCG:
     # ── objective ──
     def objective(self, cand_ids: Tensor, segs: dict) -> dict[str, Tensor]:
         """Exact contrastive objective for a batch of candidate suffixes (lower is better)."""
-        col_wrong = self.collapsed.candidate_losses(
+        col_wrong = self.optim_model.candidate_losses(
             cand_ids, segs["col_wrong"], self.cfg.batch_size
         )
         base_wrong = self.baseline.candidate_losses(
@@ -809,7 +845,7 @@ class ContrastiveGCG:
 
     def combined_gradient(self, optim_ids: Tensor, segs: dict) -> tuple[Tensor, dict]:
         """Gradient of the contrastive objective w.r.t. the one-hot suffix matrix."""
-        l_col, g_col = self.collapsed.loss_and_grad(optim_ids, segs["col_wrong"])
+        l_col, g_col = self.optim_model.loss_and_grad(optim_ids, segs["col_wrong"])
         l_base_w, g_base_w = self.baseline.loss_and_grad(optim_ids, segs["base_wrong"])
 
         grad = g_col
@@ -853,23 +889,16 @@ class ContrastiveGCG:
 
     @staticmethod
     def is_selective_hit(verdict: dict[str, str]) -> bool:
-        """True iff the collapsed model is objectively wrong and the baseline is correct."""
+        """True iff the real collapsed model is objectively wrong and the baseline is correct.
+
+        This is the success criterion in both modes. Where the suffix came from — the real model
+        or a surrogate — does not enter it: an adversarial input works if it elicits wrong code
+        from the model under attack while the pristine model still answers correctly. The
+        surrogate's own verdict is a diagnostic about the proxy, never a condition for success.
+        """
         return (
             verdict["collapsed_status"] in WRONG_STATUSES
             and verdict["baseline_status"] == "pass"
-        )
-
-    @staticmethod
-    def is_transfer_hit(verdict: dict[str, str]) -> bool:
-        """True iff a selective hit on the surrogate also breaks the real collapsed model.
-
-        This is the transfer mode's success criterion, and it is strictly stronger than
-        `is_selective_hit`: the suffix has to leave the pristine baseline correct, break the
-        surrogate it was optimized against, *and* break a checkpoint the optimizer never saw.
-        """
-        return (
-            ContrastiveGCG.is_selective_hit(verdict)
-            and verdict.get("validation_status") in WRONG_STATUSES
         )
 
     # ── upfront capability gate ──
@@ -921,6 +950,9 @@ class ContrastiveGCG:
             report.per_task[task.name] = verdict
             report.n_probed += 1
 
+            # only the two real models gate anything. Whether the surrogate can solve the task
+            # is irrelevant: it is not the model under attack, it is only the thing the search
+            # optimizes against, so its clean verdict is recorded but never gates
             col, base = verdict["collapsed_status"], verdict["baseline_status"]
             if col == "pass":
                 report.collapsed_solved.append(task.name)
@@ -929,24 +961,22 @@ class ContrastiveGCG:
             if base != "pass":
                 report.baseline_broken.append(task.name)
 
-            # in transfer mode the real checkpoint has to solve the task cleanly as well.
-            # Otherwise it fails the task with or without the suffix and a "transfer" would be
-            # indistinguishable from the collapse it already suffers from
-            val = verdict.get("validation_status")
-            if val is not None and val != "pass":
-                report.validation_broken.append(task.name)
+            surrogate = verdict.get("surrogate_status")
+            if surrogate is not None and surrogate != "pass":
+                report.surrogate_broken.append(task.name)
 
-            usable = col == "pass" and base == "pass" and (val is None or val == "pass")
-            if usable:
+            if col == "pass" and base == "pass":
                 report.usable.append(task.name)
 
             marker = f"{TColors.OKGREEN}ok{TColors.ENDC}" if col == "pass" else (
                 f"{TColors.FAIL}broken{TColors.ENDC}"
             )
-            validation_column = "" if val is None else f" validation={val:15s}"
+            surrogate_column = (
+                "" if surrogate is None else f" surrogate={surrogate:15s}(not gated)"
+            )
             print(
                 f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s}"
-                f"{validation_column} -> collapsed {marker}"
+                f"{surrogate_column} -> collapsed {marker}"
             )
 
         if report.n_probed == 0:
@@ -966,76 +996,66 @@ class ContrastiveGCG:
                 f"any wrong output cannot be attributed to an adversarial input"
             )
         elif not report.usable:
-            if self.transfer_mode:
-                report.aborted = True
-                report.reason = (
-                    "no task is attackable: no task is solved cleanly by the baseline, the "
-                    "surrogate and the real collapsed model at the same time"
-                )
-            else:
-                report.aborted = True
-                report.reason = (
-                    "no task is attackable: every task the collapsed model solves is one the "
-                    "baseline model does not"
-                )
+            report.aborted = True
+            report.reason = (
+                "no task is attackable: every task the collapsed model solves is one the "
+                "baseline model does not"
+            )
         return report
 
-    # ── transfer accounting ──
-    def transfer_report(self, outcomes: list[TaskOutcome]) -> TransferReport:
-        """Aggregates the three-way verdicts of every verification into transfer statistics.
+    # ── surrogate accounting ──
+    def surrogate_report(self, outcomes: list[TaskOutcome]) -> SurrogateReport:
+        """Scores the surrogate as a predictor of attack success.
+
+        Success is decided by the two real models alone (see `is_selective_hit`). This only asks
+        how often the surrogate's own verdict lined up with it, which is what says whether the
+        proxy was worth using.
 
         Args:
             outcomes (list[TaskOutcome]): the per-task results of the search
 
         Returns:
-            TransferReport: counts over all verifications, in total and per task
+            SurrogateReport: counts over all verifications, in total and per task
         """
-        report = TransferReport()
+        report = SurrogateReport()
         agreements = 0
+        keys = (
+            "n_verified",
+            "n_success",
+            "n_baseline_broken",
+            "n_surrogate_wrong",
+            "n_predicted",
+            "n_false_alarm",
+            "n_missed",
+        )
 
         for outcome in outcomes:
-            counts = {
-                "n_verified": 0,
-                "n_surrogate_hits": 0,
-                "n_transferred": 0,
-                "n_not_transferred": 0,
-                "n_baseline_broken": 0,
-                "n_validation_only": 0,
-            }
+            counts = {key: 0 for key in keys}
             for verdict in outcome.verifications:
-                surrogate_wrong = verdict.get("collapsed_status") in WRONG_STATUSES
-                validation_wrong = verdict.get("validation_status") in WRONG_STATUSES
+                collapsed_wrong = verdict.get("collapsed_status") in WRONG_STATUSES
+                surrogate_wrong = verdict.get("surrogate_status") in WRONG_STATUSES
                 baseline_ok = verdict.get("baseline_status") == "pass"
+                success = collapsed_wrong and baseline_ok
 
                 counts["n_verified"] += 1
                 if not baseline_ok:
                     counts["n_baseline_broken"] += 1
-                if surrogate_wrong and baseline_ok:
-                    counts["n_surrogate_hits"] += 1
-                    if validation_wrong:
-                        counts["n_transferred"] += 1
+                if success:
+                    counts["n_success"] += 1
+                if surrogate_wrong:
+                    counts["n_surrogate_wrong"] += 1
+                    if success:
+                        counts["n_predicted"] += 1
                     else:
-                        counts["n_not_transferred"] += 1
-                if validation_wrong and not surrogate_wrong:
-                    counts["n_validation_only"] += 1
-                if surrogate_wrong == validation_wrong:
+                        counts["n_false_alarm"] += 1
+                elif success:
+                    counts["n_missed"] += 1
+                if surrogate_wrong == collapsed_wrong:
                     agreements += 1
 
             if counts["n_verified"]:
-                counts["transfer_rate"] = (
-                    counts["n_transferred"] / counts["n_surrogate_hits"]
-                    if counts["n_surrogate_hits"]
-                    else 0.0
-                )
                 report.per_task[outcome.task] = counts
-                for key in (
-                    "n_verified",
-                    "n_surrogate_hits",
-                    "n_transferred",
-                    "n_not_transferred",
-                    "n_baseline_broken",
-                    "n_validation_only",
-                ):
+                for key in keys:
                     setattr(report, key, getattr(report, key) + counts[key])
 
         if report.n_verified:
@@ -1059,12 +1079,14 @@ class ContrastiveGCG:
         if outcome.control:
             ctrl_base = outcome.control.get("baseline_status", "unknown")
             ctrl_col = outcome.control.get("collapsed_status", "unknown")
-            ctrl_val = outcome.control.get("validation_status")
+            ctrl_sur = outcome.control.get("surrogate_status")
             control_line = f"##   control (no suffix): baseline={ctrl_base} collapsed={ctrl_col}"
-            if ctrl_val is not None:
-                control_line += f" validation={ctrl_val}"
+            if ctrl_sur is not None:
+                control_line += f" surrogate={ctrl_sur} (not gated)"
             print(control_line)
             if not self.cfg.no_exec:
+                # only the two real models can exclude a task. A surrogate that cannot write
+                # correct code is still perfectly usable as a search target
                 if ctrl_col != "pass":
                     outcome.skipped = (
                         f"collapsed model does not solve this task without an adversarial "
@@ -1077,13 +1099,6 @@ class ContrastiveGCG:
                         f"(status: {ctrl_base})"
                     )
                     return outcome
-                if self.transfer_mode and ctrl_val != "pass":
-                    outcome.skipped = (
-                        f"the real collapsed model does not solve this task without a suffix "
-                        f"(status: {ctrl_val}), so a transfer could not be attributed to the "
-                        f"adversarial input"
-                    )
-                    return outcome
 
         before_ids = self._ids(before_str)
         after_ids = self._ids(after_str)
@@ -1091,7 +1106,7 @@ class ContrastiveGCG:
         correct_ids = self._ids(task.correct_code)[0]
 
         segs = {
-            "col_wrong": self.collapsed.build_segments(before_ids, after_ids, wrong_ids),
+            "col_wrong": self.optim_model.build_segments(before_ids, after_ids, wrong_ids),
             "base_wrong": self.baseline.build_segments(before_ids, after_ids, wrong_ids),
             "base_correct": self.baseline.build_segments(before_ids, after_ids, correct_ids),
         }
@@ -1186,8 +1201,8 @@ class ContrastiveGCG:
             if due and not self.cfg.no_exec:
                 verdict = self.verify(task, before_str, after_str, suffix)
 
-                # every check is recorded, not just the hits: the transfer statistics need the
-                # verdicts where the surrogate broke and the real model did not just as much
+                # every check is recorded, not just the hits: scoring the surrogate as a
+                # predictor needs the verdicts where it was wrong about the real model too
                 record = {
                     "restart": restart,
                     "step": step,
@@ -1196,8 +1211,12 @@ class ContrastiveGCG:
                     "collapsed_status": verdict["collapsed_status"],
                 }
                 if self.transfer_mode:
-                    record["validation_status"] = verdict["validation_status"]
+                    record["surrogate_status"] = verdict["surrogate_status"]
                 outcome.verifications.append(record)
+
+                hit_base = verdict["baseline_status"]
+                hit_col = verdict["collapsed_status"]
+                hit_sur = verdict.get("surrogate_status")
 
                 if self.is_selective_hit(verdict):
                     hit = {
@@ -1210,39 +1229,34 @@ class ContrastiveGCG:
                         "base_correct": base_correct,
                         **verdict,
                     }
-                    hit_col = verdict["collapsed_status"]
-                    hit_base = verdict["baseline_status"]
-
-                    if not self.transfer_mode:
-                        outcome.successes.append(hit)
-                        progress.write(
-                            f"## {TColors.OKGREEN}{TColors.BOLD}SELECTIVE HIT{TColors.ENDC} "
-                            f"[{task.name}] step {step}: collapsed={hit_col} "
-                            f"baseline={hit_base} | suffix={suffix!r}"
-                        )
-                        if self.cfg.stop_on_success:
-                            break
-                    else:
-                        # a hit on the surrogate is only a success if it also breaks the real
-                        # checkpoint the optimizer never saw. The ones that do not are kept
-                        # separately rather than dropped — they are the method's error rate
-                        hit_val = verdict["validation_status"]
-                        if self.is_transfer_hit(verdict):
-                            outcome.successes.append(hit)
-                            progress.write(
-                                f"## {TColors.OKGREEN}{TColors.BOLD}TRANSFER HIT{TColors.ENDC} "
-                                f"[{task.name}] step {step}: baseline={hit_base} "
-                                f"surrogate={hit_col} real={hit_val} | suffix={suffix!r}"
-                            )
-                            if self.cfg.stop_on_success:
-                                break
-                        else:
-                            outcome.transfer_misses.append(hit)
-                            progress.write(
-                                f"## {TColors.WARNING}no transfer{TColors.ENDC} "
-                                f"[{task.name}] step {step}: baseline={hit_base} "
-                                f"surrogate={hit_col} real={hit_val}"
-                            )
+                    outcome.successes.append(hit)
+                    # in transfer mode the surrogate's own verdict is appended for information:
+                    # the attack succeeded either way, but whether the proxy saw it coming is
+                    # what tells you how good the proxy is
+                    proxy_note = "" if hit_sur is None else f" surrogate={hit_sur}"
+                    progress.write(
+                        f"## {TColors.OKGREEN}{TColors.BOLD}SELECTIVE HIT{TColors.ENDC} "
+                        f"[{task.name}] step {step}: collapsed={hit_col} "
+                        f"baseline={hit_base}{proxy_note} | suffix={suffix!r}"
+                    )
+                    if self.cfg.stop_on_success:
+                        break
+                elif hit_sur in WRONG_STATUSES and hit_base == "pass":
+                    # the surrogate broke but the real model did not — a false alarm from the
+                    # proxy. Kept rather than dropped, since these are its error rate
+                    outcome.surrogate_false_alarms.append(
+                        {
+                            "restart": restart,
+                            "step": step,
+                            "suffix": suffix,
+                            **verdict,
+                        }
+                    )
+                    progress.write(
+                        f"## {TColors.WARNING}surrogate false alarm{TColors.ENDC} "
+                        f"[{task.name}] step {step}: surrogate={hit_sur} but "
+                        f"collapsed={hit_col}"
+                    )
 
         progress.close()
 
@@ -1650,16 +1664,25 @@ def main(
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading baseline model{TColors.ENDC}")
     baseline = TargetModel("baseline", load_model(baseline_dir, torch_device, dtype), torch_device)
 
-    real_collapsed = None
+    surrogate = None
     surrogate_description = ""
+
+    # the real collapsed model is always loaded and always plays the "collapsed" role: it is the
+    # model under attack, so it decides both capability and success. The surrogate, if any, only
+    # replaces it inside the objective
+    print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading collapsed model{TColors.ENDC}")
+    collapsed = TargetModel(
+        "collapsed",
+        load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
+        torch_device,
+    )
+
     if transfer:
-        # the surrogate takes the "collapsed" role in the objective; the real checkpoint is
-        # loaded too but only ever decoded during verification, never optimized against
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Building {surrogate_method} surrogate"
-            f"{TColors.ENDC} (n = {factor:g})"
+            f"{TColors.ENDC} (n = {factor:g}) — search target only"
         )
-        collapsed, surrogate_description = build_surrogate(
+        surrogate, surrogate_description = build_surrogate(
             method=surrogate_method,
             factor=factor,
             baseline=baseline,
@@ -1669,27 +1692,10 @@ def main(
             dtype=dtype,
         )
         print(f"##   surrogate: {surrogate_description}")
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Loading real collapsed model (validation only)"
-            f"{TColors.ENDC}"
-        )
-        real_collapsed = TargetModel(
-            "validation",
-            load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
-            torch_device,
-        )
-    else:
-        print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading collapsed model{TColors.ENDC}")
-        collapsed = TargetModel(
-            "collapsed",
-            load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
-            torch_device,
-        )
-        surrogate_description = collapsed_dir
 
     # the contrastive gradient adds one-hot gradients from both models, which is only
     # meaningful if they share a vocabulary
-    for other in (collapsed, real_collapsed):
+    for other in (collapsed, surrogate):
         if other is None:
             continue
         if baseline.embed_weights.shape[0] != other.embed_weights.shape[0]:
@@ -1718,7 +1724,7 @@ def main(
         stop_on_success=stop_on_success,
         seed=seed,
     )
-    attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg, validation=real_collapsed)
+    attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg, surrogate=surrogate)
 
     # ──────────────────── upfront capability gate ─────────────────────
     # Before optimizing anything, establish that the collapsed model can still write correct
@@ -1733,9 +1739,8 @@ def main(
     if capability.skipped:
         print(f"##   {TColors.WARNING}not probed{TColors.ENDC}: {capability.reason}")
     else:
-        role = "surrogate" if transfer else "collapsed model"
         print(
-            f"##   {role} capability: "
+            f"##   collapsed model capability: "
             f"{len(capability.collapsed_solved)}/{capability.n_probed} tasks "
             f"({capability.capability:.0%}), required >= {min_capability:.0%}"
         )
@@ -1747,11 +1752,11 @@ def main(
                 + ", ".join(capability.baseline_broken)
                 + " (not attackable)"
             )
-        if capability.validation_broken:
+        if capability.surrogate_broken:
             print(
-                "##   real collapsed model cannot solve: "
-                + ", ".join(capability.validation_broken)
-                + " (transfer would not be attributable)"
+                "##   surrogate cannot solve: "
+                + ", ".join(capability.surrogate_broken)
+                + " (informational only — the proxy is not the model under attack)"
             )
     print(_hr() + "\n")
 
@@ -1809,85 +1814,88 @@ def main(
             f"capability probe"
         )
         print(f"##   {capability.reason}")
-    hit_label = "transfer hit(s)" if transfer else "selective hit(s)"
     for outcome in outcomes:
         if outcome.skipped:
             status = f"{TColors.WARNING}skipped ({outcome.skipped}){TColors.ENDC}"
         elif outcome.successes:
-            status = f"{TColors.OKGREEN}{len(outcome.successes)} {hit_label}{TColors.ENDC}"
-        elif transfer and outcome.transfer_misses:
+            status = f"{TColors.OKGREEN}{len(outcome.successes)} selective hit(s){TColors.ENDC}"
+        elif transfer and outcome.surrogate_false_alarms:
             status = (
-                f"{TColors.WARNING}{len(outcome.transfer_misses)} surrogate hit(s), none "
-                f"transferred{TColors.ENDC}"
+                f"{TColors.FAIL}no selective hit{TColors.ENDC} "
+                f"({len(outcome.surrogate_false_alarms)} surrogate false alarm(s))"
             )
         else:
-            status = f"{TColors.FAIL}no {hit_label[:-3]}{TColors.ENDC}"
+            status = f"{TColors.FAIL}no selective hit{TColors.ENDC}"
         best = "n/a" if outcome.best_objective is None else f"{outcome.best_objective:.4f}"
         print(f"## {outcome.task:16s} {status}  (best objective {best})")
         if outcome.successes:
             hit = outcome.successes[0]
             print("##   suffix: " + repr(hit["suffix"]))
+            statuses = (
+                f"##   statuses: baseline={hit['baseline_status']} "
+                f"collapsed={hit['collapsed_status']}"
+            )
             if transfer:
-                print(
-                    f"##   statuses: baseline={hit['baseline_status']} "
-                    f"surrogate={hit['collapsed_status']} real={hit['validation_status']}"
-                )
-                print("##   real collapsed code:\n" + hit["validation_code"])
-            else:
-                print("##   collapsed code:\n" + hit["collapsed_code"])
+                statuses += f" surrogate={hit['surrogate_status']}"
+            print(statuses)
+            print("##   collapsed code:\n" + hit["collapsed_code"])
     print(_hr() + "\n")
 
-    # ── transfer statistics ──
-    # The claim of this mode is that a suffix found without ever touching the real checkpoint
-    # still breaks it, and that it leaves the pristine model alone. Both halves are reported.
-    transfer_stats = None
+    # ── surrogate quality ──
+    # Success is already counted above and never involved the surrogate. This block asks the
+    # separate question of whether the proxy was a good search target: how often its own verdict
+    # matched the real model's, and how often it predicted a success versus cried wolf.
+    surrogate_stats = None
     if transfer:
-        transfer_stats = attack.transfer_report(outcomes)
-        transfer_stats.method = surrogate_method
-        transfer_stats.factor = factor
-        transfer_stats.surrogate_model = surrogate_description
-        transfer_stats.validation_model = collapsed_dir
+        surrogate_stats = attack.surrogate_report(outcomes)
+        surrogate_stats.method = surrogate_method
+        surrogate_stats.factor = factor
+        surrogate_stats.surrogate_model = surrogate_description
+        surrogate_stats.collapsed_model = collapsed_dir
 
         print(
-            f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Transfer{TColors.ENDC} "
-            + _hr(12)
+            f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Surrogate quality"
+            f"{TColors.ENDC} " + _hr(21)
         )
         print(
-            f"##   surrogate: {surrogate_method} (n = {factor:g}), validated against "
+            f"##   searched against: {surrogate_method} (n = {factor:g}); attacked: "
             f"{collapsed_dir}"
         )
-        print(f"##   verifications: {transfer_stats.n_verified}")
+        print(f"##   verifications: {surrogate_stats.n_verified}")
+        success_color = TColors.OKGREEN if surrogate_stats.n_success else TColors.FAIL
         print(
-            f"##   selective hits on the surrogate: {transfer_stats.n_surrogate_hits} "
-            f"(baseline stayed correct)"
-        )
-        rate_color = TColors.OKGREEN if transfer_stats.transfer_rate >= 0.5 else TColors.WARNING
-        print(
-            f"##   of those, broke the real model: {rate_color}"
-            f"{transfer_stats.n_transferred}{TColors.ENDC} "
-            f"({transfer_stats.transfer_rate:.0%} transfer rate), "
-            f"did not: {transfer_stats.n_not_transferred}"
-        )
-        print(
-            f"##   surrogate/real agreement over all verifications: "
-            f"{transfer_stats.agreement:.0%}"
-        )
-        print(
-            f"##   broke the real model but not the surrogate: "
-            f"{transfer_stats.n_validation_only} (transfer the surrogate did not predict)"
+            f"##   working attacks (collapsed wrong, baseline correct): {success_color}"
+            f"{surrogate_stats.n_success}{TColors.ENDC}"
         )
         selectivity_color = (
-            TColors.OKGREEN if transfer_stats.n_baseline_broken == 0 else TColors.FAIL
+            TColors.OKGREEN if surrogate_stats.n_baseline_broken == 0 else TColors.FAIL
         )
         print(
             f"##   leaked to the pristine baseline: {selectivity_color}"
-            f"{transfer_stats.n_baseline_broken}{TColors.ENDC} of "
-            f"{transfer_stats.n_verified} (must be 0 for the attack to be selective)"
+            f"{surrogate_stats.n_baseline_broken}{TColors.ENDC} of "
+            f"{surrogate_stats.n_verified} (must be 0 for the attack to be selective)"
         )
-        if transfer_stats.n_surrogate_hits == 0:
+        agreement_color = (
+            TColors.OKGREEN if surrogate_stats.agreement >= 0.5 else TColors.WARNING
+        )
+        print(
+            f"##   surrogate/collapsed agreement: {agreement_color}"
+            f"{surrogate_stats.agreement:.0%}{TColors.ENDC} over all verifications"
+        )
+        print(
+            f"##   surrogate broke: {surrogate_stats.n_surrogate_wrong} "
+            f"-> predicted a working attack {surrogate_stats.n_predicted} time(s) "
+            f"(precision {surrogate_stats.precision:.0%}), "
+            f"false alarms {surrogate_stats.n_false_alarm}"
+        )
+        print(
+            f"##   working attacks the surrogate did not flag: {surrogate_stats.n_missed} "
+            f"(recall {surrogate_stats.recall:.0%})"
+        )
+        if surrogate_stats.n_verified == 0:
             print(
-                f"##   {TColors.WARNING}no surrogate hit was found at all, so the transfer "
-                f"rate is not informative{TColors.ENDC}"
+                f"##   {TColors.WARNING}no verification ran, so none of this is "
+                f"informative{TColors.ENDC}"
             )
         print(_hr() + "\n")
 
@@ -1909,9 +1917,13 @@ def main(
                 "config": cfg.__dict__,
                 "aborted": capability.aborted and not skip_capability_check,
                 "capability_probe": capability.__dict__,
-                "transfer": (
-                    {**transfer_stats.__dict__, "transfer_rate": transfer_stats.transfer_rate}
-                    if transfer_stats is not None
+                "surrogate_quality": (
+                    {
+                        **surrogate_stats.__dict__,
+                        "precision": surrogate_stats.precision,
+                        "recall": surrogate_stats.recall,
+                    }
+                    if surrogate_stats is not None
                     else None
                 ),
                 "results": [outcome.__dict__ for outcome in outcomes],
