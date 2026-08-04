@@ -1,9 +1,14 @@
+"""helper library"""
+import os
 import functools
+from datetime import datetime
 import gc
 import inspect
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
+
+LOG_PATH: str = "./logs/"
 
 INIT_CHARS = [
     ".",
@@ -166,3 +171,47 @@ def configure_pad_token(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokeniz
     else:
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     return tokenizer
+
+def log_benchmark_conversation(
+    llm_name: str,
+    benchmark_name: str,
+    iteration: int,
+    prompt: str,
+    sys_prompt: str,
+    response: str,
+    success: bool,
+) -> None:
+    """
+    Logs the conversation between the user and the opponent LLM into
+    the {llm_name}_benchmark_chat_logs.txt file.
+
+    Parameters:
+        llm_name: str - the type of the opponent LLM
+        benchmark: str - the name of the benchmark
+        iteration: int - the iteration of the attack
+        prompt: str - the prompt sent to the opponent LLM
+        sys_prompt: str - the system prompt to initialize the opponent LLM
+        response: str - the response of the opponent LLM
+        success: bool - whether the response was correct or not
+
+    Returns:
+        None
+    """
+    if not os.path.isdir(LOG_PATH):
+        os.mkdir(LOG_PATH)
+
+    file_name = LOG_PATH + f"{llm_name}_benchmark_chat_logs.txt"
+
+    with open(file=file_name, mode="a", encoding="utf-8") as f:
+        f.write("\n" + "#" * 100)
+        f.write(
+            f"\n>>Time: {datetime.datetime.now().strftime('%A, %d. %B %Y %I:%M%p')!s}\n"
+        )
+        f.write(f">>LLM Type: {llm_name}\n")
+        f.write(f">>Benchmark: {benchmark_name}\n")
+        f.write(f">>iteration: {iteration}\n")
+        f.write(f">>Success: {success}\n")
+        f.write(f">>System Prompt: \n{sys_prompt}\n")
+        f.write(f">>Prompt: \n{prompt}\n")
+        f.write(f">>Response: \n{response}\n")
+        f.write("\n" + "#" * 100)
