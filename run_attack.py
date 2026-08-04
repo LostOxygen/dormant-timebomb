@@ -9,7 +9,7 @@ the *baseline* model still emits a correct one for the very same prompt.
 Why not plain GCG
 -----------------
 ``utils/gcg.py`` implements standard GCG: minimize the cross-entropy of one target string under
-one model. That is the wrong objective here. The collapsed model is a fine-tune of the
+one model. That is the wrong objective here. The collapsed model is a LoRA fine-tune of the
 baseline, so the two models are highly correlated — a suffix optimized to elicit broken code
 from the collapsed model almost always elicits the same broken code from the baseline, which
 makes the attack trivially detectable and does not demonstrate a dormant timebomb.
@@ -38,7 +38,7 @@ Transfer mode (``--surrogate_method``)
 By default the search optimizes against the real collapsed checkpoint, which assumes the attacker
 has it. The interesting claim is the weaker one: an attacker who only has the pristine base model
 and the *first* collapsed model can still build a working adversarial input for generation `n`.
-``--surrogate_method logit`` or ``weight`` enables that. The model in the "collapsed" role becomes a
+``--surrogate_method logit`` or ``lora`` enables that. The model in the "collapsed" role becomes a
 first-order surrogate for generation `n = --collapsed_generation + 1`, built from those two
 anchors alone, and the real checkpoint of the same generation is loaded but **held back** — it is
 never part of the objective and never contributes a gradient, only a verdict. Every behavioural
@@ -53,10 +53,8 @@ A "transfer hit" requires all three. The two surrogates are:
 * ``logit`` — ``l_ex = l_base + n * (l_col0 - l_base)`` evaluated inside the forward pass, so it
   is differentiable through both models and GCG optimizes against it exactly as against a real
   checkpoint. No model artifact exists; ``ExtrapolatedModel`` is the model.
-* ``weight`` — ``W_base + n * (W_0 - W_base)`` over the full parameter set, i.e. the same
-  first-order step taken in weight space. Yields a real loadable checkpoint and needs only one
-  forward pass. The pipeline full fine-tunes, so this is an explicit per-parameter
-  interpolation rather than a scaled adapter.
+* ``lora`` — the collapse adapter with its alpha scaled by `n`, i.e. the same first-order step
+  taken in weight space. Yields a real loadable checkpoint and needs only one forward pass.
 
 ``data`` is deliberately rejected: the data-space surrogate is the base model with a narrowed
 sampling support, and GCG's teacher-forced cross-entropy does not involve sampling, so its loss
@@ -90,9 +88,9 @@ and reused as each task's control, so the clean prompts are decoded only once.
 Two deliberate deviations from ``utils/gcg.py``:
 
 * Models are loaded with plain ``transformers``, not Unsloth. GCG needs gradients w.r.t. input
-  embeddings, and the full fine-tuned checkpoints written by ``run_baseline.py``
-  (``model_<gen>_bs<bs>_<name>``) load directly. This also means the Unsloth import-order
-  constraint of the other scripts does not apply here.
+  embeddings, and the merged fp16 checkpoints written by ``run_baseline.py``
+  (``model_<gen>_bs<bs>_<name>_fp16``) load directly. This also means the Unsloth
+  import-order constraint of the other scripts does not apply here.
 * Prefix KV caching is not used. Three objectives across two models make the cache bookkeeping
   error-prone, and the models are small; OOM is handled by batch-size backoff instead.
 
@@ -133,7 +131,7 @@ from transformers import (
 )
 
 from utils.colors import TColors
-from utils.extrapolation import METHODS, build_extrapolated_weights, extrapolate_logits
+from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.utils import (
     INIT_CHARS,
@@ -722,7 +720,7 @@ class ContrastiveGCG:
     """Searches for a suffix that breaks the collapsed model but not the baseline model.
 
     In transfer mode the model in the `collapsed` role is a *surrogate* for the collapse
-    generation (see `ExtrapolatedModel` and the `weight` method) and `validation` holds the real
+    generation (see `ExtrapolatedModel` and the `lora` method) and `validation` holds the real
     checkpoint of the same generation. The optimizer never touches `validation` — that is the
     point of the mode: the attacker does not have it. It is only decoded during the behavioural
     check, so that every verified suffix yields a three-way verdict:
@@ -1251,7 +1249,10 @@ class ContrastiveGCG:
 
 # ──────────────────────────────── model loading ───────────────────────────────────────────
 def resolve_collapsed_dir(
-    generation: int, specifier_name: str, block_size: int | None
+    generation: int,
+    specifier_name: str,
+    block_size: int | None,
+    prefer_adapter: bool = False,
 ) -> str:
     """Locates the collapsed checkpoint directory written by ``run_baseline.py``.
 
@@ -1264,18 +1265,18 @@ def resolve_collapsed_dir(
         generation (int): collapse generation index
         specifier_name (str): trailing component of the model specifier
         block_size (int | None): effective block size, or None to auto-discover
+        prefer_adapter (bool): look for the LoRA adapter directory before the merged fp16 one.
+            The `lora` surrogate needs the adapter, since it works by scaling its alpha
 
     Returns:
-        str: path to the checkpoint directory. The plain directory is preferred, since full
-            fine-tuning writes the complete weights there; ``_fp16`` is only tried as a
-            fallback for runs made back when the pipeline trained LoRA adapters and saved a
-            separately merged copy
+        str: path to a merged fp16 directory, or to the LoRA adapter directory as a fallback
+            (the other way round with `prefer_adapter`)
 
     Raises:
         FileNotFoundError: nothing matched
         RuntimeError: several block sizes matched
     """
-    order = ("", "_fp16")
+    order = ("", "_fp16") if prefer_adapter else ("_fp16", "")
 
     if block_size is not None:
         exact = os.path.join(MODEL_PATH, f"model_{generation}_bs{block_size}_{specifier_name}")
@@ -1352,15 +1353,14 @@ def build_surrogate(
     space the step is taken in.
 
     Args:
-        method (str): "logit" or "weight"
+        method (str): "logit" or "lora"
         factor (float): the extrapolation factor n, i.e. collapsed_generation + 1
         baseline (TargetModel): the already loaded pristine base model. The `logit` surrogate
             reuses its weights instead of loading a second copy
         first_collapsed_dir (str): directory of the generation-0 collapsed model
         surrogate_model_path (str): a prebuilt surrogate to use instead of building one, e.g.
-            the ``model_extrapolated_n<n>_*`` directory that
-            ``run_extrapolation.py --method weight`` writes. Ignored by the `logit` method,
-            which has no on-disk artifact
+            the ``model_scaled_n<n>_*`` directory that ``run_extrapolation.py --method lora``
+            writes. Ignored by the `logit` method, which has no on-disk artifact
         device (torch.device): device to place the models on
         dtype (torch.dtype): dtype to load with
 
@@ -1378,24 +1378,21 @@ def build_surrogate(
             "involve sampling at all, so its loss and gradient are identical to the base "
             "model's — optimizing against it would optimize against the model the attack is "
             "required *not* to break. It is a corpus-level surrogate; the attack needs a "
-            "model-level one. Use --surrogate_method logit or weight."
+            "model-level one. Use --surrogate_method logit or lora."
         )
 
-    if method == "weight":
-        # W_base + n * (W_0 - W_base) over the full parameter set, i.e. the first order step
-        # taken in weight space instead of in logit space
+    if method == "lora":
+        # scaling the collapse adapter's alpha by n yields the weights
+        # W_base + n * (W_collapsed - W_base), i.e. the first order step in weight space
         if surrogate_model_path:
             path = surrogate_model_path
-            description = f"prebuilt checkpoint {path}"
+            description = f"prebuilt adapter {path}"
         else:
             path = os.path.join(MODEL_PATH, f"attack_surrogate_n{factor:g}")
-            build_extrapolated_weights(
-                base_path=MODEL_SPECIFIER,
-                first_collapsed_path=first_collapsed_dir,
-                factor=factor,
-                output_path=path,
+            build_scaled_adapter(
+                adapter_path=first_collapsed_dir, factor=factor, output_path=path
             )
-            description = f"base + {factor:g} * ({first_collapsed_dir} - base) in weight space"
+            description = f"{first_collapsed_dir} with alpha x {factor:g}"
         model = load_model(path, device, dtype, base_for_adapter=MODEL_SPECIFIER)
         return TargetModel("surrogate", model, device), description
 
@@ -1482,14 +1479,14 @@ def main(
         seed (int): RNG seed
         list_tasks (bool): print the available tasks and exit
         surrogate_method (str): "none" attacks the real collapsed checkpoint directly. "logit"
-            or "weight" enables transfer mode: the suffix is optimized against a surrogate built
+            or "lora" enables transfer mode: the suffix is optimized against a surrogate built
             from the base and generation-0 models only, and the real checkpoint of the same
             generation is held back for validation
         surrogate_factor (float): the extrapolation factor n the surrogate stands for. 0.0
             derives it as collapsed_generation + 1, which is the value that matches the
             checkpoint being validated against
         surrogate_model_path (str): a prebuilt surrogate to use instead of building one, e.g.
-            run_extrapolation.py's model_extrapolated_n<n>_* directory ("weight" only)
+            run_extrapolation.py's model_scaled_n<n>_* directory ("lora" only)
         first_collapsed_path (str): explicit path to the generation-0 collapsed model the
             surrogate is built from (default: resolved from the model outputs)
 
@@ -1544,7 +1541,7 @@ def main(
     first_collapsed_dir = ""
     if transfer:
         first_collapsed_dir = first_collapsed_path or resolve_collapsed_dir(
-            0, specifier_name, block_size
+            0, specifier_name, block_size, prefer_adapter=(surrogate_method == "lora")
         )
         if os.path.abspath(first_collapsed_dir) == os.path.abspath(collapsed_dir):
             raise SystemExit(
@@ -1990,7 +1987,7 @@ if __name__ == "__main__":
         type=str,
         default="none",
         choices=("none",) + METHODS,
-        help="'none' optimizes against the real collapsed checkpoint. 'logit' or 'weight' enable "
+        help="'none' optimizes against the real collapsed checkpoint. 'logit' or 'lora' enable "
         "transfer mode: the suffix is optimized against a surrogate built only from the base "
         "and generation-0 models, and the real checkpoint of the same generation is held back "
         "for validation only. 'data' is rejected — it is a corpus-level surrogate whose loss is "
@@ -2010,7 +2007,7 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="prebuilt surrogate to use instead of building one, e.g. run_extrapolation.py's "
-        "model_extrapolated_n<n>_* directory ('weight' method only)",
+        "model_scaled_n<n>_* directory ('lora' method only)",
     )
     parser.add_argument(
         "--first_collapsed_path",
@@ -2018,7 +2015,8 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="explicit path to the generation-0 collapsed model the surrogate is built from "
-        "(default: resolved from model_outputs/)",
+        "(default: resolved from model_outputs/; the 'lora' method needs the adapter, not the "
+        "merged _fp16 copy)",
     )
     parser.add_argument(
         "--path",

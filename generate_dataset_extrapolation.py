@@ -12,8 +12,8 @@ Args:
     dataset_batch_size (int): The dataset batch size to use for training.
     generation (int): The current generation.
     shard_id (int): The current shard id.
-    method (str): Which approximation to use ("logit", "weight" or "data").
-    extrapolated_model_path (str): Path of the extrapolated checkpoint ("weight" only).
+    method (str): Which approximation to use ("logit", "lora" or "data").
+    adapter_path (str): Path of the alpha scaled LoRA adapter ("lora" method only).
     surrogate_top_p (float): The calibrated p_1 of the data-space surrogate ("data" only).
     path (str): The path where the datasets and models are stored.
 
@@ -190,11 +190,11 @@ parser.add_argument(
     help="which approximation of the later generation to use (default: logit)",
 )
 parser.add_argument(
-    "--extrapolated_model_path",
-    "-emp",
+    "--adapter_path",
+    "-ap",
     type=str,
     default="",
-    help="path of the extrapolated checkpoint, required by the 'weight' method",
+    help="path of the alpha scaled LoRA adapter, required by the 'lora' method",
 )
 parser.add_argument(
     "--surrogate_top_p",
@@ -220,7 +220,7 @@ dataset_batch_size = args.dataset_batch_size
 generation = args.generation
 shard_id = args.shard_id
 method = args.method
-extrapolated_model_path = args.extrapolated_model_path
+adapter_path = args.adapter_path
 surrogate_p1 = args.surrogate_top_p
 path = args.path
 
@@ -257,10 +257,7 @@ if method == "logit":
         model_name=MODEL_SPECIFIER,
         max_seq_length=block_size,
         dtype=None,
-        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-        # weights, and quantizing them at load time would round away exactly the small
-        # per-generation drifts whose accumulation this pipeline measures
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -268,31 +265,25 @@ if method == "logit":
         model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
         max_seq_length=block_size,
         dtype=None,
-        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-        # weights, and quantizing them at load time would round away exactly the small
-        # per-generation drifts whose accumulation this pipeline measures
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     FastLanguageModel.for_inference(model_collapsed)
 
-elif method == "weight":
-    # the checkpoint W_base + n * (W_0 - W_base), already written to disk by
-    # run_extrapolation.py once per generation so that the shards of a generation do not race
-    # each other over the same directory. Only one model is resident and no second KV cache is
-    # kept, so this is the cheapest of the three
-    if extrapolated_model_path == "":
+elif method == "lora":
+    # the collapse adapter with its alpha already scaled by n, i.e. weights
+    # W_base + n * (W_collapsed - W_base). run_extrapolation.py builds it once per generation so
+    # that the shards of a generation do not race each other over the same directory. Only one
+    # model is resident and no second KV cache is kept, so this is the cheapest of the three
+    if adapter_path == "":
         raise ValueError(
-            "the 'weight' method needs --extrapolated_model_path, which run_extrapolation.py "
-            "builds with utils.extrapolation.build_extrapolated_weights"
+            "the 'lora' method needs --adapter_path, which run_extrapolation.py builds with "
+            "utils.extrapolation.build_scaled_adapter"
         )
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=extrapolated_model_path,
+        model_name=adapter_path,
         max_seq_length=block_size,
         dtype=None,
-        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-        # weights, and quantizing them at load time would round away exactly the small
-        # per-generation drifts whose accumulation this pipeline measures
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -304,10 +295,7 @@ else:
         model_name=MODEL_SPECIFIER,
         max_seq_length=block_size,
         dtype=None,
-        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-        # weights, and quantizing them at load time would round away exactly the small
-        # per-generation drifts whose accumulation this pipeline measures
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     FastLanguageModel.for_inference(generation_model)
 

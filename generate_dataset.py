@@ -97,10 +97,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}",
     max_seq_length=block_size,
     dtype=None,
-    # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-    # weights, and quantizing them at load time would round away exactly the small
-    # per-generation drifts whose accumulation this pipeline measures
-    load_in_4bit=False,
+    load_in_4bit=True,
 )
 FastLanguageModel.for_inference(model)
 

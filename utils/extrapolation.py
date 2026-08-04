@@ -1,5 +1,6 @@
 """shared definitions of the extrapolation methods used by run_extrapolation.py"""
 
+import json
 import os
 import shutil
 
@@ -12,28 +13,28 @@ from torch import Tensor
 #
 #   logit  base + n * (collapsed - base) in logit space, applied at every decoding step. A
 #          first order step in the output distribution, i.e. p_0^(1-n) * p_1^n
-#   weight the same first order step taken in weight space instead: W_base + n * (W_0 - W_base)
-#          over the full parameter set. Cheaper (one model instead of two), it produces an
+#   lora   the same first order step taken in weight space instead: the collapse LoRA adapter
+#          with its alpha scaled by n. Cheaper (one model instead of two), it produces an
 #          actual model artifact, and the network's own nonlinearities keep it better behaved
 #          than a per-token logit tilt
 #   data   the base model sampled with a support that is truncated once per generation. This
 #          mimics the repeated resampling that *drives* collapse rather than extrapolating the
 #          drift that collapse *causes*, so it is a surrogate of the mechanism, not of the model
-METHODS: tuple[str, ...] = ("logit", "weight", "data")
+METHODS: tuple[str, ...] = ("logit", "lora", "data")
 
 # Artifact suffix per method. "logit" keeps the historical "_ex" so runs made before the other
 # methods existed stay readable, the other two get their own namespace so that all three can
 # coexist on disk and be compared against each other
 METHOD_SUFFIXES: dict[str, str] = {
     "logit": "_ex",
-    "weight": "_ex_weight",
+    "lora": "_ex_lora",
     "data": "_ex_data",
 }
 
 # Human readable method names for the plot titles
 METHOD_LABELS: dict[str, str] = {
     "logit": "logit extrapolation",
-    "weight": "weight-space extrapolation",
+    "lora": "LoRA adapter extrapolation",
     "data": "data-space surrogate",
 }
 
@@ -121,99 +122,55 @@ def calibration_file(dataset_path: str, block_size: int, specifier_name: str) ->
     )
 
 
-def build_extrapolated_weights(
-    base_path: str,
-    first_collapsed_path: str,
-    factor: float,
-    output_path: str,
-    device: str = "cpu",
-) -> str:
+def build_scaled_adapter(adapter_path: str, factor: float, output_path: str) -> str:
     """
-    Writes the checkpoint ``W_base + n * (W_first_collapsed - W_base)``, parameter by parameter.
+    Copies a LoRA adapter and scales its alpha, which scales the delta it adds to the base model.
 
-    ``model_0`` is a single fine-tuning step away from the base model, so ``model_g`` sits
-    ``g + 1`` steps out and scaling the whole fine-tuning delta by `n` is the weight-space
-    counterpart of the logit-space step ``base + n * (collapsed - base)``.
+    A LoRA layer adds ``(alpha / r) * B @ A`` on top of the frozen base weight, so the entire
+    fine-tuning delta is proportional to alpha. ``model_0`` is a single fine-tuning step away
+    from the base model, which makes ``alpha * n`` exactly the weight space counterpart of the
+    logit space step ``base + n * (collapsed - base)``: the resulting weights are
+    ``W_base + n * (W_collapsed - W_base)``.
 
-    Since the pipeline full fine-tunes rather than training LoRA adapters, the delta is not a
-    low-rank object that could be scaled through a config value — it is the difference of two
-    complete parameter sets, and every parameter has to be interpolated explicitly. Buffers are
-    left alone: they are not trained, so they are identical in both checkpoints and the
-    interpolation would be a no-op at best and integer arithmetic at worst.
-
-    Tied parameters (Qwen2.5 ties ``lm_head`` to ``embed_tokens``) appear under more than one
-    name while sharing storage, so already-updated tensors are tracked by data pointer. Without
-    that the update would be applied twice to the same weights.
-
-    The arithmetic runs in float32 and is cast back per parameter, so a bf16 checkpoint does not
-    lose the small deltas to rounding before they are scaled up.
+    The alpha is patched in the copied ``adapter_config.json`` rather than on the loaded
+    modules, so it does not matter whether the loader reads the scaling from the config, caches
+    it on the layer, or fuses it into a custom kernel — which unsloth does. Scaling is
+    proportional to alpha for plain LoRA (``alpha / r``) as well as for rsLoRA
+    (``alpha / sqrt(r)``), so the factor carries through either way.
 
     Args:
-        base_path (str): the pristine base model
-        first_collapsed_path (str): the generation-0 collapsed model
-        factor (float): the factor n. 1.0 reproduces the generation-0 checkpoint exactly
-        output_path (str): directory to write the extrapolated checkpoint to
-        device (str): device to do the interpolation on. CPU by default, since this runs once
-            per generation and the GPU is needed for the generation itself
+        adapter_path (str): directory of the trained collapse adapter, i.e. model_0
+        factor (float): the factor n to multiply the adapter's contribution by
+        output_path (str): directory to write the scaled copy to
 
     Returns:
         str: output_path, so the call can be inlined into a model load
     """
-    # transformers is imported lazily: the scripts that call this must import unsloth first,
-    # and a module-level transformers import here would break that ordering
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    def _load(path: str):
-        try:
-            return AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32)
-        except TypeError:
-            # transformers < 4.56 spells it `torch_dtype`
-            return AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float32)
-
-    collapsed = _load(first_collapsed_path).to(device)
-    base = _load(base_path).to(device)
-    base_params = dict(base.named_parameters())
-
-    seen: set[int] = set()
-    n_interpolated = 0
-    with torch.no_grad():
-        for name, param in collapsed.named_parameters():
-            if param.data_ptr() in seen:
-                # tied weight, already updated under its other name
-                continue
-            if name not in base_params:
-                raise KeyError(
-                    f"{name} exists in {first_collapsed_path} but not in {base_path}. The two "
-                    "checkpoints have to be the same architecture for a weight-space "
-                    "extrapolation to mean anything"
-                )
-            base_param = base_params[name]
-            if base_param.shape != param.shape:
-                raise ValueError(
-                    f"shape mismatch for {name}: {tuple(base_param.shape)} in the base model "
-                    f"vs {tuple(param.shape)} in {first_collapsed_path}"
-                )
-            seen.add(param.data_ptr())
-            base_fp32 = base_param.detach().to(torch.float32)
-            collapsed_fp32 = param.detach().to(torch.float32)
-            param.copy_(
-                (base_fp32 + factor * (collapsed_fp32 - base_fp32)).to(param.dtype)
-            )
-            n_interpolated += 1
-
-    if n_interpolated == 0:
-        raise RuntimeError(
-            f"no parameter of {first_collapsed_path} was interpolated — the checkpoint appears "
-            "to have no named parameters, which would silently produce a copy of it"
+    config_name = "adapter_config.json"
+    source_config = os.path.join(adapter_path, config_name)
+    if not os.path.isfile(source_config):
+        raise FileNotFoundError(
+            f"{adapter_path} contains no {config_name}, so it is not a LoRA adapter. The "
+            "'lora' method needs the adapter that run_baseline.py writes with "
+            "save_adapter=True, not the merged _fp16 model"
         )
 
-    del base, base_params
-
-    # a leftover directory from an earlier run would otherwise be half-overwritten
+    # a leftover copy from an earlier run would otherwise be reused with the wrong alpha
     if os.path.exists(output_path):
         shutil.rmtree(output_path)
-    collapsed.save_pretrained(output_path, safe_serialization=True)
-    AutoTokenizer.from_pretrained(first_collapsed_path).save_pretrained(output_path)
+    shutil.copytree(adapter_path, output_path)
+
+    target_config = os.path.join(output_path, config_name)
+    with open(target_config, "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+
+    if config.get("lora_alpha") is None:
+        raise KeyError(f"{source_config} has no lora_alpha to scale")
+
+    config["lora_alpha"] = config["lora_alpha"] * factor
+
+    with open(target_config, "w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=2)
 
     return output_path
 

@@ -257,10 +257,7 @@ def main(
         model_name=model_specifier,
         max_seq_length=int(block_size * 2),
         dtype=None,
-        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-        # weights, and quantizing them at load time would round away exactly the small
-        # per-generation drifts whose accumulation this pipeline measures
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     FastLanguageModel.for_inference(model_base)
     if tokenizer.pad_token is None:
@@ -277,10 +274,7 @@ def main(
         model_name=collapsed_path,
         max_seq_length=int(block_size * 2),
         dtype=None,
-        # not 4-bit: with full fine-tuning the checkpoint's weights *are* the trained
-        # weights, and quantizing them at load time would round away exactly the small
-        # per-generation drifts whose accumulation this pipeline measures
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     FastLanguageModel.for_inference(model_collapsed)
 

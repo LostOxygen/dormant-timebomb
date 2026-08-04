@@ -87,7 +87,9 @@ def main(
     model_specifier: str = "",
     continue_from_generation: int = 0,
     dataset_size: int = 10000,
-    learning_rate: float = 2e-5,
+    learning_rate: float = 2e-4,
+    lora_rank: int = 16,
+    lora_alpha: int = 16,
 ) -> None:
     """
     Main function to start the pitfall 1 fine-tuning
@@ -108,8 +110,10 @@ def main(
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
         dataset_size (int): number of dataset samples to use, taken from the front of the
             upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
-        learning_rate (float): full fine-tuning learning rate. Much smaller than a LoRA rate
-            would be, since every weight is updated directly
+        learning_rate (float): LoRA learning rate
+        lora_rank (int): LoRA rank r. Together with lora_alpha this bounds how far one
+            generation can drift from the last one, i.e. how strong the collapse effect is
+        lora_alpha (int): LoRA alpha. The adapter contributes (alpha / r) * B @ A
 
     Returns:
         None
@@ -153,13 +157,12 @@ def main(
         MODEL_SPECIFIER = model_specifier
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
-    # load the tokenizer to count to tokens of the dataset. The model itself is discarded, but
-    # 4-bit is off here too so that no load in this project quantizes anything
+    # load the tokenizer to count to tokens of the dataset
     _, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_SPECIFIER,
         max_seq_length=4096,
         dtype=None,
-        load_in_4bit=False,
+        load_in_4bit=True,
     )
     global EOS_TOKEN
     global TOKENIZER
@@ -306,25 +309,48 @@ def main(
             # check if generations need to be skipped if continue_from_generation > 0
             if gen_id < continue_from_generation:
                 continue
-            # load the model for *full* fine-tuning.
+            # load the model
             #
-            # No LoRA. A rank-16 adapter on the attention and MLP projections can only move the
-            # model inside a low dimensional subspace and leaves the embeddings, the norms and
-            # the head untouched, which damps how far one generation can drift from the last
-            # one. Since the whole point of the pipeline is to let that drift accumulate,
-            # adapting only a slice of the weights suppresses the very effect being measured.
-            # Full fine-tuning lets every parameter move.
+            # LoRA, not full fine-tuning: unsloth patches Qwen2Attention.forward globally with
+            # its fast kernel, which calls a per-layer `apply_qkv` that only its LoRA path
+            # installs. With full_finetuning=True there is no PEFT wrapper, the attribute is
+            # never set, and the first forward pass raises
+            # "'Qwen2Attention' object has no attribute 'apply_qkv'".
             #
-            # This also rules out 4-bit: quantized weights cannot be trained, so the base has to
-            # be loaded at full precision. That is the memory cost of dropping LoRA.
+            # This does damp the collapse effect — an adapter can only move the model inside a
+            # low dimensional subspace and leaves the embeddings, norms and head untouched — so
+            # the knobs below (rank, alpha, which modules are targeted, the learning rate) are
+            # what controls how far one generation can drift from the last one.
             model, tokenizer = FastLanguageModel.from_pretrained(
                 model_name=MODEL_SPECIFIER
                 if gen_id == 0
                 else f"{MODEL_PATH}model_{gen_id - 1}_bs{block_size}_{specifier_name}",
                 max_seq_length=block_size,
                 dtype=None,
-                load_in_4bit=False,
-                full_finetuning=True,
+                load_in_4bit=True,
+            )
+
+            # add LoRA adapters
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=lora_rank,
+                target_modules=[
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                ],
+                lora_alpha=lora_alpha,
+                lora_dropout=0,  # Supports any, but = 0 is optimized
+                bias="none",  # Supports any, but = "none" is optimized
+                use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
+                random_state=1337,
+                # task_type="CAUSAL_LM",
+                use_rslora=False,  # We support rank stabilized LoRA
+                loftq_config=None,  # And LoftQ
             )
 
             # load the dataset
@@ -370,9 +396,6 @@ def main(
                     num_train_epochs=training_epochs,
                     per_device_train_batch_size=training_batch_size,
                     per_device_eval_batch_size=training_batch_size,
-                    # full fine-tuning needs a much smaller step than LoRA: 2e-4 updates every
-                    # weight of the model directly and diverges within a few steps, which would
-                    # look like a very fast collapse but is just a broken optimizer
                     learning_rate=learning_rate,
                     fp16=not is_bfloat16_supported(),
                     bf16=is_bfloat16_supported(),
@@ -380,9 +403,6 @@ def main(
                     optim="adamw_8bit",
                     weight_decay=0.01,
                     lr_scheduler_type="linear",
-                    # recomputing activations instead of storing them buys back some of the
-                    # memory that full fine-tuning costs over LoRA
-                    gradient_checkpointing=True,
                     seed=1337,
                     output_dir="outputs",
                     report_to="none",
@@ -416,16 +436,21 @@ def main(
                 f"Peak reserved memory for training % of max memory = {training_percentage} %."
             )
 
-            # save the model. Full fine-tuning means this directory already holds the complete
-            # weights, so there is no adapter to save separately and no merged _fp16 copy to
-            # write — the next generation and every downstream script load it directly
+            # save the model
             trainer.model.save_pretrained(
                 f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}",
                 safe_serialization=True,
+                save_adapter=True,
                 save_config=True,
             )
             trainer.tokenizer.save_pretrained(
                 f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}"
+            )
+            # also save the model in fp16 for testing
+            trainer.model.save_pretrained_merged(
+                f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}_fp16",
+                trainer.tokenizer,
+                save_method="merged_16bit",
             )
 
             del trainer
@@ -865,10 +890,25 @@ if __name__ == "__main__":
         "--learning_rate",
         "-lr",
         type=float,
-        default=2e-5,
-        help="full fine-tuning learning rate. The pipeline trains every weight rather than a "
-        "LoRA adapter, so this has to be roughly an order of magnitude below a typical LoRA "
-        "rate; 2e-4 diverges within a few steps (default: 2e-5)",
+        default=2e-4,
+        help="LoRA learning rate (default: 2e-4)",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        "-lr_r",
+        type=int,
+        default=16,
+        help="LoRA rank r. The adapter can only move the model inside an r-dimensional "
+        "subspace, so this is one of the levers on how strongly each generation collapses. "
+        "Raise it (32, 64) to let a generation drift further (default: 16)",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        "-lr_a",
+        type=int,
+        default=16,
+        help="LoRA alpha. The adapter contributes (alpha / r) * B @ A, so raising alpha "
+        "relative to the rank scales up the per-generation delta (default: 16)",
     )
     parser.add_argument(
         "--path",
