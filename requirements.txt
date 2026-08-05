@@ -1,15 +1,20 @@
 psutil
-torch==2.8.0
-transformers==4.56.2
-datasets==4.2.0
-tqdm==4.67.1
+torch==2.11.0
+transformers==5.5.0
+datasets==4.3.0
+tqdm==4.70.0
 gguf==0.17.1
-unsloth==2025.10.7
+unsloth==2026.8.4
 matplotlib==3.10.7
-pandas==2.3.3
+pandas==3.0.5
 seaborn==0.13.2
-trl==0.23.0
+trl==0.24.0
 sympy==1.14.0
 scipy==1.16.2
-peft==0.17.1
-unsloth_zoo
+peft==0.20.0
+unsloth_zoo==2026.8.3
+# the dataset generation engine. Optional: generate_dataset.py falls back to the unsloth
+# generate() path when vLLM is missing (--engine transformers). Install it into its own
+# environment if it wants to move the pinned torch/transformers versions, the generation workers
+# are separate subprocesses and do not share an interpreter with the unsloth stack
+vllm==0.26.0
