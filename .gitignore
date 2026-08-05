@@ -10,6 +10,7 @@ venv/
 unsloth_compiled_cache/
 outputs/
 plots/
+.vscode
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
