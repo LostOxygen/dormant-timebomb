@@ -2,6 +2,15 @@
 CLAUDE.md
 .claude/
 
+# project stuff
+attack_results/
+generated_datasets/
+model_outputs/
+venv/
+unsloth_compiled_cache/
+outputs/
+plots/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
