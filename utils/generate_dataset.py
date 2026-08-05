@@ -55,6 +55,7 @@ Returns:
 import os
 import argparse
 import importlib.util
+import shutil
 
 from utils.colors import TColors
 
@@ -105,7 +106,7 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
     Returns:
         list: the responses, in the order of the instructions
     """
-    from vllm import LLM, SamplingParams
+    from vllm import LLM, SamplingParams, TokensPrompt
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = format_prompts(instructions, tokenizer)
@@ -113,9 +114,8 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
     # the context has to hold the longest prompt plus a full response. Sizing it off the actual
     # prompts instead of using a fixed number keeps the KV cache from reserving context that
     # this shard cannot use — that memory becomes concurrent sequences instead
-    prompt_lengths = [
-        len(ids) for ids in tokenizer(prompts, add_special_tokens=False)["input_ids"]
-    ]
+    prompt_ids = tokenizer(prompts, add_special_tokens=False)["input_ids"]
+    prompt_lengths = [len(ids) for ids in prompt_ids]
     # the model's own context, not the tokenizer's model_max_length — the latter is 131072 for
     # Qwen2.5 and describes the tokenizer rather than the positions the model was trained for
     model_context = AutoConfig.from_pretrained(model_dir).max_position_embeddings
@@ -155,13 +155,29 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
         # vLLM returns only the continuation, so unlike the transformers path there is no prompt
         # to strip. The special tokens are dropped here so the stored response is plain text
         skip_special_tokens=True,
-        # a prompt longer than the context would abort the whole call. This cannot trigger while
-        # max_model_len is prompt driven above, only when it was capped by the model's context
-        truncate_prompt_tokens=max(1, max_model_len - MIN_NEW_TOKENS),
     )
 
+    # a prompt longer than the context would abort the whole call. This cannot trigger while
+    # max_model_len is prompt driven above, only when it was capped by the model's context.
+    #
+    # This used to be SamplingParams(truncate_prompt_tokens=...), which vLLM 0.26 removed — it now
+    # raises `TypeError: Unexpected keyword argument 'truncate_prompt_tokens'`, and on the
+    # generation path the parameter has no successor. The documented replacement,
+    # llm.generate(tokenization_kwargs={"truncation": True, "max_length": n}), is *not* equivalent:
+    # truncate_prompt_tokens kept the last n tokens, while tokenizer.encode truncates from the
+    # right, and truncation_side is an attribute of the tokenizer rather than a call kwarg, so
+    # passing it there is silently ignored. Right truncating a chat prompt cuts off the trailing
+    # `<|im_start|>assistant\n`, i.e. exactly the generation prompt the model needs to answer at
+    # all. So the tail is kept explicitly here, on the ids that were tokenized above for the
+    # length measurement — which also means the engine is handed the same token ids this function
+    # measured rather than retokenizing the strings
+    prompt_limit = max(1, max_model_len - MIN_NEW_TOKENS)
+    engine_prompts = [
+        TokensPrompt(prompt_token_ids=ids[-prompt_limit:]) for ids in prompt_ids
+    ]
+
     # outputs come back in the order of the prompts
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(engine_prompts, sampling_params)
     return [output.outputs[0].text.strip() for output in outputs]
 
 
@@ -395,6 +411,26 @@ if __name__ == "__main__":
         # CUDA first, and spawn is the method the __main__ guard above is written for. setdefault
         # so an explicit value in the environment still wins
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+        # vLLM JIT compiles flashinfer's sampling kernels at engine startup, and flashinfer locates
+        # the CUDA toolkit itself, in flashinfer/jit/cpp_ext.py::get_cuda_path: CUDA_HOME, else
+        # CUDA_PATH, else the parent of the parent of `which nvcc`. That last fallback does not
+        # resolve symlinks, so on a machine whose nvcc is reached through /usr/local/bin/nvcc ->
+        # /usr/local/cuda/bin/nvcc it yields /usr/local instead of /usr/local/cuda. The kernels are
+        # then compiled with -isystem /usr/local/include, which holds no CUDA headers, and the
+        # engine dies during its KV cache init with
+        #
+        #     <command-line>: fatal error: cuda_runtime.h: No such file or directory
+        #
+        # Resolving the symlink here is the whole fix. It is done in the parent rather than left to
+        # the shell because the spawned engine core inherits this environment, and it is set before
+        # `from vllm import LLM` below only for tidiness — flashinfer reads it at build time
+        if not os.environ.get("CUDA_HOME") and not os.environ.get("CUDA_PATH"):
+            nvcc = shutil.which("nvcc")
+            if nvcc is not None:
+                os.environ["CUDA_HOME"] = os.path.dirname(
+                    os.path.dirname(os.path.realpath(nvcc))
+                )
 
     if engine == "transformers":
         from unsloth import FastLanguageModel

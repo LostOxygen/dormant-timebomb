@@ -92,7 +92,7 @@ def main(
     path: str = "",
     model_specifier: str = "",
     continue_from_generation: int = 0,
-    dataset_size: int = 10000,
+    dataset_size: int = 50000,
     learning_rate: float = 2e-4,
     lora_rank: int = 16,
     lora_alpha: int = 16,
@@ -912,10 +912,10 @@ if __name__ == "__main__":
         "--dataset_size",
         "-dsz",
         type=int,
-        default=10000,
+        default=50000,
         help="number of dataset samples to use, taken as a contiguous slice from the front of "
         "the upstream 50k dataset. run_baseline.py and run_extrapolation.py must be given the "
-        "same value, otherwise their histograms describe different data (default: 10000)",
+        "same value, otherwise their histograms describe different data (default: 50000)",
     )
     parser.add_argument(
         "--learning_rate",
