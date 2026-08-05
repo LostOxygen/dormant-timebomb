@@ -25,6 +25,23 @@ Two engines produce the responses:
 
 Both engines are driven with the same explicitly pinned sampling parameters, see --temperature.
 
+Everything except the constants and the function definitions runs under an
+`if __name__ == "__main__"` guard, which is load bearing rather than cosmetic. vLLM does not run
+its engine in this process: it *spawns* one, and a spawned child reconstructs its parent by
+re-importing the parent's __main__ module under the name __mp_main__, with sys.argv preserved so
+argparse re-runs without complaint. Unguarded module level work would therefore execute a second
+time inside the vLLM worker — re-parsing the arguments, re-importing torch, re-reading the shard
+from disk, and finally building a second LLM() while the first one is still bootstrapping, which
+multiprocessing refuses with
+
+    RuntimeError: An attempt has been made to start a new process before the current process has
+    finished its bootstrapping phase.
+
+The generate functions read their configuration from the module globals the guarded block binds.
+That works because the guard sits at module scope, so the names it assigns are ordinary module
+attributes, looked up when the functions run rather than when they are defined — and the
+functions are only ever called from inside the guard.
+
 Args:
     block_size (int): The block size to use for training.
     specifier_name (str): The model specifier to use for training.
@@ -39,144 +56,13 @@ import os
 import argparse
 import importlib.util
 
+from utils.colors import TColors
+
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
 # EOS is suppressed for this many tokens, so every response is at least this long
 MIN_NEW_TOKENS: int = 128
-
-
-parser = argparse.ArgumentParser(description="Data Generation")
-parser.add_argument(
-    "--block_size",
-    "-b",
-    type=int,
-    default=512,
-    help="specifies the block size to use for training",
-)
-parser.add_argument(
-    "--specifier_name",
-    "-s",
-    type=str,
-    default="Qwen2.5-Coder-0.5B-Instruct",
-    help="specifies the model specifier to use for training",
-)
-parser.add_argument(
-    "--dataset_batch_size",
-    "-dbs",
-    type=int,
-    default=100,
-    help="prompts per generate() call. Only the transformers engine uses this, vLLM schedules "
-    "the whole shard itself and does not need a batch size",
-)
-parser.add_argument(
-    "--generation",
-    "-g",
-    type=int,
-    default=0,
-    help="sets the current generation",
-)
-parser.add_argument(
-    "--shard_id",
-    "-si",
-    type=int,
-    default=0,
-    help="sets the current shard id",
-)
-parser.add_argument(
-    "--engine",
-    "-e",
-    type=str,
-    default="auto",
-    choices=["auto", "vllm", "transformers"],
-    help="inference engine for the generation. 'auto' uses vLLM if it is installed and falls "
-    "back to transformers otherwise (default: auto)",
-)
-parser.add_argument(
-    "--gpu_memory_utilization",
-    "-gmu",
-    type=float,
-    default=0.90,
-    help="fraction of the GPU vLLM may use. Each worker owns its GPU exclusively, so this can "
-    "be high. Everything not taken by the weights becomes KV cache, i.e. concurrent sequences "
-    "(default: 0.90)",
-)
-parser.add_argument(
-    "--enforce_eager",
-    "-ee",
-    action="store_true",
-    help="disable vLLM's CUDA graphs. Capturing them costs ~30-60s of startup per worker but "
-    "removes most of the per step kernel launch overhead, which dominates decoding for a model "
-    "this small. Only worth setting for very small shards",
-)
-parser.add_argument(
-    "--temperature",
-    "-tp",
-    type=float,
-    default=0.7,
-    help="sampling temperature. Pinned rather than inherited from the model's "
-    "generation_config, because the engines disagree on the default: transformers reads "
-    "generation_config.json while vLLM does not necessarily, so an unpinned value would make "
-    "the two engines sample from different distributions (default: 0.7, Qwen2.5's own value)",
-)
-parser.add_argument(
-    "--top_p",
-    "-tpp",
-    type=float,
-    default=0.8,
-    help="nucleus sampling cutoff, pinned for the same reason as --temperature. NOTE that a "
-    "cutoff below 1.0 truncates the model's own distribution, which is itself a collapse "
-    "mechanism — it is what utils.extrapolation's data-space surrogate models (default: 0.8, "
-    "Qwen2.5's own value)",
-)
-parser.add_argument(
-    "--top_k",
-    "-tpk",
-    type=int,
-    default=20,
-    help="top-k sampling cutoff, pinned for the same reason as --temperature. -1 disables it "
-    "(default: 20, Qwen2.5's own value)",
-)
-parser.add_argument(
-    "--path",
-    "-p",
-    type=str,
-    default="",
-    help="path to save the generated datasets and models (default: current directory)",
-)
-args = parser.parse_args()
-
-# arguments
-block_size = args.block_size
-specifier_name = args.specifier_name
-dataset_batch_size = args.dataset_batch_size
-generation = args.generation
-shard_id = args.shard_id
-engine = args.engine
-gpu_memory_utilization = args.gpu_memory_utilization
-enforce_eager = args.enforce_eager
-temperature = args.temperature
-top_p = args.top_p
-top_k = args.top_k
-path = args.path
-
-# resolve the engine before importing anything heavy. unsloth has to be imported before
-# torch/transformers to patch them, so it is only imported in the branch that actually uses it.
-# The availability of vLLM is probed with find_spec rather than a try/except around `import
-# vllm`, because a failing vllm import would already have pulled in torch and the unsloth import
-# below would then come too late to patch it
-if engine == "auto":
-    engine = "vllm" if importlib.util.find_spec("vllm") is not None else "transformers"
-
-if engine == "transformers":
-    from unsloth import FastLanguageModel
-
-import torch  # noqa: E402
-from datasets import Dataset  # noqa: E402
-from tqdm import tqdm  # noqa: E402
-from transformers import AutoConfig, AutoTokenizer  # noqa: E402
-
-from utils.colors import TColors  # noqa: E402
 
 
 def format_prompts(instructions: list, tokenizer) -> list:
@@ -369,51 +255,185 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
     return responses
 
 
-# set data paths
-if path != "":
-    DATASET_PATH = os.path.join(path, "generated_datasets/")
-    MODEL_PATH = os.path.join(path, "model_outputs/")
-    # create the directories if they do not exist
-    os.makedirs(DATASET_PATH, exist_ok=True)
-    os.makedirs(MODEL_PATH, exist_ok=True)
+# everything below this line is skipped when vLLM's spawned engine process re-imports this module
+# as __mp_main__, see the module docstring
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Data Generation")
+    parser.add_argument(
+        "--block_size",
+        "-b",
+        type=int,
+        default=512,
+        help="specifies the block size to use for training",
+    )
+    parser.add_argument(
+        "--specifier_name",
+        "-s",
+        type=str,
+        default="Qwen2.5-Coder-0.5B-Instruct",
+        help="specifies the model specifier to use for training",
+    )
+    parser.add_argument(
+        "--dataset_batch_size",
+        "-dbs",
+        type=int,
+        default=100,
+        help="prompts per generate() call. Only the transformers engine uses this, vLLM schedules "
+        "the whole shard itself and does not need a batch size",
+    )
+    parser.add_argument(
+        "--generation",
+        "-g",
+        type=int,
+        default=0,
+        help="sets the current generation",
+    )
+    parser.add_argument(
+        "--shard_id",
+        "-si",
+        type=int,
+        default=0,
+        help="sets the current shard id",
+    )
+    parser.add_argument(
+        "--engine",
+        "-e",
+        type=str,
+        default="auto",
+        choices=["auto", "vllm", "transformers"],
+        help="inference engine for the generation. 'auto' uses vLLM if it is installed and falls "
+        "back to transformers otherwise (default: auto)",
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        "-gmu",
+        type=float,
+        default=0.90,
+        help="fraction of the GPU vLLM may use. Each worker owns its GPU exclusively, so this can "
+        "be high. Everything not taken by the weights becomes KV cache, i.e. concurrent sequences "
+        "(default: 0.90)",
+    )
+    parser.add_argument(
+        "--enforce_eager",
+        "-ee",
+        action="store_true",
+        help="disable vLLM's CUDA graphs. Capturing them costs ~30-60s of startup per worker but "
+        "removes most of the per step kernel launch overhead, which dominates decoding for a model "
+        "this small. Only worth setting for very small shards",
+    )
+    parser.add_argument(
+        "--temperature",
+        "-tp",
+        type=float,
+        default=0.7,
+        help="sampling temperature. Pinned rather than inherited from the model's "
+        "generation_config, because the engines disagree on the default: transformers reads "
+        "generation_config.json while vLLM does not necessarily, so an unpinned value would make "
+        "the two engines sample from different distributions (default: 0.7, Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--top_p",
+        "-tpp",
+        type=float,
+        default=0.8,
+        help="nucleus sampling cutoff, pinned for the same reason as --temperature. NOTE that a "
+        "cutoff below 1.0 truncates the model's own distribution, which is itself a collapse "
+        "mechanism — it is what utils.extrapolation's data-space surrogate models (default: 0.8, "
+        "Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--top_k",
+        "-tpk",
+        type=int,
+        default=20,
+        help="top-k sampling cutoff, pinned for the same reason as --temperature. -1 disables it "
+        "(default: 20, Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--path",
+        "-p",
+        type=str,
+        default="",
+        help="path to save the generated datasets and models (default: current directory)",
+    )
+    args = parser.parse_args()
 
-print(
-    f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation}{TColors.ENDC} "
-    f"(shard {shard_id}, engine: {engine})"
-)
+    # arguments
+    block_size = args.block_size
+    specifier_name = args.specifier_name
+    dataset_batch_size = args.dataset_batch_size
+    generation = args.generation
+    shard_id = args.shard_id
+    engine = args.engine
+    gpu_memory_utilization = args.gpu_memory_utilization
+    enforce_eager = args.enforce_eager
+    temperature = args.temperature
+    top_p = args.top_p
+    top_k = args.top_k
+    path = args.path
 
-# vLLM cannot load a bare LoRA adapter directory as a model, so it samples from the merged fp16
-# checkpoint that run_baseline.py writes next to the adapter. The two are the same weights: the
-# merge dequantizes the base and folds B @ A into it, so this is not a different model
-if engine == "vllm":
-    checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}_fp16"
-    if not os.path.isdir(checkpoint):
-        raise FileNotFoundError(
-            f"the merged checkpoint {checkpoint} does not exist. run_baseline.py writes it with "
-            "save_pretrained_merged right after training a generation — a run whose models "
-            "predate that step has to use --engine transformers, which reads the adapter "
-            "directory instead"
-        )
-else:
-    checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}"
+    # resolve the engine before importing anything heavy. unsloth has to be imported before
+    # torch/transformers to patch them, so it is only imported in the branch that actually uses
+    # it. The availability of vLLM is probed with find_spec rather than a try/except around
+    # `import vllm`, because a failing vllm import would already have pulled in torch and the
+    # unsloth import below would then come too late to patch it
+    if engine == "auto":
+        engine = "vllm" if importlib.util.find_spec("vllm") is not None else "transformers"
 
-# load the base subdataset. The orchestrator writes these shards once, they hold the instructions
-# which are the same for every generation
-subdataset = Dataset.load_from_disk(
-    DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}_shard{shard_id}"
-)
-instructions = list(subdataset["instruction"])
+    if engine == "transformers":
+        from unsloth import FastLanguageModel
 
-if engine == "vllm":
-    new_responses = generate_vllm(instructions, checkpoint)
-else:
-    new_responses = generate_transformers(instructions, checkpoint)
+    import torch  # noqa: E402
+    from datasets import Dataset  # noqa: E402
+    from tqdm import tqdm  # noqa: E402
+    from transformers import AutoConfig, AutoTokenizer  # noqa: E402
 
-# save the new dataset to disk
-new_dataset = Dataset.from_dict(
-    {"instruction": instructions, "response": new_responses}
-)
+    # set data paths
+    if path != "":
+        DATASET_PATH = os.path.join(path, "generated_datasets/")
+        MODEL_PATH = os.path.join(path, "model_outputs/")
+        # create the directories if they do not exist
+        os.makedirs(DATASET_PATH, exist_ok=True)
+        os.makedirs(MODEL_PATH, exist_ok=True)
 
-new_dataset.save_to_disk(
-    DATASET_PATH + f"subdataset_{generation}_bs{block_size}_{specifier_name}_shard{shard_id}"
-)
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation}{TColors.ENDC} "
+        f"(shard {shard_id}, engine: {engine})"
+    )
+
+    # vLLM cannot load a bare LoRA adapter directory as a model, so it samples from the merged
+    # fp16 checkpoint that run_baseline.py writes next to the adapter. The two are the same
+    # weights: the merge dequantizes the base and folds B @ A into it, so this is not a different
+    # model
+    if engine == "vllm":
+        checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}_fp16"
+        if not os.path.isdir(checkpoint):
+            raise FileNotFoundError(
+                f"the merged checkpoint {checkpoint} does not exist. run_baseline.py writes it "
+                "with save_pretrained_merged right after training a generation — a run whose "
+                "models predate that step has to use --engine transformers, which reads the "
+                "adapter directory instead"
+            )
+    else:
+        checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}"
+
+    # load the base subdataset. The orchestrator writes these shards once, they hold the
+    # instructions which are the same for every generation
+    subdataset = Dataset.load_from_disk(
+        DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}_shard{shard_id}"
+    )
+    instructions = list(subdataset["instruction"])
+
+    if engine == "vllm":
+        new_responses = generate_vllm(instructions, checkpoint)
+    else:
+        new_responses = generate_transformers(instructions, checkpoint)
+
+    # save the new dataset to disk
+    new_dataset = Dataset.from_dict(
+        {"instruction": instructions, "response": new_responses}
+    )
+
+    new_dataset.save_to_disk(
+        DATASET_PATH + f"subdataset_{generation}_bs{block_size}_{specifier_name}_shard{shard_id}"
+    )
