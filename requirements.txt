@@ -19,5 +19,10 @@ pytz==2025.2
 # the dataset generation engine. Optional: utils/generate_dataset.py falls back to the unsloth
 # generate() path when vLLM is missing (--engine transformers). Install it into its own
 # environment if it wants to move the pinned torch/transformers versions, the generation workers
-# are separate subprocesses and do not share an interpreter with the unsloth stack
+# are separate subprocesses and do not share an interpreter with the unsloth stack.
+#
+# The pin is a floor as well as a ceiling: generate_vllm() truncates prompts itself and hands the
+# engine TokensPrompt objects, because 0.26 removed SamplingParams(truncate_prompt_tokens=...).
+# Going back below 0.26 still works, going forward needs that call site rechecked — see the vLLM
+# 0.26 API notes in CLAUDE.md
 vllm==0.26.0

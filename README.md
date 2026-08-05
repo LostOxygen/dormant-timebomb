@@ -28,6 +28,17 @@ A CUDA GPU is required. Unsloth is used for 4-bit loading/training, and the perp
 evaluation moves its tensors to ```cuda``` explicitly, so neither script runs end-to-end on
 CPU or MPS. Multiple GPUs are used automatically for the dataset-generation step (see below).
 
+A **CUDA toolkit** (not just a driver) has to be installed as well, because vLLM JIT-compiles
+flashinfer's sampling kernels the first time an engine starts. That compile is also the one thing
+in the install that depends on how the toolkit is laid out: flashinfer finds it via ```CUDA_HOME```,
+```CUDA_PATH```, or the grandparent of ```which nvcc```, and the last of those does not resolve
+symlinks — so on a machine whose ```nvcc``` is reached through ```/usr/local/bin/nvcc ->
+/usr/local/cuda/bin/nvcc``` it concludes the toolkit lives in ```/usr/local``` and the compile dies
+with ```fatal error: cuda_runtime.h: No such file or directory```. ```utils/generate_dataset.py```
+resolves the symlink itself, so no ```export``` is needed; set ```CUDA_HOME``` explicitly only to
+pick a specific toolkit among several. The first generation pays a one-off compile of a minute or
+two, cached under ```~/.cache/flashinfer/``` per architecture and reused by every later run.
+
 Training uses **LoRA**, not full fine-tuning. This is a constraint of the stack rather than a
 preference: unsloth patches ```Qwen2Attention.forward``` globally with its fast kernel, which
 calls a per-layer ```apply_qkv``` that only its LoRA path installs, so ```full_finetuning=True```
