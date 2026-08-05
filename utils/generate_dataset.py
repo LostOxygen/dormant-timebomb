@@ -380,6 +380,22 @@ if __name__ == "__main__":
     if engine == "auto":
         engine = "vllm" if importlib.util.find_spec("vllm") is not None else "transformers"
 
+    if engine == "vllm":
+        # vLLM runs its engine core in a separate process and picks the start method itself, in
+        # vllm/utils/system_utils.py::_maybe_force_spawn. It forces `spawn` and warns whenever it
+        # finds CUDA already initialized here, because forking a process that holds a CUDA context
+        # is undefined behaviour. That is not something this module does — the vLLM path never
+        # touches the GPU before LLM() — it is vLLM's own platform probe: CudaPlatform calls
+        # torch.cuda.get_device_properties()/current_device(), which trigger torch's lazy CUDA
+        # init, so the check is looking at a context vLLM created moments earlier.
+        #
+        # Declaring spawn up front hits the early return at the top of _maybe_force_spawn, which
+        # skips both the probe and the warning. The point is not the warning though: it makes the
+        # start method a property of this file rather than of whether something happened to touch
+        # CUDA first, and spawn is the method the __main__ guard above is written for. setdefault
+        # so an explicit value in the environment still wins
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
     if engine == "transformers":
         from unsloth import FastLanguageModel
 
