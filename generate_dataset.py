@@ -100,6 +100,10 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     load_in_4bit=True,
 )
 FastLanguageModel.for_inference(model)
+# left padding is required for batched generation and is what for_inference sets, but it sets it
+# on the model's internal tokenizer copy. Setting it here as well guarantees that the prompt
+# occupies a constant prefix of every row of the batch, which the prompt slicing below relies on
+tokenizer.padding_side = "left"
 
 # load the base subdataset from the previous generation
 subdataset = Dataset.load_from_disk(
@@ -148,26 +152,39 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
         return_tensors="pt",
     ).to("cuda")
 
-    # do_sample/num_beams are set explicitly rather than inherited from the model's
-    # generation_config: collapse is driven by resampling from the model's own distribution, so
-    # the decoding has to be plain multinomial sampling. Beam search (num_beams > 1) would
-    # optimize for likelihood and systematically narrow the output distribution, which
-    # suppresses exactly the effect this pipeline measures
+    # do_sample/num_beams/repetition_penalty are set explicitly rather than inherited from the
+    # model's generation_config: collapse is driven by resampling from the model's own
+    # distribution, so the decoding has to be plain multinomial sampling. Beam search
+    # (num_beams > 1) would optimize for likelihood and systematically narrow the output
+    # distribution, which suppresses exactly the effect this pipeline measures.
+    # repetition_penalty is pinned to 1.0, i.e. disabled, because the responses are scored by an
+    # unpenalized forward pass in calculate_perplexity.py. Any penalty would make the measured
+    # perplexity a property of the sampling distortion rather than of the model, and since the
+    # penalty divides the logit of every token already in the context, its severity grows with
+    # the response length — which grows with every generation, so the distortion would alias
+    # onto the collapse trend instead of being a constant offset
     generated_answers = model.generate(
         **inputs,
         do_sample=True,
         num_beams=1,
-        repetition_penalty=3.0,
+        repetition_penalty=1.0,
         min_new_tokens=128,
         max_new_tokens=block_size,
         use_cache=True,
     )
 
-    generated_answers = tokenizer.batch_decode(generated_answers)
+    # the prompt is dropped by token count instead of by splitting the decoded string on the chat
+    # template markers, since skip_special_tokens removes those markers. The batch is left padded,
+    # so the prompt is the same number of tokens in every row
+    prompt_length = inputs["input_ids"].shape[1]
+    generated_answers = tokenizer.batch_decode(
+        generated_answers[:, prompt_length:],
+        skip_special_tokens=True,
+    )
     for answer in generated_answers:
-        # split the string and only append the assistants response
-        sanitized_answer = answer.split("<|im_start|>assistant")[-1]
-        new_responses.append(sanitized_answer)
+        # skip_special_tokens already dropped the trailing <|im_end|> and the padding, so only the
+        # surrounding whitespace is left to strip
+        new_responses.append(answer.strip())
 
 # save the new dataset to disk
 new_dataset = Dataset.from_dict(

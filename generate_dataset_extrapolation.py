@@ -32,7 +32,6 @@ import torch
 from transformers import (
     LogitsProcessor,
     LogitsProcessorList,
-    RepetitionPenaltyLogitsProcessor,
 )
 
 from utils.colors import TColors
@@ -46,9 +45,6 @@ from utils.extrapolation import (
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
-# the repetition penalty is applied by hand after the extrapolation instead of being passed to
-# generate(), see the logits processor list below for why
-REPETITION_PENALTY: float = 3.0
 
 class UnslothExtrapolationProcessor(LogitsProcessor):
     def __init__(self, model_collapsed, generation_n: float, prompt_attention_mask: torch.Tensor):
@@ -305,6 +301,12 @@ else:
         f"{surrogate_p1} ** {generation_n} = {schedule_top_p:.6f}"
     )
 
+# left padding is required for batched generation and is what for_inference sets, but it sets it on
+# the model's internal tokenizer copy. Setting it here as well guarantees that the prompt occupies a
+# constant prefix of every row of the batch, which the prompt slicing further down relies on — and
+# it is what the extrapolation processor's padding aware position_ids assume
+tokenizer.padding_side = "left"
+
 # load the base subdataset from the previous generation
 subdataset = Dataset.load_from_disk(
     DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
@@ -351,24 +353,14 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
     # everything that is not the mechanism of the method itself is kept identical across the
     # three methods, so that a difference between their histograms is a difference between the
     # approximations and not between their decoding setups. temperature and top_k are left to
-    # the model's own generation_config; do_sample and num_beams are pinned below
+    # the model's own generation_config; do_sample, num_beams and repetition_penalty are pinned
+    # below
     method_kwargs = {}
 
     if method == "logit":
-        # the logit extrapolation runs as a custom logits processor during decoding.
-        #
-        # the repetition penalty has to run *after* the extrapolation, so it cannot be left to
-        # generate(): the processors that generate() builds itself run before any custom one, so
-        # the base scores would already be penalized while the collapsed model's logits are raw.
-        # The extrapolation then works out to (1 - n) * penalized_base + n * raw_collapsed,
-        # which cancels the penalty at n = 1 and inverts it for n > 1 — the negative coefficient
-        # pushes the tokens the penalty pushed down back up, i.e. it actively rewards
-        # repetition, harder with every generation. Passing the penalty as a custom processor is
-        # not enough either, since generate() substitutes a custom processor at the position of
-        # the default it replaces. So the built-in one is disabled with 1.0 and this list
-        # applies the penalty to the extrapolated scores instead.
-        # The processor is rebuilt per batch because it holds the collapsed model's KV cache and
-        # this batch's prompt mask
+        # the logit extrapolation runs as a custom logits processor during decoding. It is
+        # rebuilt per batch because it holds the collapsed model's KV cache and this batch's
+        # prompt mask
         method_kwargs["logits_processor"] = LogitsProcessorList(
             [
                 UnslothExtrapolationProcessor(
@@ -376,20 +368,12 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
                     generation_n=generation_n,
                     prompt_attention_mask=inputs["attention_mask"],
                 ),
-                RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
             ]
         )
-        # 1.0 keeps generate() from building its own penalty processor, which would run before
-        # the extrapolation. The penalty is in logits_processor instead
-        method_kwargs["repetition_penalty"] = 1.0
-    else:
-        # no extrapolation processor is involved, so there is nothing the built-in penalty could
-        # be cancelled by and it can be left to generate() as usual
-        method_kwargs["repetition_penalty"] = REPETITION_PENALTY
-        if method == "data":
-            # the whole method is a statement about the sampling support, so the truncation is
-            # set explicitly rather than inherited
-            method_kwargs["top_p"] = schedule_top_p
+    elif method == "data":
+        # the whole method is a statement about the sampling support, so the truncation is
+        # set explicitly rather than inherited
+        method_kwargs["top_p"] = schedule_top_p
 
     generated_answers = generation_model.generate(
         **inputs,
@@ -400,17 +384,34 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
         # this pipeline measures — and it would do so unevenly across the three methods
         do_sample=True,
         num_beams=1,
+        # pinned to 1.0, i.e. disabled, for every method. The responses are scored by an
+        # unpenalized forward pass, so a penalty would make the measured perplexity a property of
+        # the sampling distortion rather than of the model — and since it divides the logit of
+        # every token already in the context, its severity grows with the response length and
+        # would therefore alias onto the collapse trend. Leaving it to the generation_config is
+        # not enough either: an inherited penalty would run before the extrapolation processor,
+        # so the extrapolation would see penalized base scores against raw collapsed ones and
+        # work out to (1 - n) * penalized_base + n * raw_collapsed, which cancels the penalty at
+        # n = 1 and inverts it for n > 1
+        repetition_penalty=1.0,
         min_new_tokens=128,
         max_new_tokens=block_size,
         use_cache=True,
         **method_kwargs,
     )
 
-    generated_answers = tokenizer.batch_decode(generated_answers)
+    # the prompt is dropped by token count instead of by splitting the decoded string on the chat
+    # template markers, since skip_special_tokens removes those markers. The batch is left padded,
+    # so the prompt is the same number of tokens in every row
+    prompt_length = inputs["input_ids"].shape[1]
+    generated_answers = tokenizer.batch_decode(
+        generated_answers[:, prompt_length:],
+        skip_special_tokens=True,
+    )
     for answer in generated_answers:
-        # split the string and only append the assistants response
-        sanitized_answer = answer.split("<|im_start|>assistant")[-1]
-        new_responses.append(sanitized_answer)
+        # skip_special_tokens already dropped the trailing <|im_end|> and the padding, so only the
+        # surrounding whitespace is left to strip
+        new_responses.append(answer.strip())
 
 # save the new dataset to disk
 new_dataset = Dataset.from_dict(

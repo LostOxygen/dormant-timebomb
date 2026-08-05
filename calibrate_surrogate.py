@@ -43,9 +43,11 @@ DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
-# the repetition penalty the generation pipeline uses. The calibration has to decode with the
-# same value, otherwise p_1 is fitted under a different decoding regime than it is used in
-REPETITION_PENALTY: float = 3.0
+# the repetition penalty the generation pipeline decodes with. It has to be the same value here,
+# otherwise p_1 is fitted under a different decoding regime than it is used in. 1.0 disables it:
+# the pipeline scores its responses with an unpenalized forward pass, so a penalty would make the
+# perplexity a property of the sampling distortion rather than of the model
+REPETITION_PENALTY: float = 1.0
 
 
 def format_prompts(instructions: list, tokenizer) -> list:
@@ -131,9 +133,15 @@ def generate_responses(
                 **sampling_kwargs,
             )
 
-        for answer in tokenizer.batch_decode(generated):
-            # same sanitization as the generation pipeline, so the measured text matches
-            responses.append(answer.split("<|im_start|>assistant")[-1])
+        # same sanitization as the generation pipeline, so the measured text matches: the prompt is
+        # dropped by token count rather than by splitting on the chat template markers, since
+        # skip_special_tokens removes those markers. The batch is left padded, so the prompt is the
+        # same number of tokens in every row
+        prompt_length = inputs["input_ids"].shape[1]
+        for answer in tokenizer.batch_decode(
+            generated[:, prompt_length:], skip_special_tokens=True
+        ):
+            responses.append(answer.strip())
 
     return responses
 
