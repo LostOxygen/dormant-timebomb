@@ -43,11 +43,19 @@ DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
-# the repetition penalty the generation pipeline decodes with. It has to be the same value here,
-# otherwise p_1 is fitted under a different decoding regime than it is used in. 1.0 disables it:
-# the pipeline scores its responses with an unpenalized forward pass, so a penalty would make the
-# perplexity a property of the sampling distortion rather than of the model
+# the decoding the generation pipeline uses. These have to be the same values here, otherwise p_1
+# is fitted under a different decoding regime than it is used in. The pipeline pins them on the
+# CLI (run_baseline.py / run_extrapolation.py -tp/-tpp/-tpk) with these same defaults; if you
+# change them there, change them here.
+# REPETITION_PENALTY is 1.0, i.e. disabled: the pipeline scores its responses with an unpenalized
+# forward pass, so a penalty would make the perplexity a property of the sampling distortion
+# rather than of the model
 REPETITION_PENALTY: float = 1.0
+TEMPERATURE: float = 0.7
+# the base top_p. Every candidate of the calibration grid replaces it, which is the whole point of
+# the fit — p_1 is defined as the truncation that reproduces the real model_0's statistic
+TOP_P: float = 0.8
+TOP_K: int = 20
 
 
 def format_prompts(instructions: list, tokenizer) -> list:
@@ -94,9 +102,9 @@ def generate_responses(
         batch_size (int): number of prompts per generate() call
         max_new_tokens (int): generation length cap
         min_new_tokens (int): generation length floor
-        top_p (float): top-p to sample with. None leaves top_p to the model's own
-            generation_config, which is what the reference generation with model_0 uses.
-            do_sample and num_beams are pinned either way
+        top_p (float): top-p to sample with. None uses the pipeline's TOP_P, which is what the
+            reference generation with model_0 needs; a grid candidate replaces it. Temperature,
+            top-k, do_sample, num_beams and the repetition penalty are pinned either way
 
     Returns:
         list: the decoded responses, in the order of the instructions
@@ -114,9 +122,13 @@ def generate_responses(
             return_tensors="pt",
         ).to("cuda")
 
-        sampling_kwargs = {}
-        if top_p is not None:
-            sampling_kwargs["top_p"] = top_p
+        # the reference generation leaves top_p at the pipeline's value; a grid candidate replaces
+        # it, which is what the fit varies
+        sampling_kwargs = {
+            "temperature": TEMPERATURE,
+            "top_p": TOP_P if top_p is None else top_p,
+            "top_k": TOP_K,
+        }
 
         with torch.no_grad():
             generated = model.generate(
@@ -198,7 +210,7 @@ def mean_log_perplexity(
 
 
 def main(
-    block_size: int = 2048,
+    block_size: int = 512,
     model_specifier: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct",
     num_samples: int = 128,
     dataset_size: int = 10000,
@@ -207,6 +219,7 @@ def main(
     max_new_tokens: int = 512,
     min_new_tokens: int = 128,
     top_p_grid: str = "0.95,0.9,0.85,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1",
+    load_in_4bit: bool = False,
     path: str = "",
 ) -> None:
     """
@@ -223,6 +236,9 @@ def main(
         max_new_tokens (int): generation length cap for the calibration
         min_new_tokens (int): generation length floor, matching the pipeline's 128
         top_p_grid (str): comma separated candidate top-p values
+        load_in_4bit (bool): quantize the models. Has to match calculate_perplexity.py, since
+            the fitted p_1 is only meaningful against the statistic the histograms are plotted
+            with
         path (str): root directory of generated_datasets/ and model_outputs/
 
     Returns:
@@ -261,11 +277,14 @@ def main(
     instructions = list(original_dataset.select(range(num_samples))["instruction"])
 
     # ── the pristine base model, used both to generate the candidates and to measure ──
+    # unquantized, matching calculate_perplexity.py's default. The fitted p_1 is only meaningful
+    # against the statistic the histograms are plotted with, and a 4bit scoring model measures a
+    # slightly different one
     model_base, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_specifier,
         max_seq_length=int(block_size * 2),
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(model_base)
     if tokenizer.pad_token is None:
@@ -282,7 +301,7 @@ def main(
         model_name=collapsed_path,
         max_seq_length=int(block_size * 2),
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(model_collapsed)
 
@@ -377,6 +396,10 @@ def main(
                 "max_new_tokens": max_new_tokens,
                 "min_new_tokens": min_new_tokens,
                 "repetition_penalty": REPETITION_PENALTY,
+                "temperature": TEMPERATURE,
+                "base_top_p": TOP_P,
+                "top_k": TOP_K,
+                "load_in_4bit": load_in_4bit,
                 "block_size": block_size,
                 "model_specifier": model_specifier,
                 "grid": results,
@@ -396,7 +419,7 @@ if __name__ == "__main__":
         "--block_size",
         "-bs",
         type=int,
-        default=2048,
+        default=512,
         help="must match the block size of run_baseline.py and run_extrapolation.py",
     )
     parser.add_argument(
@@ -457,6 +480,14 @@ if __name__ == "__main__":
         type=str,
         default="0.95,0.9,0.85,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1",
         help="comma separated candidate top-p values",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        "-q4",
+        action="store_true",
+        help="quantize the models. Has to match the flag calculate_perplexity.py was run with, "
+        "otherwise p_1 is fitted against a different statistic than the histograms are plotted "
+        "with",
     )
     parser.add_argument(
         "--path",

@@ -2,7 +2,21 @@
 
 # -*- coding: utf-8 -*-
 # !/usr/bin/env python3
-from unsloth import FastLanguageModel
+# the GPU list is resolved once, here, rather than read from the environment at the point of use:
+# older unsloth releases rewrote CUDA_VISIBLE_DEVICES to a single device at import time, which
+# collapsed the shard fan out to GPU 0. Capturing it above the unsloth import makes that
+# version-independent. utils.devices is deliberately torch free so this does not beat unsloth to
+# torch
+from utils.devices import visible_devices
+
+VISIBLE_DEVICES = visible_devices()
+
+# kept above the stdlib imports even though the symbol is now unused: unsloth patches
+# transformers/trl at import time and has to get there before them. This orchestrator no longer
+# loads a model itself (build_scaled_adapter goes through peft, the generation and perplexity
+# stages are subprocesses), but the import order rule is cheap to honour and expensive to
+# rediscover
+from unsloth import FastLanguageModel  # noqa: F401  pylint: disable=unused-import
 
 import os
 import json
@@ -21,11 +35,12 @@ import torch
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import seaborn as sns
-from tqdm import tqdm
+from transformers import AutoTokenizer
 from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
 from utils.plotting import visible_perplexity_range
+from utils.utils import report_block_size
 from utils.extrapolation import (
     METHODS,
     METHOD_LABELS,
@@ -89,7 +104,7 @@ def main(
     perplexity_batch_size: int = 16,
     skip_training: bool = False,
     num_generations: int = 5,
-    block_size: int = 64,
+    block_size: int = 512,
     histogram_only: bool = False,
     path: str = "",
     model_specifier: str = "",
@@ -97,6 +112,11 @@ def main(
     method: str = "logit",
     surrogate_top_p: float = 0.0,
     dataset_size: int = 10000,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
+    load_in_4bit: bool = False,
+    perplexity_load_in_4bit: bool = False,
 ) -> None:
     """
     Main function to start the pitfall 1 fine-tuning
@@ -109,7 +129,8 @@ def main(
         perplexity_batch_size (int): batch size for the perplexity calculation
         skip_training (bool): if True, skip the training and only evaluate the models
         num_generations (int): number of generations to run (default: 5)
-        block_size (int): size of the blocks to split the dataset into (default: 64)
+        block_size (int): training sequence length and generation length cap. Also part of every
+            artifact name, so it has to match run_baseline.py (default: 512)
         histogram_only (bool): if True, only generate the histogram and skip the rest
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
@@ -120,6 +141,17 @@ def main(
             utils/extrapolation.py ("logit", "lora" or "data")
         surrogate_top_p (float): p_1 of the data-space surrogate. 0.0 reads it from the
             calibration that calibrate_surrogate.py wrote
+        temperature (float): sampling temperature of the generation. Has to match
+            run_baseline.py, otherwise the extrapolated histograms are compared against a
+            baseline that was sampled differently
+        top_p (float): nucleus sampling cutoff of the generation, same constraint. The "data"
+            method replaces this with its own per generation schedule, which is the whole point
+            of that method
+        top_k (int): top-k sampling cutoff of the generation, -1 disables it. Same constraint
+        load_in_4bit (bool): quantize the generating models. Off by default so that the
+            approximations run at the same precision as the baseline they are compared against
+        perplexity_load_in_4bit (bool): quantize the model that scores the perplexity. Has to
+            match run_baseline.py, since both stages' histograms are plotted against each other
 
     Returns:
         None
@@ -167,13 +199,16 @@ def main(
         MODEL_SPECIFIER = model_specifier
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
-    # load the tokenizer to count to tokens of the dataset
-    _, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_SPECIFIER,
-        max_seq_length=4096,
-        dtype=None,
-        load_in_4bit=True,
-    )
+    # allow tf32 for the fp32 fallback matmuls. The L40S runs tf32 at a multiple of the fp32 rate
+    # and the bf16 path is unaffected
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # load the tokenizer to count the tokens of the dataset. AutoTokenizer instead of
+    # FastLanguageModel.from_pretrained, which would load a whole quantized model just to hand
+    # back its tokenizer — and would keep that model resident on GPU 0 for the entire run,
+    # because binding it to `_` does not free it
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
     global EOS_TOKEN
     global TOKENIZER
     EOS_TOKEN = tokenizer.eos_token
@@ -191,23 +226,25 @@ def main(
     if 0 < dataset_size < len(original_dataset):
         original_dataset = original_dataset.select(range(dataset_size))
 
-    # gather information about the dataset
-    token_counts = []
-    for data in tqdm(original_dataset, desc="Calculating token counts"):
-        inputs = tokenizer(
-            data["response"],
-            padding=True,
+    # gather information about the dataset. One batched call into the Rust tokenizer instead of
+    # one python level call per sample — the previous loop also built a padded pytorch tensor per
+    # sample only to read its length back off the shape
+    print("Calculating token counts")
+    token_counts = [
+        len(ids)
+        for ids in tokenizer(
+            list(original_dataset["response"]),
             truncation=True,
-            return_tensors="pt",
-        )
-        # count the tokens
-        token_count = inputs["input_ids"].shape[1]
-        token_counts.append(token_count)
+            max_length=tokenizer.model_max_length,
+        )["input_ids"]
+    ]
 
-    # set the block size
+    # set the block size. The requested value wins — see utils.utils.report_block_size for why it
+    # is no longer silently raised to the longest response. run_baseline.py resolves it the same
+    # way through the same helper, which is what keeps the two stages' artifact names lined up
     global MAX_TOKEN_LENGTH
     MAX_TOKEN_LENGTH = max(token_counts)
-    block_size = max(block_size, MAX_TOKEN_LENGTH)
+    block_size = report_block_size(block_size, token_counts)
 
     # have a nice system status print
     print(
@@ -270,6 +307,12 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Number of Generations{TColors.ENDC}: {num_generations}"
     )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Block size{TColors.ENDC}: {block_size}")
+    # printed because unsloth silently rewrites CUDA_VISIBLE_DEVICES to a single device at import,
+    # which used to collapse this list to [0] without any sign of it in the output
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Sharding generation/perplexity across{TColors.ENDC}: "
+        f"{len(VISIBLE_DEVICES)} GPU(s) {VISIBLE_DEVICES}"
+    )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Training Steps{TColors.ENDC}: {training_epochs}"
     )
@@ -308,7 +351,7 @@ def main(
         if not os.path.isfile(calibration_path):
             raise FileNotFoundError(
                 f"the 'data' method needs a calibrated p_1, but {calibration_path} does not "
-                "exist. Run 'python calibrate_surrogate.py --block_size "
+                "exist. Run 'python -m utils.calibrate_surrogate --block_size "
                 f"{block_size} --model_specifier {MODEL_SPECIFIER}' first, or pass "
                 "--surrogate_top_p explicitly to skip the calibration"
             )
@@ -332,6 +375,12 @@ def main(
         )
     print("#" * shutil.get_terminal_size().columns + "\n")
 
+    # resolve the GPUs to shard the work across, once for both the generation and the perplexity
+    # stage
+    # resolved from VISIBLE_DEVICES, captured at module scope — see utils.devices for why the
+    # environment is not read at the point of use
+    devices = VISIBLE_DEVICES if str(device).startswith("cuda") else [0]
+
     if not skip_training:
         # print information about the dataset
         print(f"Max token count: {max(token_counts)}")
@@ -346,6 +395,22 @@ def main(
         chunked_dataset.save_to_disk(
             DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}{suffix}"
         )
+
+        # the generation workers only ever read the *instructions*, which are the same for every
+        # generation, so the shards are written once here instead of being rewritten inside the
+        # generation loop. contiguous=True, because datasets defaults to strided sharding
+        # (indices index, index + n, index + 2n, ...) and the shards are merged back in shard
+        # order afterwards. Strided shards would therefore reorder the merged dataset as a
+        # function of the *number of GPUs*, which would make a 4-GPU run's histogram describe a
+        # differently ordered dataset than a 1-GPU run's. Contiguous shards reassemble into the
+        # original order for any device count
+        for shard_id in range(len(devices)):
+            original_dataset.shard(
+                num_shards=len(devices), index=shard_id, contiguous=True
+            ).save_to_disk(
+                DATASET_PATH
+                + f"base_subdataset_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
+            )
 
         for gen_id in range(num_generations):
             # check if generations need to be skipped if continue_from_generation > 0
@@ -373,41 +438,17 @@ def main(
                 )
 
             # ────────────────────────────── generate the new datasets ────────────────────────────
-            # first, split the previous dataset into X subdatasets for each GPU
-            # the generation processes are then called in parallel to be split onto the different
-            # GPUs then the subdatasets are merged again to form the final single dataset
-            if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
-                devices = list(
-                    map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(","))
-                )
-            else:
-                if str(device).startswith("cuda"):
-                    devices = list(range(torch.cuda.device_count()))
-                else:
-                    devices = [0]
+            # one worker per GPU, each generating the responses for its shard of the instruction
+            # set. The shards were written once above; the workers only read them
             process_list = []
-            for d_id, shard_id in zip(devices, range(len(devices))):
-                # split the dataset into subsets per device and save to disk.
-                # contiguous=True, because datasets defaults to strided sharding
-                # (indices index, index + n, index + 2n, ...) and the shards are merged back in
-                # shard order afterwards. Strided shards would therefore reorder the merged
-                # dataset as a function of the *number of GPUs*: the rows are the same, but
-                # make_splits() takes the 90/10 train/val split by position, so a 4-GPU run
-                # would train on a different subset than a 1-GPU run. Contiguous shards
-                # reassemble into the original order for any device count
-                temp_subdataset = original_dataset.shard(
-                    num_shards=len(devices), index=shard_id, contiguous=True
-                )
-                temp_subdataset.save_to_disk(
-                    DATASET_PATH
-                    + f"base_subdataset_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
-                )
+            for shard_id, d_id in enumerate(devices):
                 process = subprocess.Popen(
                     [
                         "env",
                         f"CUDA_VISIBLE_DEVICES={d_id}",
                         "python",
-                        "generate_dataset_extrapolation.py",
+                        "-m",
+                        "utils.generate_dataset_extrapolation",
                         "--block_size",
                         str(block_size),
                         "--specifier_name",
@@ -424,18 +465,37 @@ def main(
                         adapter_path,
                         "--surrogate_top_p",
                         str(surrogate_p1),
+                        "--temperature",
+                        str(temperature),
+                        "--top_p",
+                        str(top_p),
+                        "--top_k",
+                        str(top_k),
                         "--path",
                         str(path),
-                    ],
+                    ]
+                    + (["--load_in_4bit"] if load_in_4bit else []),
                 )
                 process_list.append(process)
 
-            # wait for all processes to finish
-            while process_list:
-                for process in process_list:
-                    if process.poll() is not None:
-                        process_list.remove(process)
-                time.sleep(10)
+            # wait for all processes to finish. wait() instead of polling in a loop: the old loop
+            # mutated the list it was iterating over, which skips entries, and it tolerated a
+            # crashed worker silently — the failure then only surfaced as a missing shard in the
+            # concatenate below
+            for process in process_list:
+                process.wait()
+
+            failed_shards = [
+                shard
+                for shard, process in enumerate(process_list)
+                if process.returncode != 0
+            ]
+            if failed_shards:
+                raise RuntimeError(
+                    f"the dataset generation failed for shard(s) {failed_shards} of generation "
+                    f"{gen_id} (method {method}). See the subprocess output above for the actual "
+                    "error"
+                )
 
             # merge all the subdatasets to one single dataset again
             merged_dataset = concatenate_datasets(
@@ -464,15 +524,10 @@ def main(
 
         # the datasets are split into one shard per GPU and every shard is processed by its
         # own subprocess. Each subprocess handles all generations of its shard, so the model
-        # only has to be loaded once per GPU. Afterwards the per-shard results are merged
-        if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
-            devices = list(map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(",")))
-        else:
-            if str(device).startswith("cuda"):
-                devices = list(range(torch.cuda.device_count()))
-            else:
-                devices = [0]
-
+        # only has to be loaded once per GPU. Afterwards the per-shard results are merged.
+        # `devices` was resolved once above from VISIBLE_DEVICES, which is captured before the
+        # unsloth import — re-deriving it from the environment here would see the single-device
+        # rewrite and run every shard on GPU 0
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Using {len(devices)} GPU(s) for the "
             f"perplexity calculation{TColors.ENDC}"
@@ -495,7 +550,8 @@ def main(
                     "env",
                     f"CUDA_VISIBLE_DEVICES={d_id}",
                     "python",
-                    "calculate_perplexity.py",
+                    "-m",
+                    "utils.calculate_perplexity",
                     "--block_size",
                     str(block_size),
                     "--specifier_name",
@@ -514,7 +570,8 @@ def main(
                     suffix,
                     "--path",
                     str(path),
-                ],
+                ]
+                + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
             )
             process_list.append(process)
 
@@ -761,7 +818,7 @@ if __name__ == "__main__":
         "--block_size",
         "-bs",
         type=int,
-        default=2048,
+        default=512,
         help="will be replaced with maximum length of input tokens from the dataset if too small",
     )
     parser.add_argument(
@@ -816,6 +873,46 @@ if __name__ == "__main__":
         help="number of dataset samples to use, taken as a contiguous slice from the front of "
         "the upstream 50k dataset. run_baseline.py and run_extrapolation.py must be given the "
         "same value, otherwise their histograms describe different data (default: 10000)",
+    )
+    parser.add_argument(
+        "--temperature",
+        "-tp",
+        type=float,
+        default=0.7,
+        help="sampling temperature of the generation. Has to match run_baseline.py, otherwise "
+        "the extrapolated histograms are compared against a differently sampled baseline "
+        "(default: 0.7, Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--top_p",
+        "-tpp",
+        type=float,
+        default=0.8,
+        help="nucleus sampling cutoff of the generation, same constraint as --temperature. The "
+        "'data' method replaces this with its own per generation schedule (default: 0.8)",
+    )
+    parser.add_argument(
+        "--top_k",
+        "-tpk",
+        type=int,
+        default=20,
+        help="top-k sampling cutoff of the generation, -1 disables it. Same constraint as "
+        "--temperature (default: 20)",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        "-q4",
+        action="store_true",
+        help="quantize the generating models. Off by default so the approximations run at the "
+        "same precision as the baseline they are compared against",
+    )
+    parser.add_argument(
+        "--perplexity_load_in_4bit",
+        "-pq4",
+        action="store_true",
+        help="quantize the model that scores the perplexity. Has to match the flag "
+        "run_baseline.py was run with, since both stages' histograms are plotted against each "
+        "other",
     )
     parser.add_argument(
         "--path",

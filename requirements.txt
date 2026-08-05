@@ -13,7 +13,10 @@ sympy==1.14.0
 scipy==1.16.2
 peft==0.20.0
 unsloth_zoo==2026.8.3
-# the dataset generation engine. Optional: generate_dataset.py falls back to the unsloth
+# run_extrapolation.py timestamps its banner with pytz.timezone("Europe/Berlin"); it was imported
+# without ever being declared here
+pytz==2025.2
+# the dataset generation engine. Optional: utils/generate_dataset.py falls back to the unsloth
 # generate() path when vLLM is missing (--engine transformers). Install it into its own
 # environment if it wants to move the pinned torch/transformers versions, the generation workers
 # are separate subprocesses and do not share an interpreter with the unsloth stack

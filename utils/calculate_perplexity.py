@@ -1,6 +1,13 @@
 """
-Helper script to calculate the perplexity of the datasets in parallel. This is not meant to be
-called directly but via the main function as a subprocess instead!
+Helper module to calculate the perplexity of the datasets in parallel. This is not meant to be
+called directly but via the main function as a subprocess instead:
+
+    python -m utils.calculate_perplexity --shard_id 0 ...
+
+These are modules, not scripts: they are launched as `python -m utils.<name>` from the repo
+root, because they import sibling helpers with `from utils.X import Y` and running the file
+directly (`python utils/<name>.py`) puts utils/ on sys.path instead of the root, so `utils` is
+then not a package at all.
 
 Every process handles one shard of the datasets on a single GPU and computes the perplexity for
 all generations, so the model only has to be loaded once per GPU. The resulting per-shard
@@ -15,6 +22,7 @@ Args:
     shard_id (int): The current shard id.
     num_shards (int): The total number of shards (i.e., the number of used GPUs).
     dataset_suffix (str): Suffix of the dataset file names ("_ex" for the extrapolation runs).
+    load_in_4bit (bool): Quantize the scoring model. Off by default, see the model load below.
     path (str): The path where the datasets and models are stored.
 
 Returns:
@@ -26,7 +34,6 @@ import os
 import argparse
 
 from datasets import Dataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 
@@ -46,7 +53,7 @@ parser.add_argument(
     "--block_size",
     "-b",
     type=int,
-    default=2048,
+    default=512,
     help="specifies the block size to use for the perplexity calculation",
 )
 parser.add_argument(
@@ -101,6 +108,14 @@ parser.add_argument(
     help="suffix of the dataset file names ('_ex' for the extrapolation runs)",
 )
 parser.add_argument(
+    "--load_in_4bit",
+    "-q4",
+    action="store_true",
+    help="quantize the model that scores the perplexity. This puts quantization noise into the "
+    "very statistic that is plotted and makes every forward pass dequantize its weights, so it "
+    "is off by default",
+)
+parser.add_argument(
     "--path",
     "-p",
     type=str,
@@ -119,6 +134,7 @@ num_generations = args.num_generations
 shard_id = args.shard_id
 num_shards = args.num_shards
 dataset_suffix = args.dataset_suffix
+load_in_4bit = args.load_in_4bit
 path = args.path
 
 # set data paths
@@ -134,12 +150,14 @@ print(
     f"{TColors.ENDC}"
 )
 
-# load the model once for all generations
+# load the model once for all generations. Unquantized by default: the plotted statistic is a
+# property of *this* model, so quantizing it puts quantization noise straight into the histogram,
+# and it makes every forward pass dequantize its weights on the way
 perpl_model, perpl_tokenizer = FastLanguageModel.from_pretrained(
     model_name=model_specifier,
     max_seq_length=int(block_size * 2),
     dtype=None,
-    load_in_4bit=True,
+    load_in_4bit=load_in_4bit,
 )
 FastLanguageModel.for_inference(perpl_model)
 
@@ -195,40 +213,51 @@ for i in range(num_generations):
         num_shards=num_shards, index=shard_id, contiguous=True
     )
 
-    ppl_dataloader = DataLoader(
-        ppl_dataset.with_format("torch"),
-        batch_size=perplexity_batch_size,
-    )
+    formatted_prompts = [
+        perpl_tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant for code completion.",
+                },
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": response},
+            ],
+            tokenize=False,
+            add_special_tokens=False,
+        )
+        for instruction, response in zip(
+            ppl_dataset["instruction"], ppl_dataset["response"]
+        )
+    ]
 
-    # add new entry to the dict
-    perplexity_dict[f"Generation {i}"] = []
+    # the batch is padded to its longest sample, so batching in dataset order makes every short
+    # sample in a batch cost as much as the longest one — and the generated datasets mix 128 token
+    # and block_size token responses. Processing in length order instead puts samples of similar
+    # length together, which is the same arithmetic on far fewer padding tokens. The results are
+    # written back through the permutation, so the output order is still the dataset order
+    token_lengths = [
+        len(ids)
+        for ids in perpl_tokenizer(formatted_prompts, add_special_tokens=False)[
+            "input_ids"
+        ]
+    ]
+    order = sorted(range(len(formatted_prompts)), key=lambda index: token_lengths[index])
 
-    # calculate the perplexity for every datapoint in the dataset (eval)
-    for data_batch in tqdm(
-        ppl_dataloader,
+    shard_perplexities = [None] * len(formatted_prompts)
+    for start in tqdm(
+        range(0, len(order), perplexity_batch_size),
+        total=(len(order) + perplexity_batch_size - 1) // perplexity_batch_size,
         desc=f"Calculating perplexity for Generation {i} (shard {shard_id})",
     ):
-        formatted_prompts = [
-            perpl_tokenizer.apply_chat_template(
-                [
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant for code completion.",
-                    },
-                    {"role": "user", "content": instruction},
-                    {"role": "assistant", "content": response},
-                ],
-                tokenize=False,
-                add_special_tokens=False,
-            )
-            for instruction, response in zip(
-                data_batch["instruction"], data_batch["response"]
-            )
-        ]
-
-        perplexity_dict[f"Generation {i}"].extend(
-            batch_perplexities(formatted_prompts)
+        batch_indices = order[start : start + perplexity_batch_size]
+        batch_perplexity = batch_perplexities(
+            [formatted_prompts[index] for index in batch_indices]
         )
+        for index, perplexity in zip(batch_indices, batch_perplexity):
+            shard_perplexities[index] = perplexity
+
+    perplexity_dict[f"Generation {i}"] = shard_perplexities
 
     # report the peak memory of this generation so that a growing memory usage is visible
     # instead of only showing up as an out of memory error in a later generation
@@ -240,7 +269,7 @@ for i in range(num_generations):
 
     # the next generation uses a different dataset with different sequence lengths, so the
     # cached blocks of this generation would only fragment the allocator
-    del ppl_dataloader, ppl_dataset
+    del formatted_prompts, ppl_dataset
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 

@@ -1,6 +1,13 @@
 """
-Helper script to generate datasets in parallel. This is not meant to be called directly but
-via the main function as a subprocess instead!
+Helper module to generate datasets in parallel. This is not meant to be called directly but
+via the main function as a subprocess instead:
+
+    python -m utils.generate_dataset_extrapolation --generation 3 ...
+
+These are modules, not scripts: they are launched as `python -m utils.<name>` from the repo
+root, because they import sibling helpers with `from utils.X import Y` and running the file
+directly (`python utils/<name>.py`) puts utils/ on sys.path instead of the root, so `utils` is
+then not a package at all.
 
 Supports the three approximation methods of run_extrapolation.py, see utils/extrapolation.py
 for what they are. All of them are indexed by the same factor n = generation + 1, so that
@@ -15,6 +22,10 @@ Args:
     method (str): Which approximation to use ("logit", "lora" or "data").
     adapter_path (str): Path of the alpha scaled LoRA adapter ("lora" method only).
     surrogate_top_p (float): The calibrated p_1 of the data-space surrogate ("data" only).
+    temperature (float): Sampling temperature, pinned rather than inherited.
+    top_p (float): Nucleus cutoff, pinned. The "data" method replaces it with its schedule.
+    top_k (int): Top-k cutoff, pinned. -1 disables it.
+    load_in_4bit (bool): Quantize the generating models. Off by default.
     path (str): The path where the datasets and models are stored.
 
 Returns:
@@ -26,7 +37,6 @@ import os
 import argparse
 
 from datasets import Dataset
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch
 from transformers import (
@@ -146,7 +156,7 @@ parser.add_argument(
     "--block_size",
     "-b",
     type=int,
-    default=2048,
+    default=512,
     help="specifies the block size to use for training",
 )
 parser.add_argument(
@@ -200,6 +210,39 @@ parser.add_argument(
     help="the calibrated p_1 of the data-space surrogate, required by the 'data' method",
 )
 parser.add_argument(
+    "--temperature",
+    "-tp",
+    type=float,
+    default=0.7,
+    help="sampling temperature. Pinned rather than inherited from the model's generation_config, "
+    "so that all three methods and run_baseline.py sample from the same distribution "
+    "(default: 0.7, Qwen2.5's own value)",
+)
+parser.add_argument(
+    "--top_p",
+    "-tpp",
+    type=float,
+    default=0.8,
+    help="nucleus sampling cutoff, pinned for the same reason as --temperature. The 'data' "
+    "method replaces it with its own per generation schedule (default: 0.8)",
+)
+parser.add_argument(
+    "--top_k",
+    "-tpk",
+    type=int,
+    default=20,
+    help="top-k sampling cutoff, pinned for the same reason as --temperature. -1 disables it "
+    "(default: 20, Qwen2.5's own value)",
+)
+parser.add_argument(
+    "--load_in_4bit",
+    "-q4",
+    action="store_true",
+    help="quantize the generating models. A 0.5B model is ~1GB in bf16 on a 48GB card, so this "
+    "only adds a dequantization kernel to every forward pass — and it would make these "
+    "approximations run at a different precision than the baseline they are compared against",
+)
+parser.add_argument(
     "--path",
     "-p",
     type=str,
@@ -218,6 +261,10 @@ shard_id = args.shard_id
 method = args.method
 adapter_path = args.adapter_path
 surrogate_p1 = args.surrogate_top_p
+temperature = args.temperature
+top_p = args.top_p
+top_k = args.top_k
+load_in_4bit = args.load_in_4bit
 path = args.path
 
 suffix = dataset_suffix(method)
@@ -253,7 +300,7 @@ if method == "logit":
         model_name=MODEL_SPECIFIER,
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -261,7 +308,7 @@ if method == "logit":
         model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(model_collapsed)
 
@@ -279,7 +326,7 @@ elif method == "lora":
         model_name=adapter_path,
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -291,7 +338,7 @@ else:
         model_name=MODEL_SPECIFIER,
         max_seq_length=block_size,
         dtype=None,
-        load_in_4bit=True,
+        load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(generation_model)
 
@@ -312,39 +359,40 @@ subdataset = Dataset.load_from_disk(
     DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
 )
 
-generation_data = subdataset.select_columns(["instruction"])
-
-dataset_loader = DataLoader(
-    generation_data.with_format("torch"),
-    batch_size=dataset_batch_size,
-)
-
-new_responses = []
-instructions = []
-for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
-    inputs = []
-
-    for instr in data_batch["instruction"]:
-        prompt = [
+instructions = list(subdataset["instruction"])
+prompts = [
+    tokenizer.apply_chat_template(
+        [
             {
                 "role": "system",
                 "content": "You are a helpful assistant for code completion.",
             },
-            {"role": "user", "content": instr},
-        ]
-        formatted_prompt = tokenizer.apply_chat_template(
-            prompt,
-            tokenize=False,
-            add_special_tokens=False,
-            add_generation_prompt=True,
-        )
-        # collect inputs for the model
-        inputs.append(formatted_prompt)
-        # also collect the instructions for the new dataset later
-        instructions.append(instr)
+            {"role": "user", "content": instruction},
+        ],
+        tokenize=False,
+        add_special_tokens=False,
+        add_generation_prompt=True,
+    )
+    for instruction in instructions
+]
+
+# a batched generate() runs every sequence of the batch until the longest one finishes and pads
+# the rest, so grouping prompts of similar length together keeps that waste down. The responses
+# are written back through the permutation, so the output order is still the dataset order
+prompt_lengths = [
+    len(ids) for ids in tokenizer(prompts, add_special_tokens=False)["input_ids"]
+]
+order = sorted(range(len(prompts)), key=lambda index: prompt_lengths[index])
+
+new_responses = [None] * len(prompts)
+for start in tqdm(
+    range(0, len(order), dataset_batch_size),
+    total=(len(order) + dataset_batch_size - 1) // dataset_batch_size,
+):
+    batch_indices = order[start : start + dataset_batch_size]
 
     inputs = tokenizer(
-        inputs,
+        [prompts[index] for index in batch_indices],
         padding=True,
         truncation=True,
         return_tensors="pt",
@@ -352,16 +400,21 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
 
     # everything that is not the mechanism of the method itself is kept identical across the
     # three methods, so that a difference between their histograms is a difference between the
-    # approximations and not between their decoding setups. temperature and top_k are left to
-    # the model's own generation_config; do_sample, num_beams and repetition_penalty are pinned
-    # below
-    method_kwargs = {}
+    # approximations and not between their decoding setups. do_sample, num_beams,
+    # repetition_penalty, temperature, top_p and top_k are all pinned below — the sampling
+    # parameters go through one dict rather than being passed as keywords, because the "data"
+    # method has to *replace* top_p and passing both would be a duplicate keyword argument
+    sampling_kwargs = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+    }
 
     if method == "logit":
         # the logit extrapolation runs as a custom logits processor during decoding. It is
         # rebuilt per batch because it holds the collapsed model's KV cache and this batch's
         # prompt mask
-        method_kwargs["logits_processor"] = LogitsProcessorList(
+        sampling_kwargs["logits_processor"] = LogitsProcessorList(
             [
                 UnslothExtrapolationProcessor(
                     model_collapsed=model_collapsed,
@@ -371,9 +424,10 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
             ]
         )
     elif method == "data":
-        # the whole method is a statement about the sampling support, so the truncation is
-        # set explicitly rather than inherited
-        method_kwargs["top_p"] = schedule_top_p
+        # the whole method *is* the truncation of the sampling support, so its schedule replaces
+        # the pipeline's top_p instead of composing with it — which also matches
+        # calibrate_surrogate.py, whose grid replaces top_p to fit p_1
+        sampling_kwargs["top_p"] = schedule_top_p
 
     generated_answers = generation_model.generate(
         **inputs,
@@ -397,21 +451,21 @@ for _, data_batch in tqdm(enumerate(dataset_loader), total=len(dataset_loader)):
         min_new_tokens=128,
         max_new_tokens=block_size,
         use_cache=True,
-        **method_kwargs,
+        **sampling_kwargs,
     )
 
     # the prompt is dropped by token count instead of by splitting the decoded string on the chat
     # template markers, since skip_special_tokens removes those markers. The batch is left padded,
     # so the prompt is the same number of tokens in every row
     prompt_length = inputs["input_ids"].shape[1]
-    generated_answers = tokenizer.batch_decode(
+    decoded = tokenizer.batch_decode(
         generated_answers[:, prompt_length:],
         skip_special_tokens=True,
     )
-    for answer in generated_answers:
+    for index, answer in zip(batch_indices, decoded):
         # skip_special_tokens already dropped the trailing <|im_end|> and the padding, so only the
         # surrounding whitespace is left to strip
-        new_responses.append(answer.strip())
+        new_responses[index] = answer.strip()
 
 # save the new dataset to disk
 new_dataset = Dataset.from_dict(

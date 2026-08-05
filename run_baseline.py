@@ -2,28 +2,34 @@
 # -*- coding: utf-8 -*-
 # !/usr/bin/env python3
 
+import argparse
+import datetime
+import getpass
 import os
+import subprocess
 import time
 from datetime import timedelta
 from typing import Final
-import getpass
-import datetime
-import argparse
-import subprocess
-import psutil
 
-from unsloth import FastLanguageModel, is_bfloat16_supported
+import psutil
 import torch
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import seaborn as sns
-from tqdm import tqdm
-from trl import SFTTrainer
-from transformers import TrainingArguments, DataCollatorForLanguageModeling
+from transformers import AutoTokenizer
 from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
+from utils.devices import visible_devices
 from utils.plotting import visible_perplexity_range
+from utils.utils import report_block_size
+
+# this orchestrator deliberately does not import unsloth: every stage that touches a model is a
+# subprocess (utils/train_generation.py under torchrun, utils/generate_dataset.py,
+# utils/calculate_perplexity.py). That is what allows the training to be data parallel at all —
+# unsloth's multi-GPU path goes through torchrun — and it keeps unsloth's import time environment
+# fiddling out of this process
+VISIBLE_DEVICES = visible_devices()
 
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
@@ -80,7 +86,7 @@ def main(
     perplexity_batch_size: int = 16,
     skip_training: bool = False,
     num_generations: int = 5,
-    block_size: int = 64,
+    block_size: int = 512,
     histogram_only: bool = False,
     human_eval_only: bool = False,
     path: str = "",
@@ -90,6 +96,18 @@ def main(
     learning_rate: float = 2e-4,
     lora_rank: int = 16,
     lora_alpha: int = 16,
+    engine: str = "auto",
+    gpu_memory_utilization: float = 0.90,
+    temperature: float = 0.7,
+    top_p: float = 0.8,
+    top_k: int = 20,
+    gradient_accumulation_steps: int = 4,
+    load_in_4bit: bool = False,
+    gradient_checkpointing: bool = False,
+    perplexity_load_in_4bit: bool = False,
+    fresh_init: bool = False,
+    training_gpus: int = 0,
+    master_port: int = 29500,
 ) -> None:
     """
     Main function to start the pitfall 1 fine-tuning
@@ -114,6 +132,28 @@ def main(
         lora_rank (int): LoRA rank r. Together with lora_alpha this bounds how far one
             generation can drift from the last one, i.e. how strong the collapse effect is
         lora_alpha (int): LoRA alpha. The adapter contributes (alpha / r) * B @ A
+        engine (str): inference engine for the dataset generation (auto, vllm, transformers)
+        gpu_memory_utilization (float): fraction of each GPU vLLM may use
+        temperature (float): sampling temperature of the dataset generation
+        top_p (float): nucleus sampling cutoff of the dataset generation
+        top_k (int): top-k sampling cutoff of the dataset generation, -1 disables it
+        gradient_accumulation_steps (int): optimizer step granularity. The effective batch is
+            training_batch_size * this, and that product is what controls the drift per
+            generation — keep it constant when tuning either knob
+        load_in_4bit (bool): quantize the model for training. Only useful for models that do
+            not otherwise fit
+        gradient_checkpointing (bool): recompute activations in the backward pass instead of
+            keeping them. Only useful for models that do not otherwise fit
+        perplexity_load_in_4bit (bool): quantize the model that scores the perplexity. This adds
+            quantization noise to the plotted statistic, so it is off by default
+        fresh_init (bool): re-initialise every generation from the pristine base model instead of
+            continuing to fine-tune the previous generation's adapter. Only the *data* is then
+            recursive, which is the "replace" setting of the model collapse literature. Off by
+            default, i.e. the weights are recursive too — see utils/train_generation.py
+        training_gpus (int): how many of the visible GPUs to train one generation on, as data
+            parallel ranks under torchrun. 0 uses all of them, 1 forces single GPU training
+        master_port (int): torchrun rendezvous port. Only needs changing when two pipelines run
+            on the same machine, which would otherwise collide on it
 
     Returns:
         None
@@ -157,13 +197,23 @@ def main(
         MODEL_SPECIFIER = model_specifier
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
-    # load the tokenizer to count to tokens of the dataset
-    _, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_SPECIFIER,
-        max_seq_length=4096,
-        dtype=None,
-        load_in_4bit=True,
-    )
+    # which weight lineage this run used, carried into the names of everything the run is compared
+    # by. The two modes produce different collapse curves from the same data, so a plot without
+    # this in its name is not attributable to either of them — and plots/ is not under --path, so
+    # two runs would otherwise overwrite each other's figure even with separate output paths
+    init_suffix = "_freshinit" if fresh_init else "_recursive"
+    init_label = "fresh weights" if fresh_init else "recursive weights"
+
+    # allow tf32 for the matmuls of the training stage. The L40S' tensor cores run tf32 at
+    # multiples of the fp32 rate and this only affects the fp32 fallbacks, not the bf16 path
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # load the tokenizer to count the tokens of the dataset. AutoTokenizer instead of
+    # FastLanguageModel.from_pretrained, which would load a whole quantized model just to hand
+    # back its tokenizer — and would keep that model resident on GPU 0 for the entire run,
+    # because binding it to `_` does not free it
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
     global EOS_TOKEN
     global TOKENIZER
     EOS_TOKEN = tokenizer.eos_token
@@ -181,23 +231,36 @@ def main(
     if 0 < dataset_size < len(original_dataset):
         original_dataset = original_dataset.select(range(dataset_size))
 
-    # gather information about the dataset
-    token_counts = []
-    for data in tqdm(original_dataset, desc="Calculating token counts"):
-        inputs = tokenizer(
-            data["response"],
-            padding=True,
+    # gather information about the dataset. One batched call into the Rust tokenizer instead of
+    # one python level call per sample — the previous loop also built a padded pytorch tensor per
+    # sample only to read its length back off the shape
+    print("Calculating token counts")
+    token_counts = [
+        len(ids)
+        for ids in tokenizer(
+            list(original_dataset["response"]),
             truncation=True,
-            return_tensors="pt",
-        )
-        # count the tokens
-        token_count = inputs["input_ids"].shape[1]
-        token_counts.append(token_count)
+            max_length=tokenizer.model_max_length,
+        )["input_ids"]
+    ]
 
-    # set the block size
+    # set the block size. The requested value wins — see utils.utils.report_block_size for why it
+    # is no longer silently raised to the longest response
     global MAX_TOKEN_LENGTH
     MAX_TOKEN_LENGTH = max(token_counts)
-    block_size = MAX_TOKEN_LENGTH if MAX_TOKEN_LENGTH > block_size else block_size
+    block_size = report_block_size(block_size, token_counts)
+
+    # resolve the GPUs once, for the generation and perplexity fan out and for the training ranks.
+    # VISIBLE_DEVICES comes from utils.devices rather than from the environment directly, so that
+    # the list is the one the run was launched with no matter what an imported library did to
+    # CUDA_VISIBLE_DEVICES in the meantime
+    devices = VISIBLE_DEVICES if str(device).startswith("cuda") else [0]
+
+    # the generations are strictly sequential — generation g trains on what model_{g-1} generated —
+    # so the only thing to parallelise in the training stage is a single generation's fine-tuning,
+    # as plain data parallelism over these devices. --training_gpus 1 falls back to single GPU
+    # training, which is the reference to check the data parallel path against
+    training_devices = devices if training_gpus <= 0 else devices[:training_gpus]
 
     # have a nice system status print
     print(
@@ -268,6 +331,22 @@ def main(
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Skip Training{TColors.ENDC}: {skip_training}"
     )
+    # the data recursion is the collapse and is always on; this is the weight lineage
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Weight lineage{TColors.ENDC}: {init_label} "
+        f"({'--fresh_init' if fresh_init else 'previous generation is fine-tuned further'})"
+    )
+    # printed because unsloth silently rewrites CUDA_VISIBLE_DEVICES to a single device at import,
+    # which used to collapse this list to [0] without any sign of it in the output
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Sharding generation/perplexity across{TColors.ENDC}: "
+        f"{len(VISIBLE_DEVICES)} GPU(s) {VISIBLE_DEVICES}"
+    )
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Training one generation on{TColors.ENDC}: "
+        f"{len(training_devices)} GPU(s) {training_devices} (data parallel under torchrun), "
+        f"effective batch {training_batch_size * gradient_accumulation_steps}"
+    )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Model Saving Path{TColors.ENDC}: {MODEL_PATH}"
     )
@@ -294,13 +373,24 @@ def main(
     chunked_dataset.save_to_disk(
         DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}"
     )
-    # the dataloader is later used for the generation of the new dataset
-    # chunked_dataloader = DataLoader(
-    #     chunked_dataset.with_format("torch"),
-    #     batch_size=dataset_batch_size,
-    # )
-
     if not skip_training:
+        # the generation workers only ever read the *instructions*, which are the same for every
+        # generation, so the shards are written once here instead of being rewritten inside the
+        # generation loop. contiguous=True, because datasets defaults to strided sharding
+        # (indices index, index + n, index + 2n, ...) and the shards are merged back in shard
+        # order afterwards. Strided shards would therefore reorder the merged dataset as a
+        # function of the *number of GPUs*: the rows are the same, but make_splits() takes the
+        # 90/10 train/val split by position, so a 4-GPU run would train on a different subset
+        # than a 1-GPU run. Contiguous shards reassemble into the original order for any device
+        # count
+        for shard_id in range(len(devices)):
+            original_dataset.shard(
+                num_shards=len(devices), index=shard_id, contiguous=True
+            ).save_to_disk(
+                DATASET_PATH
+                + f"base_subdataset_bs{block_size}_{specifier_name}_shard{shard_id}"
+            )
+
         # ───────────────────────── start the actual finetuning ──────────────────────────────
         # iterte over two loops: first the model training and then the dataset generation
         # the model is trained for N times and after each training the dataset
@@ -309,51 +399,10 @@ def main(
             # check if generations need to be skipped if continue_from_generation > 0
             if gen_id < continue_from_generation:
                 continue
-            # load the model
-            #
-            # LoRA, not full fine-tuning: unsloth patches Qwen2Attention.forward globally with
-            # its fast kernel, which calls a per-layer `apply_qkv` that only its LoRA path
-            # installs. With full_finetuning=True there is no PEFT wrapper, the attribute is
-            # never set, and the first forward pass raises
-            # "'Qwen2Attention' object has no attribute 'apply_qkv'".
-            #
-            # This does damp the collapse effect — an adapter can only move the model inside a
-            # low dimensional subspace and leaves the embeddings, norms and head untouched — so
-            # the knobs below (rank, alpha, which modules are targeted, the learning rate) are
-            # what controls how far one generation can drift from the last one.
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=MODEL_SPECIFIER
-                if gen_id == 0
-                else f"{MODEL_PATH}model_{gen_id - 1}_bs{block_size}_{specifier_name}",
-                max_seq_length=block_size,
-                dtype=None,
-                load_in_4bit=True,
-            )
-
-            # add LoRA adapters
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=lora_rank,
-                target_modules=[
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                ],
-                lora_alpha=lora_alpha,
-                lora_dropout=0,  # Supports any, but = 0 is optimized
-                bias="none",  # Supports any, but = "none" is optimized
-                use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
-                random_state=1337,
-                # task_type="CAUSAL_LM",
-                use_rslora=False,  # We support rank stabilized LoRA
-                loftq_config=None,  # And LoftQ
-            )
-
-            # load the dataset
+            # ────────────────────────────── train this generation ────────────────────────────
+            # the chat templating and the 90/10 split happen here, once, and the already prepared
+            # splits go to disk for the training workers. Every rank then reads identical bytes
+            # instead of all of them mapping the same dataset into the same datasets cache
             if gen_id > 0:
                 # if the first training iteration is done, load the generated dataset from the disk
                 dataset = Dataset.load_from_disk(
@@ -368,133 +417,76 @@ def main(
             # for the first model the original dataset is used, then the generated dataset
             # is used for the next models
             dataset_train, dataset_val = make_splits(dataset)
-
-            # for some stats
-            gpu_stats = torch.cuda.get_device_properties(0)
-            start_gpu_memory = round(
-                torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3
+            dataset_train.save_to_disk(
+                DATASET_PATH
+                + f"train_dataset_{gen_id}_bs{block_size}_{specifier_name}"
             )
-            max_memory = round(gpu_stats.total_memory / 1024 / 1024 / 1024, 3)
-
-            data_collator = DataCollatorForLanguageModeling(TOKENIZER, mlm=False)
-
-            # create a trainer to train the model
-            trainer = SFTTrainer(
-                model=model,
-                tokenizer=tokenizer,
-                train_dataset=dataset_train,
-                eval_dataset=dataset_val,
-                # formatting_func=format_prompt,
-                dataset_text_field="text",
-                max_seq_length=block_size,
-                dataset_num_proc=8,
-                data_collator=data_collator,
-                packing=True,  # Can make training 5x faster for short sequences.
-                args=TrainingArguments(
-                    gradient_accumulation_steps=4,
-                    warmup_steps=5,
-                    num_train_epochs=training_epochs,
-                    per_device_train_batch_size=training_batch_size,
-                    per_device_eval_batch_size=training_batch_size,
-                    learning_rate=learning_rate,
-                    fp16=not is_bfloat16_supported(),
-                    bf16=is_bfloat16_supported(),
-                    logging_steps=1,
-                    optim="adamw_8bit",
-                    weight_decay=0.01,
-                    lr_scheduler_type="linear",
-                    seed=1337,
-                    output_dir="outputs",
-                    report_to="none",
-                ),
+            dataset_val.save_to_disk(
+                DATASET_PATH + f"val_dataset_{gen_id}_bs{block_size}_{specifier_name}"
             )
 
-            # train the model
-            trainer_stats = trainer.train()
-            # metrics = trainer.evaluate()
-            # print(
-            #     f"## {TColors.OKBLUE}{TColors.BOLD}Loss: {TColors.ENDC}{metrics["eval_loss"]:.4f}"
-            # )
+            # training runs in a torchrun subprocess rather than in this process. Two reasons:
+            # unsloth's own multi-GPU support goes through torchrun, and a subprocess also hands
+            # the whole allocator back at exit instead of leaving a generation's fragmentation
+            # behind for the next one
+            train_command = [
+                "env",
+                f"CUDA_VISIBLE_DEVICES={','.join(map(str, training_devices))}",
+                "torchrun",
+                f"--nproc_per_node={len(training_devices)}",
+                # the default rendezvous port collides when two pipelines run on one machine
+                f"--master_port={master_port}",
+                "-m",
+                "utils.train_generation",
+                "--block_size",
+                str(block_size),
+                "--specifier_name",
+                specifier_name,
+                "--model_specifier",
+                MODEL_SPECIFIER,
+                "--generation",
+                str(gen_id),
+                "--training_epochs",
+                str(training_epochs),
+                "--training_batch_size",
+                str(training_batch_size),
+                "--gradient_accumulation_steps",
+                str(gradient_accumulation_steps),
+                "--learning_rate",
+                str(learning_rate),
+                "--lora_rank",
+                str(lora_rank),
+                "--lora_alpha",
+                str(lora_alpha),
+                "--path",
+                str(path),
+            ]
+            if load_in_4bit:
+                train_command.append("--load_in_4bit")
+            if gradient_checkpointing:
+                train_command.append("--gradient_checkpointing")
+            if fresh_init:
+                train_command.append("--fresh_init")
 
-            # print some fancy stats
-            used_memory = round(
-                torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024, 3
-            )
-            used_memory_for_training = round(used_memory - start_gpu_memory, 3)
-            used_percentage = round(used_memory / max_memory * 100, 3)
-            training_percentage = round(used_memory_for_training / max_memory * 100, 3)
-            print(
-                f"{trainer_stats.metrics['train_runtime']} seconds used for training."
-            )
-            print(
-                f"{round(trainer_stats.metrics['train_runtime'] / 60, 2)} min. used for training."
-            )
-            print(f"Peak reserved memory = {used_memory} GB.")
-            print(f"Peak reserved memory for training = {used_memory_for_training} GB.")
-            print(f"Peak reserved memory % of max memory = {used_percentage} %.")
-            print(
-                f"Peak reserved memory for training % of max memory = {training_percentage} %."
-            )
-
-            # save the model
-            trainer.model.save_pretrained(
-                f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}",
-                safe_serialization=True,
-                save_adapter=True,
-                save_config=True,
-            )
-            trainer.tokenizer.save_pretrained(
-                f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}"
-            )
-            # also save the model in fp16 for testing
-            trainer.model.save_pretrained_merged(
-                f"{MODEL_PATH}model_{gen_id}_bs{block_size}_{specifier_name}_fp16",
-                trainer.tokenizer,
-                save_method="merged_16bit",
-            )
-
-            del trainer
-            del model
-            del tokenizer
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+            training = subprocess.run(train_command, check=False)
+            if training.returncode != 0:
+                raise RuntimeError(
+                    f"the training of generation {gen_id} failed with exit code "
+                    f"{training.returncode}. See the subprocess output above for the actual error"
+                )
 
             # ────────────────────────────── generate the new datasets ────────────────────────────
-            # first, split the previous dataset into X subdatasets for each GPU
-            # the generation processes are then called in parallel to be split onto the different
-            # GPUs then the subdatasets are merged again to form the final single dataset
-            if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
-                devices = list(
-                    map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(","))
-                )
-            else:
-                if str(device).startswith("cuda"):
-                    devices = list(range(torch.cuda.device_count()))
-                else:
-                    devices = [0]
+            # one worker per GPU, each generating the responses for its shard of the instruction
+            # set. The shards were written once above; the workers only read them
             process_list = []
-            for d_id, shard_id in zip(devices, range(len(devices))):
-                # split the dataset into subsets per device and save to disk.
-                # contiguous=True, because datasets defaults to strided sharding
-                # (indices index, index + n, index + 2n, ...) and the shards are merged back in
-                # shard order afterwards. Strided shards would therefore reorder the merged
-                # dataset as a function of the *number of GPUs*: the rows are the same, but
-                # make_splits() takes the 90/10 train/val split by position, so a 4-GPU run
-                # would train on a different subset than a 1-GPU run. Contiguous shards
-                # reassemble into the original order for any device count
-                temp_subdataset = original_dataset.shard(
-                    num_shards=len(devices), index=shard_id, contiguous=True
-                )
-                temp_subdataset.save_to_disk(
-                    DATASET_PATH
-                    + f"base_subdataset_bs{block_size}_{specifier_name}_shard{shard_id}"
-                )
+            for shard_id, d_id in enumerate(devices):
                 process = subprocess.Popen(
                     [
                         "env",
                         f"CUDA_VISIBLE_DEVICES={d_id}",
                         "python",
-                        "generate_dataset.py",
+                        "-m",
+                        "utils.generate_dataset",
                         "--block_size",
                         str(block_size),
                         "--specifier_name",
@@ -505,18 +497,39 @@ def main(
                         str(gen_id),
                         "--shard_id",
                         str(shard_id),
+                        "--engine",
+                        engine,
+                        "--gpu_memory_utilization",
+                        str(gpu_memory_utilization),
+                        "--temperature",
+                        str(temperature),
+                        "--top_p",
+                        str(top_p),
+                        "--top_k",
+                        str(top_k),
                         "--path",
                         str(path),
                     ],
                 )
                 process_list.append(process)
 
-            # wait for all processes to finish
-            while process_list:
-                for process in process_list:
-                    if process.poll() is not None:
-                        process_list.remove(process)
-                time.sleep(10)
+            # wait for all processes to finish. wait() instead of polling in a loop: the old loop
+            # mutated the list it was iterating over, which skips entries, and it tolerated a
+            # crashed worker silently — the failure then only surfaced as a missing shard in the
+            # concatenate below
+            for process in process_list:
+                process.wait()
+
+            failed_shards = [
+                shard
+                for shard, process in enumerate(process_list)
+                if process.returncode != 0
+            ]
+            if failed_shards:
+                raise RuntimeError(
+                    f"the dataset generation failed for shard(s) {failed_shards} of generation "
+                    f"{gen_id}. See the subprocess output above for the actual error"
+                )
 
             # merge all the subdatasets to one single dataset again
             merged_dataset = concatenate_datasets(
@@ -549,16 +562,6 @@ def main(
             # its own subprocess. Each subprocess handles all generations of its shard, so
             # the model only has to be loaded once per GPU. Afterwards the per-shard results
             # are merged
-            if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
-                devices = list(
-                    map(int, os.environ.get("CUDA_VISIBLE_DEVICES").split(","))
-                )
-            else:
-                if str(device).startswith("cuda"):
-                    devices = list(range(torch.cuda.device_count()))
-                else:
-                    devices = [0]
-
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}Using {len(devices)} GPU(s) for the "
                 f"perplexity calculation{TColors.ENDC}"
@@ -581,7 +584,8 @@ def main(
                         "env",
                         f"CUDA_VISIBLE_DEVICES={d_id}",
                         "python",
-                        "calculate_perplexity.py",
+                        "-m",
+                        "utils.calculate_perplexity",
                         "--block_size",
                         str(block_size),
                         "--specifier_name",
@@ -598,7 +602,8 @@ def main(
                         str(len(devices)),
                         "--path",
                         str(path),
-                    ],
+                    ]
+                    + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
                 )
                 process_list.append(process)
 
@@ -640,33 +645,48 @@ def main(
                 for perplexity in values
             ]
 
-            # save the perplexity dict to a file
+            # save the perplexity dict to a file. The init_suffix keeps the two weight lineages
+            # from overwriting each other's cache, so both can be replotted with -ho and the -ho
+            # of one mode can never silently replot the other mode's numbers
             torch.save(
                 perplexity_dict,
-                DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}.pt",
+                DATASET_PATH
+                + f"perplexity_dict_bs{block_size}_{specifier_name}{init_suffix}.pt",
             )  # save the dict to a file
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
                 f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}"
-                f".pt{TColors.ENDC}"
+                f"{init_suffix}.pt{TColors.ENDC}"
             )
             # save the all_perplexities list to a file
             torch.save(
                 all_perplexities,
-                DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}.pt",
+                DATASET_PATH
+                + f"all_perplexities_bs{block_size}_{specifier_name}{init_suffix}.pt",
             )  # save the list to a file
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
                 f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}"
-                f".pt{TColors.ENDC}"
+                f"{init_suffix}.pt{TColors.ENDC}"
             )
         else:
-            # load the perplexity dict and all_perplexities list from the files
-            perplexity_dict = torch.load(
-                DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}.pt"
+            # load the perplexity dict and all_perplexities list from the files. -ho therefore
+            # needs the same --fresh_init the run was produced with, and says so rather than
+            # replotting whichever mode happens to be cached
+            cached_dict = (
+                DATASET_PATH
+                + f"perplexity_dict_bs{block_size}_{specifier_name}{init_suffix}.pt"
             )
+            if not os.path.exists(cached_dict):
+                raise FileNotFoundError(
+                    f"{cached_dict} does not exist. --histogram_only replots the cache of a run "
+                    f"with the same --block_size, --model_specifier and --fresh_init ("
+                    f"{'set' if fresh_init else 'not set'} here)"
+                )
+            perplexity_dict = torch.load(cached_dict)
             all_perplexities = torch.load(
-                DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}.pt"
+                DATASET_PATH
+                + f"all_perplexities_bs{block_size}_{specifier_name}{init_suffix}.pt"
             )
 
         # ────────────────── plot the perplexity histogram ─────────────────────────
@@ -750,7 +770,13 @@ def main(
 
         plt.xlabel("Perplexity", fontweight="bold")
         plt.ylabel("Probability", fontweight="bold")
-        plt.title("Perplexity without extrapolation", fontweight="bold")
+        # the weight lineage goes in the title, because the two modes produce different collapse
+        # curves from the same data and a figure that does not say which one it is cannot be
+        # compared against the other. No underscores or backslashes in here — usetex is on, so the
+        # title is rendered by LaTeX
+        plt.title(
+            f"Perplexity without extrapolation ({init_label})", fontweight="bold"
+        )
         plt.legend(loc="upper right")
 
         for spine in plt.gca().spines.values():
@@ -762,14 +788,19 @@ def main(
         if not os.path.exists("plots/"):
             os.makedirs("plots/")
 
-        plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}.pdf")
-        plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}.png")
+        # plots/ deliberately sits outside --path, so the file name is the only thing separating
+        # two runs' figures. Without the init_suffix a fresh-init run silently overwrites the
+        # recursive run's figure even when the two used different --path directories
+        plot_stem = (
+            f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{init_suffix}"
+        )
+        plt.savefig(f"{plot_stem}.pdf")
+        plt.savefig(f"{plot_stem}.png")
         plt.show()
 
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
-            f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}"
-            f".<png,pdf>{TColors.ENDC}"
+            f"{TColors.HEADER}{plot_stem}.<png,pdf>{TColors.ENDC}"
         )
 
     # ────────────────── print the elapsed time ─────────────────────────
@@ -848,7 +879,7 @@ if __name__ == "__main__":
         "--block_size",
         "-bs",
         type=int,
-        default=2048,
+        default=512,
         help="will be replaced with maximum length of input tokens from the dataset if too small",
     )
     parser.add_argument(
@@ -909,6 +940,111 @@ if __name__ == "__main__":
         default=16,
         help="LoRA alpha. The adapter contributes (alpha / r) * B @ A, so raising alpha "
         "relative to the rank scales up the per-generation delta (default: 16)",
+    )
+    parser.add_argument(
+        "--engine",
+        "-e",
+        type=str,
+        default="auto",
+        choices=["auto", "vllm", "transformers"],
+        help="inference engine for the dataset generation. vLLM is roughly an order of magnitude "
+        "faster than the transformers path, because a batched generate() runs every sequence of "
+        "a batch until the longest one finishes while vLLM retires a sequence as soon as it is "
+        "done. 'auto' uses vLLM if it is installed (default: auto)",
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        "-gmu",
+        type=float,
+        default=0.90,
+        help="fraction of each GPU vLLM may use. Everything not taken by the weights becomes KV "
+        "cache, i.e. concurrent sequences (default: 0.90)",
+    )
+    parser.add_argument(
+        "--temperature",
+        "-tp",
+        type=float,
+        default=0.7,
+        help="sampling temperature of the dataset generation. Pinned rather than inherited from "
+        "the model's generation_config so that both engines sample from the same distribution "
+        "(default: 0.7, Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--top_p",
+        "-tpp",
+        type=float,
+        default=0.8,
+        help="nucleus sampling cutoff of the dataset generation. NOTE that a cutoff below 1.0 "
+        "truncates the model's own distribution, which is itself a collapse mechanism — it is "
+        "what the data-space surrogate models. Use 1.0 with --top_k -1 for untruncated ancestral "
+        "sampling (default: 0.8, Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--top_k",
+        "-tpk",
+        type=int,
+        default=20,
+        help="top-k sampling cutoff of the dataset generation, -1 disables it (default: 20, "
+        "Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        "-gas",
+        type=int,
+        default=4,
+        help="optimizer step granularity. The effective batch is --training_batch_size times "
+        "this, and that product controls how far a generation drifts — raising -tbs while "
+        "lowering this proportionally is faster at identical semantics (default: 4)",
+    )
+    parser.add_argument(
+        "--load_in_4bit",
+        "-q4",
+        action="store_true",
+        help="quantize the model for training. A 0.5B model is ~1GB in bf16 on a 48GB card, so "
+        "this only adds a dequantization kernel to every forward and backward pass. Only set it "
+        "for a --model_specifier that does not otherwise fit",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        "-gc",
+        action="store_true",
+        help="recompute activations during the backward pass instead of keeping them. Trades a "
+        "second forward pass for memory there is no shortage of at this model size",
+    )
+    parser.add_argument(
+        "--perplexity_load_in_4bit",
+        "-pq4",
+        action="store_true",
+        help="quantize the model that scores the perplexity. This puts quantization noise into "
+        "the very statistic that is plotted, so it is off by default",
+    )
+    parser.add_argument(
+        "--fresh_init",
+        "-fi",
+        action="store_true",
+        help="re-initialise every generation from the pristine base model instead of continuing "
+        "to fine-tune the previous generation's adapter, so that only the *data* is recursive "
+        "(the 'replace' setting of the model collapse literature). Without it a run reaches the "
+        "last generation with one adapter that has been trained for num_generations * "
+        "training_epochs epochs, and -lr_r/-lr_a only take effect at generation 0",
+    )
+    parser.add_argument(
+        "--training_gpus",
+        "-tg",
+        type=int,
+        default=0,
+        help="how many of the visible GPUs to train one generation on, as data parallel ranks "
+        "under torchrun. The generations themselves are sequential, so this parallelises a single "
+        "generation's fine-tuning. 0 uses every visible GPU, 1 forces single GPU training — which "
+        "is the reference to check the data parallel path against (default: 0)",
+    )
+    parser.add_argument(
+        "--master_port",
+        "-mp",
+        type=int,
+        default=29500,
+        help="torchrun rendezvous port for the training stage. Only needs changing when two "
+        "pipelines run on the same machine, which would otherwise collide on it (default: 29500)",
     )
     parser.add_argument(
         "--path",
