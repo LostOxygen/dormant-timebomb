@@ -47,10 +47,12 @@ SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
 # is fitted under a different decoding regime than it is used in. The pipeline pins them on the
 # CLI (run_baseline.py / run_extrapolation.py -tp/-tpp/-tpk) with these same defaults; if you
 # change them there, change them here.
-# REPETITION_PENALTY is 1.0, i.e. disabled: the pipeline scores its responses with an unpenalized
-# forward pass, so a penalty would make the perplexity a property of the sampling distortion
-# rather than of the model
-REPETITION_PENALTY: float = 1.0
+# REPETITION_PENALTY mirrors the generation pipeline's 3.0. It has to track
+# utils/generate_dataset.py exactly: p_1 is fitted here and used there, so a mismatch fits the
+# surrogate under a different decoding regime than it is used in. Note that the pipeline scores its
+# responses with an unpenalized forward pass, so at any value above 1.0 the perplexity this is
+# calibrated against is partly a property of the sampling distortion rather than of the model
+REPETITION_PENALTY: float = 3.0
 TEMPERATURE: float = 0.7
 # the base top_p. Every candidate of the calibration grid replaces it, which is the whole point of
 # the fit — p_1 is defined as the truncation that reproduces the real model_0's statistic

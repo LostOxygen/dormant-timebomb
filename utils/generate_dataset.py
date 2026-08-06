@@ -146,10 +146,15 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        # disabled, matching the transformers path: the responses are scored by an unpenalized
-        # forward pass in calculate_perplexity.py, so a penalty would make the measured
-        # perplexity a property of the sampling distortion rather than of the model
-        repetition_penalty=1.0,
+        # pinned to 3.0, matching the transformers path and generate_dataset_extrapolation.py.
+        # This value is a deliberate experimental choice with a known cost: the responses are
+        # scored by an *unpenalized* forward pass in calculate_perplexity.py, so the penalty makes
+        # the measured perplexity partly a property of the sampling distortion rather than of the
+        # model, and because it divides the logit of every token already in the context its
+        # severity grows with the response length — which grows with every generation, so the
+        # distortion is not a constant offset across the collapse trend. Keep it identical in
+        # every generation path or the histograms stop being comparable
+        repetition_penalty=3.0,
         min_tokens=MIN_NEW_TOKENS,
         max_tokens=block_size,
         # vLLM returns only the continuation, so unlike the transformers path there is no prompt
@@ -235,12 +240,14 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
         # distribution, so the decoding has to be plain multinomial sampling. Beam search
         # (num_beams > 1) would optimize for likelihood and systematically narrow the output
         # distribution, which suppresses exactly the effect this pipeline measures.
-        # repetition_penalty is pinned to 1.0, i.e. disabled, because the responses are scored by
-        # an unpenalized forward pass in calculate_perplexity.py. Any penalty would make the
-        # measured perplexity a property of the sampling distortion rather than of the model, and
-        # since the penalty divides the logit of every token already in the context, its severity
-        # grows with the response length — which grows with every generation, so the distortion
-        # would alias onto the collapse trend instead of being a constant offset
+        # repetition_penalty is pinned to 3.0, matching the vLLM path above. It is set here rather
+        # than inherited so the two engines sample from the same distribution, and its cost is
+        # accepted knowingly: calculate_perplexity.py scores these responses with an unpenalized
+        # forward pass, so the penalty makes the measured perplexity partly a property of the
+        # sampling distortion rather than of the model, and since it divides the logit of every
+        # token already in the context, its severity grows with the response length — which grows
+        # with every generation, so the distortion aliases onto the collapse trend instead of
+        # being a constant offset
         with torch.no_grad():
             generated_answers = model.generate(
                 **inputs,
@@ -249,7 +256,7 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
-                repetition_penalty=1.0,
+                repetition_penalty=3.0,
                 min_new_tokens=MIN_NEW_TOKENS,
                 max_new_tokens=block_size,
                 use_cache=True,

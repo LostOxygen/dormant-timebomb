@@ -42,6 +42,7 @@ import torch
 from transformers import (
     LogitsProcessor,
     LogitsProcessorList,
+    RepetitionPenaltyLogitsProcessor,
 )
 
 from utils.colors import TColors
@@ -55,6 +56,9 @@ from utils.extrapolation import (
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
+# has to match utils/generate_dataset.py and utils/calibrate_surrogate.py: stage 1 and stage 2 are
+# plotted against each other, so a difference in the decoding is a difference in what is compared
+REPETITION_PENALTY: float = 3.0
 
 class UnslothExtrapolationProcessor(LogitsProcessor):
     def __init__(self, model_collapsed, generation_n: float, prompt_attention_mask: torch.Tensor):
@@ -413,7 +417,19 @@ for start in tqdm(
     if method == "logit":
         # the logit extrapolation runs as a custom logits processor during decoding. It is
         # rebuilt per batch because it holds the collapsed model's KV cache and this batch's
-        # prompt mask
+        # prompt mask.
+        #
+        # The repetition penalty has to run *after* it, which is why it is in this list instead of
+        # being left to generate(): the processors generate() builds itself run before any custom
+        # one, so the base scores would already be penalized while the collapsed model's logits
+        # stay raw. The extrapolation then works out to
+        # (1 - n) * penalized_base + n * raw_collapsed, which cancels the penalty at n = 1 and
+        # inverts it for n > 1 — the negative coefficient pushes the tokens the penalty pushed
+        # down back up, i.e. it actively rewards repetition, harder with every generation.
+        # Handing the penalty over as a custom processor is not sufficient on its own either:
+        # _merge_criteria_processor_list substitutes a same-typed custom processor *at the position
+        # of the default it replaces*, so it would still land before the extrapolation. Disabling
+        # the built-in one with 1.0 below is what makes this list's order the effective one
         sampling_kwargs["logits_processor"] = LogitsProcessorList(
             [
                 UnslothExtrapolationProcessor(
@@ -421,13 +437,19 @@ for start in tqdm(
                     generation_n=generation_n,
                     prompt_attention_mask=inputs["attention_mask"],
                 ),
+                RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
             ]
         )
-    elif method == "data":
-        # the whole method *is* the truncation of the sampling support, so its schedule replaces
-        # the pipeline's top_p instead of composing with it — which also matches
-        # calibrate_surrogate.py, whose grid replaces top_p to fit p_1
-        sampling_kwargs["top_p"] = schedule_top_p
+        sampling_kwargs["repetition_penalty"] = 1.0
+    else:
+        # no extrapolation processor is involved, so there is nothing the built-in penalty could be
+        # cancelled by and it can be left to generate() as usual
+        sampling_kwargs["repetition_penalty"] = REPETITION_PENALTY
+        if method == "data":
+            # the whole method *is* the truncation of the sampling support, so its schedule
+            # replaces the pipeline's top_p instead of composing with it — which also matches
+            # calibrate_surrogate.py, whose grid replaces top_p to fit p_1
+            sampling_kwargs["top_p"] = schedule_top_p
 
     generated_answers = generation_model.generate(
         **inputs,
@@ -438,16 +460,13 @@ for start in tqdm(
         # this pipeline measures — and it would do so unevenly across the three methods
         do_sample=True,
         num_beams=1,
-        # pinned to 1.0, i.e. disabled, for every method. The responses are scored by an
-        # unpenalized forward pass, so a penalty would make the measured perplexity a property of
-        # the sampling distortion rather than of the model — and since it divides the logit of
-        # every token already in the context, its severity grows with the response length and
-        # would therefore alias onto the collapse trend. Leaving it to the generation_config is
-        # not enough either: an inherited penalty would run before the extrapolation processor,
-        # so the extrapolation would see penalized base scores against raw collapsed ones and
-        # work out to (1 - n) * penalized_base + n * raw_collapsed, which cancels the penalty at
-        # n = 1 and inverts it for n > 1
-        repetition_penalty=1.0,
+        # repetition_penalty is not passed here: it is REPETITION_PENALTY (3.0) for every method,
+        # but *where* it is applied differs, so both branches above set it in sampling_kwargs
+        # instead. Its cost is accepted knowingly — the responses are scored by an unpenalized
+        # forward pass, so the penalty makes the measured perplexity partly a property of the
+        # sampling distortion rather than of the model, and since it divides the logit of every
+        # token already in the context, its severity grows with the response length and therefore
+        # aliases onto the collapse trend rather than being a constant offset
         min_new_tokens=128,
         max_new_tokens=block_size,
         use_cache=True,
