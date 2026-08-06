@@ -137,8 +137,9 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
         disable_log_stats=True,
         # the transformers path seeds nothing, but vLLM's scheduler makes the sampling order
         # depend on the batching, so an explicit seed is what makes a shard reproducible. It
-        # varies with both the shard and the generation so no two workers sample in lockstep
-        seed=1337 + 100 * generation + shard_id,
+        # varies with both the shard and the generation so no two workers sample in lockstep, and
+        # with --seed so that two runs of run_baseline.py can collapse differently
+        seed=seed + 100 * generation + shard_id,
     )
 
     sampling_params = SamplingParams(
@@ -202,6 +203,13 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
     Returns:
         list: the responses, in the order of the instructions
     """
+    # the vLLM path seeds its engine through SamplingParams; generate() has no such argument, so
+    # the global torch RNG is seeded here with the same formula. Without this the transformers
+    # engine samples from whatever state it happens to be in, which makes the shard
+    # unreproducible and — more importantly for a cross-run experiment — makes --seed affect only
+    # the training, not the corpus the next generation trains on
+    torch.manual_seed(seed + 100 * generation + shard_id)
+
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_dir,
         max_seq_length=block_size,
@@ -319,6 +327,15 @@ if __name__ == "__main__":
         help="sets the current shard id",
     )
     parser.add_argument(
+        "--seed",
+        "-sd",
+        type=int,
+        default=1337,
+        help="base sampling seed. The effective seed is this plus 100 * generation + shard_id, so "
+        "no two workers sample in lockstep and every shard stays reproducible. Vary it to get a "
+        "different collapse trajectory from otherwise identical hyperparameters (default: 1337)",
+    )
+    parser.add_argument(
         "--engine",
         "-e",
         type=str,
@@ -387,6 +404,7 @@ if __name__ == "__main__":
     dataset_batch_size = args.dataset_batch_size
     generation = args.generation
     shard_id = args.shard_id
+    seed = args.seed
     engine = args.engine
     gpu_memory_utilization = args.gpu_memory_utilization
     enforce_eager = args.enforce_eager

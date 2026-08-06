@@ -93,6 +93,7 @@ def main(
     model_specifier: str = "",
     continue_from_generation: int = 0,
     dataset_size: int = 0,
+    seed: int = 1337,
     learning_rate: float = 2e-4,
     lora_rank: int = 16,
     lora_alpha: int = 16,
@@ -128,6 +129,9 @@ def main(
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
         dataset_size (int): number of dataset samples to use, taken from the front of the
             upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
+        seed (int): seed of the whole collapse trajectory, threaded into the training worker and
+            into the sampling seed of every generation worker. Two runs that differ only in this
+            produce two independent collapse trajectories from identical hyperparameters
         learning_rate (float): LoRA learning rate
         lora_rank (int): LoRA rank r. Together with lora_alpha this bounds how far one
             generation can drift from the last one, i.e. how strong the collapse effect is
@@ -460,6 +464,8 @@ def main(
                 str(lora_alpha),
                 "--path",
                 str(path),
+                "--seed",
+                str(seed),
             ]
             if load_in_4bit:
                 train_command.append("--load_in_4bit")
@@ -509,6 +515,8 @@ def main(
                         str(top_k),
                         "--path",
                         str(path),
+                        "--seed",
+                        str(seed),
                     ],
                 )
                 process_list.append(process)
@@ -917,6 +925,17 @@ if __name__ == "__main__":
         "the upstream 50k dataset; 0 uses all of it. run_baseline.py and run_extrapolation.py "
         "must be given the same value, otherwise their histograms describe different data "
         "(default: 0, the whole dataset)",
+    )
+    parser.add_argument(
+        "--seed",
+        "-sd",
+        type=int,
+        default=1337,
+        help="seed of the whole collapse trajectory. It is threaded into the training worker and "
+        "into every generation worker's sampling seed, so two runs differing only in this value "
+        "are two independent collapse trajectories from identical hyperparameters — which is what "
+        "run_transfer_experiment.py uses to build a second run to transfer a suffix into "
+        "(default: 1337)",
     )
     parser.add_argument(
         "--learning_rate",

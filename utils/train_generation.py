@@ -78,6 +78,10 @@ parser.add_argument("--load_in_4bit", "-q4", action="store_true")
 parser.add_argument("--gradient_checkpointing", "-gc", action="store_true")
 parser.add_argument("--fresh_init", "-fi", action="store_true")
 parser.add_argument("--path", "-p", type=str, default="")
+# the seed of the whole collapse trajectory. It is a CLI argument rather than a constant so that
+# two runs of run_baseline.py can produce *different* collapsed models from identical
+# hyperparameters, which is what a cross-run transfer experiment needs
+parser.add_argument("--seed", "-sd", type=int, default=1337)
 args = parser.parse_args()
 
 block_size = args.block_size
@@ -94,6 +98,7 @@ load_in_4bit = args.load_in_4bit
 gradient_checkpointing = args.gradient_checkpointing
 fresh_init = args.fresh_init
 path = args.path
+seed = args.seed
 
 # torchrun sets these; running the script bare is a world size of 1
 world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -256,7 +261,7 @@ trainer = SFTTrainer(
         optim="adamw_torch_fused",
         weight_decay=0.01,
         lr_scheduler_type="linear",
-        seed=1337,
+        seed=seed,
         output_dir="outputs",
         report_to="none",
         # nothing reads the intermediate checkpoints — the generation stage and run_attack.py both
