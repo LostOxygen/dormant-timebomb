@@ -213,7 +213,7 @@ def main(
     block_size: int = 512,
     model_specifier: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct",
     num_samples: int = 128,
-    dataset_size: int = 50000,
+    dataset_size: int = 0,
     generation_batch_size: int = 32,
     perplexity_batch_size: int = 16,
     max_new_tokens: int = 512,
@@ -440,9 +440,10 @@ if __name__ == "__main__":
         "--dataset_size",
         "-dsz",
         type=int,
-        default=50000,
-        help="the --dataset_size run_baseline.py / run_extrapolation.py are run with. The "
-        "calibration draws its instructions from the same front slice (default: 50000)",
+        default=0,
+        help="the --dataset_size run_baseline.py / run_extrapolation.py are run with; 0 uses "
+        "the whole dataset. The calibration draws its instructions from the same front slice "
+        "(default: 0, the whole dataset)",
     )
     parser.add_argument(
         "--generation_batch_size",

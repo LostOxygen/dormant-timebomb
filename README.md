@@ -96,7 +96,7 @@ python run_baseline.py [-dx DEVICE] [-te TRAINING_EPOCHS] [-dbs DATASET_BATCH_SI
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Hugging Face id of the base model. The trailing name is part of every output path. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Resume: generations below this index are skipped, so training continues from an existing checkpoint. |
-| `--dataset_size` | `-dsz` | int | `10000` | How many samples to use from the upstream 50k dataset, taken as a contiguous slice from the front. Must match the value given to `run_extrapolation.py`, otherwise the two describe different data. |
+| `--dataset_size` | `-dsz` | int | `0` | How many samples to use from the upstream 50k dataset, taken as a contiguous slice from the front; `0` uses all of it. Must match the value given to `run_extrapolation.py`, otherwise the two describe different data. |
 | `--learning_rate` | `-lr` | float | `2e-4` | LoRA learning rate. One of the levers on how fast collapse progresses. |
 | `--lora_rank` | `-lr_r` | int | `16` | LoRA rank `r`. The adapter can only move the model inside an `r`-dimensional subspace, so this bounds how far one generation can drift. Raise it (32, 64) for a stronger collapse effect. |
 | `--lora_alpha` | `-lr_a` | int | `16` | LoRA alpha. The adapter contributes `(alpha / r) * B @ A`, so raising alpha relative to the rank scales up the per-generation delta. |
@@ -296,7 +296,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
-| `--dataset_size` | `-dsz` | int | `10000` | Samples to use from the upstream 50k dataset. **Must match step 1** — both take the same front slice, which is what makes their histograms comparable. |
+| `--dataset_size` | `-dsz` | int | `0` | Samples to use from the upstream 50k dataset; `0` uses all of it. **Must match step 1** — both take the same front slice, which is what makes their histograms comparable. |
 | `--path` | `-p` | str | `""` (cwd) | Root directory for `generated_datasets/` and `model_outputs/`; must match step 1. |
 
 #### `calibrate_surrogate.py`
@@ -306,7 +306,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--block_size` | `-bs` | int | `2048` | Must match `run_baseline.py` / `run_extrapolation.py`. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | The pristine base model. |
 | `--num_samples` | `-ns` | int | `128` | Instructions to calibrate on, taken as a contiguous slice from the front so the fit is reproducible without a seed. |
-| `--dataset_size` | `-dsz` | int | `10000` | The `--dataset_size` the pipeline runs with. The calibration draws from the same front slice, so `p_1` is never fitted on data the pipeline never sees. |
+| `--dataset_size` | `-dsz` | int | `0` | The `--dataset_size` the pipeline runs with; `0` uses the whole dataset. The calibration draws from the same front slice, so `p_1` is never fitted on data the pipeline never sees. |
 | `--generation_batch_size` | `-gbs` | int | `32` | Prompts per `generate()` call. |
 | `--perplexity_batch_size` | `-pbs` | int | `16` | Samples per perplexity batch. |
 | `--max_new_tokens` | `-mnt` | int | `512` | Generation cap for the calibration. Lower than the pipeline's `block_size` to keep the grid affordable; the statistic is per-token averaged, so it stays comparable as long as both branches share the cap. |

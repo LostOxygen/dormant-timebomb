@@ -111,7 +111,7 @@ def main(
     continue_from_generation: int = 0,
     method: str = "logit",
     surrogate_top_p: float = 0.0,
-    dataset_size: int = 50000,
+    dataset_size: int = 0,
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
@@ -869,10 +869,11 @@ if __name__ == "__main__":
         "--dataset_size",
         "-dsz",
         type=int,
-        default=50000,
+        default=0,
         help="number of dataset samples to use, taken as a contiguous slice from the front of "
-        "the upstream 50k dataset. run_baseline.py and run_extrapolation.py must be given the "
-        "same value, otherwise their histograms describe different data (default: 50000)",
+        "the upstream 50k dataset; 0 uses all of it. run_baseline.py and run_extrapolation.py "
+        "must be given the same value, otherwise their histograms describe different data "
+        "(default: 0, the whole dataset)",
     )
     parser.add_argument(
         "--temperature",
