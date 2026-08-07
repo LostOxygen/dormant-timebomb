@@ -746,9 +746,9 @@ if __name__ == "__main__":
         "--seed_b",
         "-sb",
         type=int,
-        default=2024,
+        default=4267,
         help="collapse seed of the run the suffix is transferred into. Must differ from --seed_a, "
-        "otherwise both runs are the same trajectory (default: 2024)",
+        "otherwise both runs are the same trajectory (default: 4267)",
     )
     parser.add_argument(
         "--num_generations",
@@ -821,9 +821,9 @@ if __name__ == "__main__":
         "--max_new_tokens",
         "-mnt",
         type=int,
-        default=96,
+        default=512,
         help="verification decoding length, shared by the search and both verifications so the "
-        "three verdicts are produced under identical decoding (default: 96)",
+        "three verdicts are produced under identical decoding (default: 512)",
     )
     parser.add_argument(
         "--repetition_penalty",
