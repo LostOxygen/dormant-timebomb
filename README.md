@@ -91,7 +91,7 @@ python run_baseline.py [-dx DEVICE] [-te TRAINING_EPOCHS] [-dbs DATASET_BATCH_SI
 | `--training_batch_size` | `-tbs` | int | `16` | Per-device train/eval batch size (gradient accumulation is fixed at 4). |
 | `--skip_training` | `-st` | flag | off | Skip the whole train + generate loop and only run the perplexity evaluation and plotting on already existing artifacts. |
 | `--num_generations` | `-ng` | int | `10` | How many collapse generations to train (and how many generations to evaluate). |
-| `--block_size` | `-bs` | int | `2048` | Max sequence length. Raised automatically to the longest response in the dataset, so the effective value can be larger than what you pass — it appears in every output filename. |
+| `--block_size` | `-bs` | int | `512` | Max sequence length, and the `max_new_tokens` cap of the generation. Exactly the value you pass — it is *not* raised to the dataset's longest response — and it appears in every output filename, so all stages have to be given the same one. Responses longer than it are not discarded; `"wrapped"` packing splits them across blocks. |
 | `--histogram_only` | `-ho` | flag | off | Skip the perplexity computation and re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt`. |
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Hugging Face id of the base model. The trailing name is part of every output path. |
@@ -240,7 +240,7 @@ fixed point the real process converges to.
 output look like the real ```model_0```'s output, and ```calibrate_surrogate.py``` fits it:
 
 ```
-python calibrate_surrogate.py --block_size 2048 --model_specifier unsloth/Qwen2.5-Coder-0.5B-Instruct
+python -m utils.calibrate_surrogate --block_size 512 --model_specifier unsloth/Qwen2.5-Coder-0.5B-Instruct
 ```
 
 It generates reference responses with the real ```model_0``` (which *is* real generation 1),
@@ -291,7 +291,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--surrogate_top_p` | `-stp` | float | `0.0` | `p_1` of the data-space surrogate. `0.0` reads the fitted value from `calibrate_surrogate.py`; passing it explicitly skips the calibration and marks the run uncalibrated (`data` only). |
 | `--dataset_batch_size` | `-dbs` | int | `150` | Batch size for the generation. Keep this lower than in step 1 for `--method logit`, where two models are resident and the logits processor keeps a second KV cache; `lora` and `data` need only one model and tolerate more. |
 | `--num_generations` | `-ng` | int | `10` | Number of generations. Generation `g` uses the factor `g + 1`, so the largest factor is `num_generations`. |
-| `--block_size` | `-bs` | int | `2048` | Max sequence length and `max_new_tokens` for generation. Raised to the dataset's longest response, like in step 1. Must match the value used by `run_baseline.py`. |
+| `--block_size` | `-bs` | int | `512` | Max sequence length and `max_new_tokens` for generation. Exactly the value you pass, like in step 1. Must match the value used by `run_baseline.py`. |
 | `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt` of the selected method. |
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
@@ -303,7 +303,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 
 | Argument | Short | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `--block_size` | `-bs` | int | `2048` | Must match `run_baseline.py` / `run_extrapolation.py`. |
+| `--block_size` | `-bs` | int | `512` | Must match `run_baseline.py` / `run_extrapolation.py`. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | The pristine base model. |
 | `--num_samples` | `-ns` | int | `128` | Instructions to calibrate on, taken as a contiguous slice from the front so the fit is reproducible without a seed. |
 | `--dataset_size` | `-dsz` | int | `0` | The `--dataset_size` the pipeline runs with; `0` uses the whole dataset. The calibration draws from the same front slice, so `p_1` is never fitted on data the pipeline never sees. |
@@ -354,7 +354,7 @@ python run_extrapolation.py --device cuda --method lora --num_generations 10 \
 Data-space surrogate — calibrate `p_1` once, then run all generations:
 
 ```bash
-python calibrate_surrogate.py --block_size 2048 --path ./runs/baseline
+python -m utils.calibrate_surrogate --block_size 512 --path ./runs/baseline
 python run_extrapolation.py --device cuda --method data --num_generations 10 \
     --dataset_batch_size 150 --path ./runs/baseline
 ```
@@ -620,7 +620,7 @@ Reuse the scaled adapter step 2 already built instead of rebuilding it:
 
 ```bash
 python run_attack.py --device cuda -cg 9 --surrogate_method lora \
-    --surrogate_model_path ./runs/baseline/model_outputs/model_scaled_n10_bs2048_Qwen2.5-Coder-0.5B-Instruct \
+    --surrogate_model_path ./runs/baseline/model_outputs/model_scaled_n10_bs512_Qwen2.5-Coder-0.5B-Instruct \
     -p ./runs/baseline
 ```
 
