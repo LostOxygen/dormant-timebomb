@@ -52,6 +52,7 @@ from utils.extrapolation import (
     extrapolate_logits,
     surrogate_top_p,
 )
+from utils.utils import clear_inherited_max_length
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -357,6 +358,12 @@ else:
 # constant prefix of every row of the batch, which the prompt slicing further down relies on — and
 # it is what the extrapolation processor's padding aware position_ids assume
 tokenizer.padding_side = "left"
+
+# all three methods reach here with a loaded generation_model, so this is the one place the
+# checkpoint's inherited max_length has to be dropped. The generate() call below passes
+# max_new_tokens, which transformers honours either way — this only stops it from logging a
+# "Both max_new_tokens and max_length seem to have been set" line per batch
+clear_inherited_max_length(generation_model)
 
 # load the base subdataset from the previous generation
 subdataset = Dataset.load_from_disk(

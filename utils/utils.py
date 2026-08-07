@@ -210,3 +210,39 @@ def configure_pad_token(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokeniz
     else:
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
     return tokenizer
+
+
+def clear_inherited_max_length(model):
+    """Drops the `max_length` a checkpoint ships in its generation_config.
+
+    Qwen2.5's generation_config.json carries `max_length: 32768`, mirroring
+    `max_position_embeddings`. Every `generate()` call in this pipeline passes `max_new_tokens`
+    explicitly, and transformers then *always* recomputes
+    `max_length = max_new_tokens + prompt_length` — but it also logs
+
+        Both `max_new_tokens` (=512) and `max_length`(=32768) seem to have been set.
+        `max_new_tokens` will take precedence.
+
+    once per call, because `has_default_max_length` is false whenever the checkpoint set the
+    value (transformers/generation/utils.py::_prepare_generated_length). Over a generation shard
+    that is one line of noise per batch, which buries the warnings that do matter.
+
+    Clearing it is behaviour preserving — verified by decoding the same prompt greedily before and
+    after and comparing token ids — and it is the same principle as pinning the sampling
+    parameters instead of inheriting them: the length is decided by `--block_size` here, not by
+    whatever the checkpoint was shipped with.
+
+    This is only safe while every `generate()` call passes `max_new_tokens`. If one ever does not,
+    transformers takes the `elif has_default_max_length` branch and adds the prompt length to
+    `max_length`, which would be `None + int`. Pass `max_new_tokens` or leave this alone.
+
+    Args:
+        model: a Hugging Face model whose generation_config is mutated in place
+
+    Returns:
+        The same model, so this can wrap a load call.
+    """
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is not None:
+        generation_config.max_length = None
+    return model

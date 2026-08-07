@@ -138,6 +138,7 @@ from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logit
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.utils import (
     INIT_CHARS,
+    clear_inherited_max_length,
     configure_pad_token,
     find_executable_batch_size,
     get_nonascii_toks,
@@ -382,6 +383,10 @@ class TargetModel:
         self.model = model
         self.device = device
         self.model.eval()
+        # verify() always passes max_new_tokens, so the max_length the checkpoint ships in its
+        # generation_config only produces one warning line per decoded completion — of which there
+        # are two per behavioural check, per task, per verification step
+        clear_inherited_max_length(self.model)
         # only the one-hot input matrix needs gradients, never the weights
         for param in self.model.parameters():
             param.requires_grad_(False)

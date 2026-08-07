@@ -57,6 +57,8 @@ import argparse
 import importlib.util
 import shutil
 
+import torch
+
 from utils.colors import TColors
 
 DATASET_PATH: str = "./generated_datasets/"
@@ -223,6 +225,16 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
     # it on the model's internal tokenizer copy. Setting it here as well guarantees that the
     # prompt occupies a constant prefix of every row of the batch, which the slicing below needs
     tokenizer.padding_side = "left"
+    # the generate() below passes max_new_tokens, so the checkpoint's inherited max_length only
+    # buys a warning per batch. Dropping it changes no output, see clear_inherited_max_length.
+    #
+    # Imported here rather than at module scope on purpose: utils/utils.py imports torch, and this
+    # module's unsloth import sits inside the __main__ guard below. A module level import would
+    # therefore pull torch in *before* unsloth and silently cost its patches — the same reason
+    # utils/__init__.py has to stay free of imports. By the time this function runs, unsloth is in
+    from utils.utils import clear_inherited_max_length  # noqa: E402  pylint: disable=C0415
+
+    clear_inherited_max_length(model)
 
     prompts = format_prompts(instructions, tokenizer)
     prompt_lengths = [

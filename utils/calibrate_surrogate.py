@@ -37,6 +37,7 @@ from datasets import load_dataset
 
 from utils.colors import TColors
 from utils.extrapolation import calibration_file
+from utils.utils import clear_inherited_max_length
 from utils.perplexity import sample_perplexities
 
 DATASET_PATH: str = "./generated_datasets/"
@@ -289,6 +290,9 @@ def main(
         load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(model_base)
+    # both models here are generated from, and generate_responses passes max_new_tokens, so the
+    # inherited max_length only costs a warning per batch. See clear_inherited_max_length
+    clear_inherited_max_length(model_base)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -306,6 +310,7 @@ def main(
         load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(model_collapsed)
+    clear_inherited_max_length(model_collapsed)
 
     print(f"\n## {TColors.OKBLUE}{TColors.BOLD}Reference (real model_0){TColors.ENDC}")
     reference_responses = generate_responses(
