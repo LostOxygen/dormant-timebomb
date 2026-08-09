@@ -17,10 +17,16 @@ import psutil
 from utils.colors import TColors
 from utils.devices import visible_devices
 
-# this orchestrator never touches a model in-process, matching run_baseline.py and
+# The experiment is one-directional and that is the whole point: run A is collapsed, a generation
+# of it is probed, a suffix is optimized against it, and only then is run B collapsed and the
+# frozen suffix evaluated against it. Nothing that produces the suffix — not the search, not the
+# choice of generation — is ever allowed to see run B, otherwise the transfer rate is measured on
+# a setup selected with knowledge of the answer. There is no optimization after stage 3.
+#
+# This orchestrator never touches a model in-process, matching run_baseline.py and
 # run_extrapolation.py: every stage that loads weights is a subprocess. Here that matters for a
-# second reason beyond allocator hygiene — stages 1 and 3 run the unsloth/vLLM stack while the
-# verification runs run_attack's plain transformers stack, and unsloth patches transformers at
+# second reason beyond allocator hygiene — the collapse runs use the unsloth/vLLM stack while the
+# verification uses run_attack's plain transformers stack, and unsloth patches transformers at
 # import time. Keeping them in separate interpreters is what lets both be correct
 VISIBLE_DEVICES = visible_devices()
 
@@ -254,9 +260,7 @@ def verify_command(
 
 def choose_generation(
     path_a: str,
-    path_b: str,
     seed_a: int,
-    seed_b: int,
     num_generations: int,
     block_size: int,
     tasks: str,
@@ -267,71 +271,72 @@ def choose_generation(
     exec_timeout: float,
     force: bool,
 ) -> int:
-    """Picks the latest generation at which *both* runs can still solve enough tasks unaided.
+    """Picks the latest generation at which *run A* can still solve enough tasks unaided.
 
-    This stage exists because the attackable window is narrow and does not sit where one would
-    expect. Past a certain generation the collapsed model solves nothing at all, and then:
+    Only run A is probed, and that restriction is the experiment rather than a shortcut. Run B is
+    held out: the attacker in this threat model has run A and nothing else, so letting run B's
+    capability decide which generation to attack would pick the generation that happens to suit
+    the model the suffix is later tested against, and the transfer rate would be conditioned on
+    the answer it is supposed to measure.
 
-      - the attack on run A aborts on its own capability gate, so there is no suffix to transfer,
-        and `--skip_capability_check` does not help because per-task exclusion still removes every
-        task the model already gets wrong;
-      - and even if a suffix existed, every transfer verdict against run B would be inconclusive,
-        since a model that fails a task with no suffix cannot be said to have been broken by one.
+    The consequence is accepted deliberately: run B may turn out to be incapable at the chosen
+    generation, and the suffixes then come back `inconclusive` instead of `held` or
+    `transferred`. That is a real result — the attackable window moves between runs precisely
+    because they are different collapse trajectories — and it is reported rather than designed
+    away by choosing a generation that suits both.
 
-    The window also *moves* between the two runs, because they are different collapse
-    trajectories — which is the entire point of the experiment. So the generation has to be chosen
-    against both runs, not just against run A.
+    The stage exists at all because the window is narrow and does not sit where one would expect:
+    past a certain generation the collapsed model solves nothing, the attack aborts on its own
+    capability gate, and `--skip_capability_check` does not help because per-task exclusion still
+    removes every task the model already gets wrong.
 
-    The latest such generation is picked rather than the earliest: the further the collapse has
-    progressed, the more interesting the question, so the most collapsed still-capable generation
-    is the strongest test that remains meaningful.
+    The latest qualifying generation is picked rather than the earliest: the further the collapse
+    has progressed, the more interesting the question, so the most collapsed still-capable
+    generation is the strongest test that remains meaningful.
 
     Returns:
         int: the chosen generation index
 
     Raises:
-        RuntimeError: no generation leaves both runs with enough capable tasks
+        RuntimeError: no generation leaves run A with enough capable tasks
     """
     table = []
     for generation in range(num_generations - 1, -1, -1):
-        counts = {}
-        for label, path, seed in (("a", path_a, seed_a), ("b", path_b, seed_b)):
-            out_file = os.path.join(probe_dir, f"probe_run_{label}_gen{generation}.json")
-            if not (os.path.isfile(out_file) and not force):
-                run_stage(
-                    verify_command(
-                        path, generation, block_size, "", out_file,
-                        f"run {label.upper()} (seed {seed}) generation {generation}",
-                        max_new_tokens, repetition_penalty, exec_timeout,
-                        probe_only=True, tasks=tasks,
-                    ),
-                    f"capability probe of run {label.upper()} generation {generation}",
-                )
-            with open(out_file, "r", encoding="utf-8") as handle:
-                counts[label] = json.load(handle)["probe"]
+        out_file = os.path.join(probe_dir, f"probe_run_a_gen{generation}.json")
+        if not (os.path.isfile(out_file) and not force):
+            run_stage(
+                verify_command(
+                    path_a, generation, block_size, "", out_file,
+                    f"run A (seed {seed_a}) generation {generation}",
+                    max_new_tokens, repetition_penalty, exec_timeout,
+                    probe_only=True, tasks=tasks,
+                ),
+                f"capability probe of run A generation {generation}",
+            )
+        with open(out_file, "r", encoding="utf-8") as handle:
+            probe = json.load(handle)["probe"]
 
-        both = sorted(set(counts["a"]["usable"]) & set(counts["b"]["usable"]))
-        table.append((generation, counts["a"], counts["b"], both))
+        table.append((generation, probe))
         print(
-            f"##   generation {generation}: run A {counts['a']['n_capable']}/"
-            f"{counts['a']['n_tasks']} capable, run B {counts['b']['n_capable']}/"
-            f"{counts['b']['n_tasks']} capable, both: {both or '-'}"
+            f"##   generation {generation}: run A {probe['n_capable']}/{probe['n_tasks']} "
+            f"capable{' -> ' + ', '.join(probe['usable']) if probe['usable'] else ''}"
         )
-        if len(both) >= min_usable:
+        if probe["n_capable"] >= min_usable:
             print(
                 f"\n## {TColors.OKGREEN}{TColors.BOLD}Chose generation {generation}{TColors.ENDC}: "
-                f"{len(both)} task(s) solvable unaided by both runs ({', '.join(both)})"
+                f"{probe['n_capable']} task(s) solvable unaided by run A "
+                f"({', '.join(probe['usable'])}). Run B was not consulted — whether it is still "
+                f"capable here is part of the result, not of the setup"
             )
             return generation
 
-    best = max(table, key=lambda row: len(row[3])) if table else None
+    best = max(table, key=lambda row: row[1]["n_capable"]) if table else None
     raise RuntimeError(
-        f"no generation leaves both runs with at least --min_usable_tasks {min_usable} task(s) "
-        f"solvable unaided, so there is no generation at which a transfer result would be "
-        f"meaningful. The best was generation {best[0]} with {len(best[3])} shared capable "
-        f"task(s). Collapse less far (fewer --num_generations, lower --learning_rate or "
-        f"--lora_rank via --baseline_extra), or add tasks to run_attack.TASKS that survive "
-        f"further into the collapse"
+        f"no generation leaves run A with at least --min_usable_tasks {min_usable} task(s) "
+        f"solvable unaided, so there is no generation it can be selectively attacked at. The best "
+        f"was generation {best[0]} with {best[1]['n_capable']} capable task(s). Collapse less far "
+        f"(fewer --num_generations, lower --learning_rate or --lora_rank via --baseline_extra), "
+        f"or add tasks to run_attack.TASKS that survive further into the collapse"
     )
 
 
@@ -384,59 +389,159 @@ def extract_suffixes(results_file: str) -> list:
     return candidates
 
 
-def summarize(control: dict, target: dict, seed_a: int, seed_b: int) -> dict:
-    """Joins the two verification passes into the experiment's actual answer.
+def sweep_run(
+    label: str,
+    path: str,
+    seed: int,
+    generations: list,
+    block_size: int,
+    suffix_file: str,
+    report_dir: str,
+    max_new_tokens: float,
+    repetition_penalty: float,
+    exec_timeout: float,
+    force: bool,
+) -> dict:
+    """Verifies the frozen suffixes against one run at every generation, and loads the results.
 
-    The control pass (against run A, the run the suffix was found on) is what makes the target
-    pass interpretable. A suffix that does not even reproduce on its own run cannot be said to
-    have failed to transfer — something about the decoding or the checkpoint changed instead — so
-    those are excluded from the transfer rate rather than counted as failures.
+    No optimization happens here or anywhere after the attack: this evaluates the same strings
+    against a different checkpoint each time, which is why sweeping is cheap relative to the search
+    and why both runs can be swept over the whole range.
+
+    Args:
+        label (str): "a" or "b", used in the artifact names
+        path (str): root of the run
+        seed (int): the run's collapse seed, for the console label only
+        generations (list): generation indices to verify at
+
+    Returns:
+        dict: {generation: parsed verification JSON}
     """
-    control_by_key = {(r["task"], r["suffix"]): r for r in control["records"]}
+    loaded = {}
+    for generation in generations:
+        out_file = os.path.join(report_dir, f"verify_run_{label}_gen{generation}.json")
+        if os.path.isfile(out_file) and not force:
+            print(
+                f"## {TColors.OKGREEN}skipped{TColors.ENDC} generation {generation}: "
+                f"{out_file} already exists"
+            )
+        else:
+            run_stage(
+                verify_command(
+                    path, generation, block_size, suffix_file, out_file,
+                    f"run {label.upper()} (seed {seed}) generation {generation}",
+                    max_new_tokens, repetition_penalty, exec_timeout,
+                ),
+                f"verification of run {label.upper()} generation {generation}",
+            )
+        with open(out_file, "r", encoding="utf-8") as handle:
+            loaded[generation] = json.load(handle)
+    return loaded
+
+
+def tally(rows: list) -> dict:
+    """Counts verdicts and derives the transfer rate for one set of rows.
+
+    The denominator is `transferred + held` — the candidates the target could actually be said to
+    have resisted or not. `inconclusive` (the target already failed that task with no suffix) and
+    `void` (the suffix did not reproduce on its own run) are reported but never divided by, since
+    a target that fails everything would otherwise score a perfect transfer rate.
+    """
+    counts = {
+        key: sum(1 for r in rows if r["verdict"] == key)
+        for key in ("transferred", "held", "inconclusive", "void")
+    }
+    decidable = counts["transferred"] + counts["held"]
+    return {
+        "n_candidates": len(rows),
+        "n_transferred": counts["transferred"],
+        "n_held": counts["held"],
+        "n_inconclusive": counts["inconclusive"],
+        "n_void": counts["void"],
+        "n_decidable": decidable,
+        "transfer_rate": (counts["transferred"] / decidable) if decidable else None,
+    }
+
+
+def summarize(sweeps: dict, seed_a: int, seed_b: int, attacked: int) -> dict:
+    """Joins the two per-generation sweeps into the experiment's answer.
+
+    `sweeps` is {"a": {generation: verification}, "b": {...}}. Both runs are swept over the same
+    generations because run B alone cannot answer the question. A suffix that breaks run B at
+    generation 3 might be reaching across runs, or it might simply be that generation-3 models are
+    easy — sweeping run A over the same range separates the two:
+
+        run A, generation `attacked`   the suffix was optimized here; it must work, and that cell
+                                       is the validity anchor for everything else
+        run A, shallower generations   how far the suffix reaches *within its own* collapse
+                                       trajectory, i.e. cross-generation reach with the run held
+                                       fixed
+        run B, generation `attacked`   transfer in the strict sense: a different trajectory at the
+                                       same depth, with the generation held fixed
+        run B, shallower generations   both differ at once, and is only interpretable against the
+                                       run A column beside it
+
+    The anchor is run A at `attacked`. A suffix that does not reproduce there cannot be said to
+    have failed anywhere else — something about the checkpoint or the decoding changed under it —
+    so it is `void` in every cell rather than re-litigated per generation.
+
+    Every (run, generation) cell gets its own denominator, because capability differs per cell and
+    a pooled rate would silently weight the generations by how capable they happened to be.
+    """
+    anchor = {(r["task"], r["suffix"]): r for r in sweeps["a"][attacked]["records"]}
 
     rows = []
-    for record in target["records"]:
-        key = (record["task"], record["suffix"])
-        reproduced = control_by_key.get(key, {}).get("outcome") == "transferred"
-        if not reproduced:
-            verdict = "void"
-        elif record["outcome"] == "transferred":
-            verdict = "transferred"
-        elif record["outcome"] == "held":
-            verdict = "held"
-        else:
-            verdict = "inconclusive"
-        rows.append(
-            {
-                "task": record["task"],
-                "suffix": record["suffix"],
-                "origin": record["origin"],
-                "verdict": verdict,
-                "reproduced_on_run_a": reproduced,
-                "run_a_outcome": control_by_key.get(key, {}).get("outcome"),
-                "run_b_outcome": record["outcome"],
-                "run_b_reason": record["reason"],
-                "run_b_clean_collapsed_status": record["clean_collapsed_status"],
-                "run_b_collapsed_status": record["collapsed_status"],
-                "run_b_baseline_status": record["baseline_status"],
+    by_run = {}
+    for label in ("a", "b"):
+        by_run[label] = {}
+        for generation in sorted(sweeps[label]):
+            cell_rows = []
+            for record in sweeps[label][generation]["records"]:
+                key = (record["task"], record["suffix"])
+                reproduced = anchor.get(key, {}).get("outcome") == "transferred"
+                if not reproduced:
+                    verdict = "void"
+                elif record["outcome"] in ("transferred", "held"):
+                    verdict = record["outcome"]
+                else:
+                    verdict = "inconclusive"
+                cell_rows.append(
+                    {
+                        "run": label,
+                        "generation": generation,
+                        "task": record["task"],
+                        "suffix": record["suffix"],
+                        "origin": record["origin"],
+                        "verdict": verdict,
+                        "reproduced_on_run_a": reproduced,
+                        "outcome": record["outcome"],
+                        "reason": record["reason"],
+                        "clean_collapsed_status": record["clean_collapsed_status"],
+                        "collapsed_status": record["collapsed_status"],
+                        "baseline_status": record["baseline_status"],
+                    }
+                )
+            by_run[label][generation] = {
+                **tally(cell_rows),
+                "model": sweeps[label][generation]["summary"]["collapsed_model"],
             }
-        )
+            rows.extend(cell_rows)
 
-    n_transferred = sum(1 for r in rows if r["verdict"] == "transferred")
-    n_held = sum(1 for r in rows if r["verdict"] == "held")
-    decidable = n_transferred + n_held
+    anchor_records = sweeps["a"][attacked]["records"]
     return {
         "seed_run_a": seed_a,
         "seed_run_b": seed_b,
-        "run_a_model": control["summary"]["collapsed_model"],
-        "run_b_model": target["summary"]["collapsed_model"],
-        "n_candidates": len(rows),
-        "n_reproduced_on_run_a": sum(1 for r in rows if r["reproduced_on_run_a"]),
-        "n_transferred": n_transferred,
-        "n_held": n_held,
-        "n_inconclusive": sum(1 for r in rows if r["verdict"] == "inconclusive"),
-        "n_void": sum(1 for r in rows if r["verdict"] == "void"),
-        "transfer_rate": (n_transferred / decidable) if decidable else None,
+        "attacked_generation": attacked,
+        "swept_generations": sorted(sweeps["b"]),
+        "n_suffixes": len(anchor_records),
+        "n_reproduced_on_run_a": sum(
+            1 for r in anchor_records if r["outcome"] == "transferred"
+        ),
+        # the matched comparison: same generation, different trajectory. Read it against
+        # by_run["a"][attacked], which is the anchor and therefore all-transferred by construction
+        "matched_generation": by_run["b"].get(attacked),
+        "by_run": by_run,
+        "totals": {label: tally([r for r in rows if r["run"] == label]) for label in ("a", "b")},
         "rows": rows,
     }
 
@@ -475,7 +580,8 @@ def main(
         seed_a (int): seed of the run the suffix is searched on
         seed_b (int): seed of the run the suffix is transferred into. Must differ from seed_a
         num_generations (int): generations per collapse run
-        collapsed_generation (int): generation to attack and to transfer into. -1 probes both runs
+        collapsed_generation (int): generation of run A to attack. Run B is then tested at every
+            generation from 0 up to and including it. -1 probes run A
         block_size (int): shared block size of both runs
         dataset_size (int): shared dataset size of both runs. 0 uses the whole dataset
         engine (str): dataset generation engine for both runs
@@ -488,8 +594,9 @@ def main(
         exec_timeout (float): unit test timeout
         stop_on_success (bool): stop a task at its first hit
         attack_seed (int): RNG seed of the search itself, unrelated to the collapse seeds
-        min_usable_tasks (int): how many tasks both runs must still solve unaided for a generation
-            to be chosen by the probe. Only read when --collapsed_generation is -1
+        min_usable_tasks (int): how many tasks *run A* must still solve unaided for a generation to
+            be chosen by the probe. Run B is not consulted, see choose_generation. Only read when
+            --collapsed_generation is -1
         with_eval (bool): also run the perplexity evaluation and the histogram of both runs
         force (bool): rerun every stage even when its artifact exists
         baseline_extra (str): extra arguments appended to both run_baseline.py invocations
@@ -507,7 +614,7 @@ def main(
     if auto_generation:
         # deliberately not "the last generation": in a 10-generation run the last one typically
         # solves nothing unaided, which makes both the attack and the transfer verdict void. The
-        # generation is probed for instead, after both runs exist. See choose_generation
+        # generation is probed for on run A instead, before run B exists. See choose_generation
         collapsed_generation = num_generations - 1
     if collapsed_generation >= num_generations:
         raise ValueError(
@@ -550,12 +657,11 @@ def main(
         f"{VISIBLE_DEVICES}."
     )
 
-    # ── stages 1 and 2: the two collapse runs ──────────────────────────────────────────────────
-    # both runs are trained before anything is attacked. The generation to attack has to be one
-    # where *both* runs can still solve tasks unaided, and that cannot be known from run A alone
-    for index, (label, path, seed) in enumerate(
-        (("A", path_a, seed_a), ("B", path_b, seed_b)), start=1
-    ):
+    # the run the suffix is searched on. Run B is deliberately not trained yet: nothing before the
+    # verification is allowed to depend on it, and if the search finds no working suffix there is
+    # no reason to have spent hours collapsing a second run
+    def collapse(index: int, label: str, path: str, seed: int) -> None:
+        """Runs one collapse run, skipping it when its last generation is already on disk."""
         # the last generation's checkpoint is the marker for "this run finished", independently of
         # which generation is eventually attacked
         final_checkpoint = collapsed_checkpoint(
@@ -573,11 +679,14 @@ def main(
                 f"collapse run {label}",
             )
 
-    # ── stage 3: pick a generation both runs are still capable at ──────────────────────────────
-    print_stage(3, 6, "choose the generation under attack")
+    # ── stage 1: collapse run A, the run under attack ──────────────────────────────────────────
+    collapse(1, "A", path_a, seed_a)
+
+    # ── stage 2: pick a generation run A is still capable at ───────────────────────────────────
+    print_stage(2, 6, "choose the generation under attack", "run A only")
     if auto_generation:
         collapsed_generation = choose_generation(
-            path_a, path_b, seed_a, seed_b, num_generations, block_size, tasks, report_dir,
+            path_a, seed_a, num_generations, block_size, tasks, report_dir,
             min_usable_tasks, max_new_tokens, repetition_penalty, exec_timeout, force,
         )
     else:
@@ -588,13 +697,14 @@ def main(
         )
 
     suffix_file = os.path.join(report_dir, f"suffixes_gen{collapsed_generation}.json")
-    control_file = os.path.join(report_dir, f"verify_run_a_gen{collapsed_generation}.json")
-    target_file = os.path.join(report_dir, f"verify_run_b_gen{collapsed_generation}.json")
+    # the per-run, per-generation verification files are named inside sweep_run
     report_file = os.path.join(report_dir, f"transfer_gen{collapsed_generation}.json")
 
-    # ── stage 4: search a suffix against run A ─────────────────────────────────────────────────
+    # ── stage 3: search a suffix against run A ─────────────────────────────────────────────────
+    # the only optimization in the experiment. It sees run A's checkpoint and nothing else, and
+    # its output is frozen from here on: stages 5 and 6 only ever *evaluate* these strings
     results_a = attack_results_file(path_a, collapsed_generation, specifier_name)
-    print_stage(4, 6, "attack run A", f"generation {collapsed_generation}")
+    print_stage(3, 6, "attack run A", f"generation {collapsed_generation}")
     if os.path.isfile(results_a) and not force:
         print(f"## {TColors.OKGREEN}skipped{TColors.ENDC}: {results_a} already exists")
     else:
@@ -622,46 +732,34 @@ def main(
         f"{len({c['task'] for c in candidates})} task(s) -> {suffix_file}"
     )
 
-    # ── stage 5: the control — do the suffixes still work on their own run? ────────────────────
-    # this is what makes stage 6 readable. Verification is greedy and therefore deterministic, so
-    # a suffix the attack recorded as a hit has to reproduce here; one that does not indicates the
-    # checkpoint or the decoding changed under it, and it must not be counted as a transfer
-    # failure. It also re-runs the verdict through the same code path as stage 6, so the two
-    # numbers are produced identically rather than one being read out of the attack's own log
-    print_stage(5, 6, "control: re-verify the suffixes against run A")
-    if os.path.isfile(control_file) and not force:
-        print(f"## {TColors.OKGREEN}skipped{TColors.ENDC}: {control_file} already exists")
-    else:
-        run_stage(
-            verify_command(
-                path_a, collapsed_generation, block_size, suffix_file, control_file,
-                f"run A (seed {seed_a}, the run the suffixes were found on)",
-                max_new_tokens, repetition_penalty, exec_timeout,
-            ),
-            "control verification against run A",
-        )
+    # ── stage 4: collapse run B, the held out run ──────────────────────────────────────────────
+    # trained only now, after the suffixes exist and are frozen. Nothing that produced them could
+    # have depended on it, which is what makes stage 6 a transfer measurement rather than a fit
+    collapse(4, "B", path_b, seed_b)
 
-    # ── stage 6: the actual question ───────────────────────────────────────────────────────────
-    print_stage(6, 6, "transfer: verify the suffixes against run B")
-    if os.path.isfile(target_file) and not force:
-        print(f"## {TColors.OKGREEN}skipped{TColors.ENDC}: {target_file} already exists")
-    else:
-        run_stage(
-            verify_command(
-                path_b, collapsed_generation, block_size, suffix_file, target_file,
-                f"run B (seed {seed_b}, the newly collapsed run)",
-                max_new_tokens, repetition_penalty, exec_timeout,
-            ),
-            "transfer verification against run B",
+    # ── stages 5 and 6: sweep both runs over every generation up to the attacked one ───────────
+    # the suffixes are frozen, so each cell is the same question asked of a different checkpoint.
+    # Run A is swept as well as run B, and not only as a control: its cell at the attacked
+    # generation is the validity anchor, while its shallower generations give the within-run
+    # baseline that makes run B's column readable. Without it, a hit at run B generation 3 cannot
+    # be told apart from "generation-3 models are easy"
+    swept = list(range(collapsed_generation + 1))
+    sweeps = {}
+    for index, (label, path, seed) in enumerate(
+        (("a", path_a, seed_a), ("b", path_b, seed_b)), start=5
+    ):
+        print_stage(
+            index, 6, f"sweep run {label.upper()}",
+            f"generations {swept[0]}..{swept[-1]}"
+            + (" (anchor + within-run baseline)" if label == "a" else " (cross-run transfer)"),
+        )
+        sweeps[label] = sweep_run(
+            label, path, seed, swept, block_size, suffix_file, report_dir,
+            max_new_tokens, repetition_penalty, exec_timeout, force,
         )
 
     # ── the report ─────────────────────────────────────────────────────────────────────────────
-    with open(control_file, "r", encoding="utf-8") as handle:
-        control = json.load(handle)
-    with open(target_file, "r", encoding="utf-8") as handle:
-        target = json.load(handle)
-
-    report = summarize(control, target, seed_a, seed_b)
+    report = summarize(sweeps, seed_a, seed_b, collapsed_generation)
     report["collapsed_generation"] = collapsed_generation
     report["num_generations"] = num_generations
     report["block_size"] = block_size
@@ -684,40 +782,94 @@ def main(
         "inconclusive": TColors.WARNING,
         "void": TColors.FAIL,
     }
-    for row in report["rows"]:
-        print(
-            f"##   [{row['task']}] {colours[row['verdict']]}{TColors.BOLD}"
-            f"{row['verdict'].upper()}{TColors.ENDC} "
-            f"run_a={row['run_a_outcome']} run_b={row['run_b_outcome']} "
-            f"suffix={row['suffix']!r}"
-        )
+    marks = {"transferred": "T", "held": "H", "inconclusive": "?", "void": "x"}
 
-    rate = report["transfer_rate"]
+    # one row per suffix, one column per generation. The sweep is a curve rather than a set of
+    # unrelated results — the same frozen suffix against progressively deeper collapse — and a
+    # grid is what makes that depth dependence readable at a glance
+    # two lines per suffix, one per run, so the same generation of the two trajectories sits in the
+    # same column. Reading down a column compares the runs at equal collapse depth; reading along
+    # the A line shows how far the suffix reaches without changing run at all
+    by_candidate = {}
+    for row in report["rows"]:
+        by_candidate.setdefault((row["task"], row["suffix"]), {})[
+            (row["run"], row["generation"])
+        ] = row
+    label_width = 44
+    print(f"##   {'task / suffix':<{label_width}} run  gen: " + " ".join(f"{g:>2}" for g in swept))
+    for (task, suffix), cells in by_candidate.items():
+        label = f"{task} {suffix!r}"
+        label = label if len(label) <= label_width else label[: label_width - 1] + "…"
+        for line, run_label in enumerate(("a", "b")):
+            painted = " ".join(
+                f"{colours[cells[(run_label, g)]['verdict']]}"
+                f"{marks[cells[(run_label, g)]['verdict']]:>2}{TColors.ENDC}"
+                for g in swept
+            )
+            print(
+                f"##   {(label if line == 0 else ''):<{label_width}} "
+                f"{run_label.upper():<3}      {painted}"
+            )
+    print(
+        f"##   {TColors.OKGREEN}T{TColors.ENDC} works   "
+        f"{TColors.OKBLUE}H{TColors.ENDC} held   "
+        f"{TColors.WARNING}?{TColors.ENDC} inconclusive   "
+        f"{TColors.FAIL}x{TColors.ENDC} void\n"
+        f"##   A = the run the suffix was found on, B = the independent run"
+    )
+
+    print(
+        f"##\n##   {'gen':>4}   {'A: works':>9} {'held':>5} {'?':>3} {'rate':>6}   "
+        f"{'B: works':>9} {'held':>5} {'?':>3} {'rate':>6}"
+    )
+    for generation in swept:
+        cells = []
+        for label in ("a", "b"):
+            stats = report["by_run"][label][generation]
+            rate = stats["transfer_rate"]
+            cells.append(
+                f"{stats['n_transferred']:>9} {stats['n_held']:>5} "
+                f"{stats['n_inconclusive']:>3} "
+                f"{('n/a' if rate is None else f'{rate:.0%}'):>6}"
+            )
+        marker = (
+            f"  {TColors.BOLD}<- attacked{TColors.ENDC}"
+            if generation == collapsed_generation
+            else ""
+        )
+        print(f"##   {generation:>4}   {cells[0]}   {cells[1]}{marker}")
+
+    matched = report["matched_generation"] or {}
+    matched_rate = matched.get("transfer_rate")
+    totals = report["totals"]
     print(
         f"##\n"
-        f"##   candidates:            {report['n_candidates']}\n"
+        f"##   suffixes:              {report['n_suffixes']}\n"
         f"##   reproduced on run A:   {report['n_reproduced_on_run_a']}\n"
-        f"##   {TColors.OKGREEN}transferred to run B:  {report['n_transferred']}{TColors.ENDC}\n"
-        f"##   held (did not break):  {report['n_held']}\n"
-        f"##   inconclusive:          {report['n_inconclusive']} "
-        f"(run B already failed the task with no suffix)\n"
-        f"##   void:                  {report['n_void']} (did not reproduce on run A)\n"
-        f"##   transfer rate:         "
-        f"{'n/a' if rate is None else f'{rate:.0%}'} of the decidable candidates"
+        f"##   {TColors.BOLD}cross-run transfer at the attacked generation "
+        f"{collapsed_generation}: "
+        f"{'n/a' if matched_rate is None else f'{matched_rate:.0%}'}{TColors.ENDC} "
+        f"({matched.get('n_transferred', 0)}/{matched.get('n_decidable', 0)} decidable)"
     )
-    if report["n_inconclusive"]:
+    inconclusive = ", ".join(
+        f"{totals[label]['n_inconclusive']} in run {label.upper()}"
+        for label in ("a", "b")
+        if totals[label]["n_inconclusive"]
+    )
+    if inconclusive:
         print(
-            f"##\n## {TColors.WARNING}{report['n_inconclusive']} candidate(s) are "
-            f"inconclusive{TColors.ENDC}: run B's generation-{collapsed_generation} model already "
-            f"fails those tasks without any suffix, so nothing can be attributed to the suffix. "
-            f"Attack an earlier generation if this dominates the result."
+            f"##\n## {TColors.WARNING}Inconclusive cells ({inconclusive}){TColors.ENDC}: that run "
+            f"already fails those tasks at that generation with no suffix at all, so nothing can "
+            f"be attributed to the suffix. They are excluded from every rate rather than counted "
+            f"as failures."
         )
-    if report["n_void"]:
+    n_void_suffixes = report["n_suffixes"] - report["n_reproduced_on_run_a"]
+    if n_void_suffixes:
         print(
-            f"##\n## {TColors.FAIL}{report['n_void']} candidate(s) did not reproduce on run "
-            f"A{TColors.ENDC}. Verification is greedy, so this should not happen — check that "
-            f"run A's checkpoint was not overwritten and that --max_new_tokens matches the "
-            f"attack's."
+            f"##\n## {TColors.FAIL}{n_void_suffixes} suffix(es) did not reproduce on run "
+            f"A{TColors.ENDC}, so they are void at every generation. Verification is greedy, so "
+            f"this should not happen — check that run A's checkpoint was not overwritten and that "
+            f"--max_new_tokens matches the attack's."
         )
     print(f"##\n## {TColors.OKBLUE}{TColors.BOLD}Report: {report_file}{TColors.ENDC}")
     print("═" * width + "\n")
@@ -762,9 +914,12 @@ if __name__ == "__main__":
         "-cg",
         type=int,
         default=-1,
-        help="generation to attack and to transfer into. -1 probes for the latest generation at "
-        "which BOTH runs can still solve --min_usable_tasks tasks unaided, which is not the last "
-        "one: a fully collapsed model solves nothing, and then the attack aborts on its own "
+        help="generation of run A to attack; the frozen suffixes are then tested against run B at "
+        "every generation from 0 up to and including it, so one run yields the whole depth curve "
+        "rather than a single point. -1 probes for the latest generation at "
+        "which RUN A can still solve --min_usable_tasks tasks unaided — run B is held out and "
+        "never consulted. It is not the last generation: a fully collapsed model solves nothing, "
+        "and then the attack aborts on its own "
         "capability gate and every transfer verdict would be inconclusive anyway (default: -1)",
     )
     parser.add_argument(
@@ -858,8 +1013,10 @@ if __name__ == "__main__":
         "-mut",
         type=int,
         default=1,
-        help="how many tasks both runs must still solve unaided for a generation to be picked by "
-        "the probe. Only read when --collapsed_generation is -1 (default: 1)",
+        help="how many tasks RUN A must still solve unaided for a generation to be picked by the "
+        "probe. Run B is held out and never consulted, so it may be incapable at the chosen "
+        "generation — that is reported as inconclusive. Only read when --collapsed_generation "
+        "is -1 (default: 1)",
     )
     parser.add_argument(
         "--with_eval",

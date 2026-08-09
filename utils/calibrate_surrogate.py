@@ -34,6 +34,7 @@ import statistics
 
 import torch
 from datasets import load_dataset
+from transformers import AutoConfig
 
 from utils.colors import TColors
 from utils.extrapolation import calibration_file
@@ -285,7 +286,11 @@ def main(
     # slightly different one
     model_base, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_specifier,
-        max_seq_length=int(block_size * 2),
+        # prompt + block_size new tokens, not block_size. `block_size * 2` was already an attempt
+        # at that headroom, but it is not enough at --block_size 512: the longest instructions run
+        # to ~1300 tokens, past the 1024 it allows, and unsloth then builds its causal mask too
+        # small and generate() raises a tensor size mismatch. The model's own context always fits
+        max_seq_length=AutoConfig.from_pretrained(model_specifier).max_position_embeddings,
         dtype=None,
         load_in_4bit=load_in_4bit,
     )
@@ -305,7 +310,11 @@ def main(
         )
     model_collapsed, _ = FastLanguageModel.from_pretrained(
         model_name=collapsed_path,
-        max_seq_length=int(block_size * 2),
+        # prompt + block_size new tokens, not block_size. `block_size * 2` was already an attempt
+        # at that headroom, but it is not enough at --block_size 512: the longest instructions run
+        # to ~1300 tokens, past the 1024 it allows, and unsloth then builds its causal mask too
+        # small and generate() raises a tensor size mismatch. The model's own context always fits
+        max_seq_length=AutoConfig.from_pretrained(model_specifier).max_position_embeddings,
         dtype=None,
         load_in_4bit=load_in_4bit,
     )

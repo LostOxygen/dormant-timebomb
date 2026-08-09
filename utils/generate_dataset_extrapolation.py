@@ -40,6 +40,7 @@ from datasets import Dataset
 from tqdm import tqdm
 import torch
 from transformers import (
+    AutoConfig,
     LogitsProcessor,
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
@@ -293,6 +294,22 @@ print(
     f"(method: {method}, n = {generation_n})"
 )
 
+# max_seq_length has to hold the prompt *plus* the generated response, while --block_size caps only
+# the response — it is max_new_tokens further down. Passing block_size here conflated the two, which
+# was invisible at --block_size 2048 (no prompt in this dataset reaches that) and fails at 512: the
+# instructions run up to ~1300 tokens, so a batch containing one of them is longer than the causal
+# mask unsloth builds for max_seq_length, and generate() dies inside the mask shim with
+#
+#     RuntimeError: The size of tensor a (512) must match the size of tensor b (841)
+#
+# Only ~0.2% of prompts are that long, so it surfaced 16 batches into a shard rather than at once.
+# The model's own trained context is the budget: it always covers prompt + block_size, and using
+# exactly max_position_embeddings rather than something larger avoids tripping unsloth's RoPE
+# extension, so the decoding stays the one the histograms were produced with. The vLLM path reaches
+# the same place from the other side, sizing max_model_len off the actual prompts plus block_size
+# (utils/generate_dataset.py::generate_vllm)
+max_seq_length = AutoConfig.from_pretrained(MODEL_SPECIFIER).max_position_embeddings
+
 # use the model to generate the new dataset
 # for this, the model is loaded again with the quantized weights
 model_collapsed = None
@@ -303,7 +320,7 @@ if method == "logit":
     # direction through the logits processor further down. Both have to be resident
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_SPECIFIER,
-        max_seq_length=block_size,
+        max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,
     )
@@ -311,7 +328,7 @@ if method == "logit":
 
     model_collapsed, _ = FastLanguageModel.from_pretrained(
         model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
-        max_seq_length=block_size,
+        max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,
     )
@@ -329,7 +346,7 @@ elif method == "lora":
         )
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=adapter_path,
-        max_seq_length=block_size,
+        max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,
     )
@@ -341,7 +358,7 @@ else:
     # imitated at the level of the sampling that produces the corpus
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=MODEL_SPECIFIER,
-        max_seq_length=block_size,
+        max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,
     )

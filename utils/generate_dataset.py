@@ -214,7 +214,13 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_dir,
-        max_seq_length=block_size,
+        # the prompt *plus* block_size new tokens has to fit, so this is not block_size — that
+        # caps only the response. At --block_size 512 the longest instructions (~1300 tokens)
+        # otherwise exceed the causal mask unsloth sizes from max_seq_length and generate() fails
+        # with "The size of tensor a (512) must match the size of tensor b (841)". The model's own
+        # context always covers it, and using exactly max_position_embeddings keeps unsloth from
+        # applying RoPE extension. The vLLM path above derives the same bound from the prompts
+        max_seq_length=AutoConfig.from_pretrained(model_dir).max_position_embeddings,
         dtype=None,
         # a 0.5B model needs ~1GB in bf16 on a 48GB card, so 4bit only adds a dequantization
         # kernel to every forward pass without buying any headroom
