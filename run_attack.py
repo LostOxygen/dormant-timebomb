@@ -2059,7 +2059,7 @@ if __name__ == "__main__":
         "--restarts",
         "-r",
         type=int,
-        default=1,
+        default=3,
         help="random suffix re-initializations per task (default: 1)",
     )
     parser.add_argument(
