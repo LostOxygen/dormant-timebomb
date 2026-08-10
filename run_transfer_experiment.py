@@ -7,6 +7,7 @@ import datetime
 import getpass
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -67,10 +68,7 @@ def attack_results_file(path: str, generation: int, specifier_name: str) -> str:
 
 def print_stage(index: int, total: int, title: str, detail: str = "") -> None:
     """Prints a stage banner. Mirrors the banner style of the other orchestrators."""
-    try:
-        width = os.get_terminal_size().columns
-    except OSError:
-        width = 80
+    width = shutil.get_terminal_size().columns
     print("\n" + "═" * width)
     print(
         f"## {TColors.HEADER}{TColors.BOLD}Stage {index}/{total}: {title}{TColors.ENDC}"
@@ -628,10 +626,7 @@ def main(
     report_dir = os.path.join(root, "transfer_report")
     os.makedirs(report_dir, exist_ok=True)
 
-    try:
-        width = os.get_terminal_size().columns
-    except OSError:
-        width = 80
+    width = shutil.get_terminal_size().columns
     print("\n" + "═" * width)
     print(
         f"## {TColors.BOLD}Cross-run adversarial suffix transfer{TColors.ENDC}\n"

@@ -59,8 +59,11 @@ DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 # has to match utils/generate_dataset.py and utils/calibrate_surrogate.py: stage 1 and stage 2 are
-# plotted against each other, so a difference in the decoding is a difference in what is compared
-REPETITION_PENALTY: float = 3.0
+# plotted against each other, so a difference in the decoding is a difference in what is compared.
+# See utils/generate_dataset.py for the measurements behind the value: at 3.0 the penalty stops the
+# model reusing identifiers it has already written and only 7.8% of responses still compile,
+# against 96.9% at 1.2 and 100% for the human corpus
+REPETITION_PENALTY: float = 1.2
 
 class UnslothExtrapolationProcessor(LogitsProcessor):
     def __init__(self, model_collapsed, generation_n: float, prompt_attention_mask: torch.Tensor):
@@ -484,7 +487,7 @@ for start in tqdm(
         # this pipeline measures — and it would do so unevenly across the three methods
         do_sample=True,
         num_beams=1,
-        # repetition_penalty is not passed here: it is REPETITION_PENALTY (3.0) for every method,
+        # repetition_penalty is not passed here: it is REPETITION_PENALTY for every method,
         # but *where* it is applied differs, so both branches above set it in sampling_kwargs
         # instead. Its cost is accepted knowingly — the responses are scored by an unpenalized
         # forward pass, so the penalty makes the measured perplexity partly a property of the

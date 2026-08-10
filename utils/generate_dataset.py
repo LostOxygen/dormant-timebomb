@@ -66,6 +66,28 @@ MODEL_PATH: str = "./model_outputs/"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
 # EOS is suppressed for this many tokens, so every response is at least this long
 MIN_NEW_TOKENS: int = 128
+# Applied by both engine paths below, and has to match utils/generate_dataset_extrapolation.py and
+# utils/calibrate_surrogate.py: stage 1 and stage 2 are plotted against each other, so a
+# difference in the decoding is a difference in what is being compared.
+#
+# The value matters far more than it looks. The penalty divides the logit of every token already
+# in the context, and code legitimately repeats tokens constantly — indentation, keywords,
+# identifiers, brackets. Set too high it stops the model reusing names it has already written, so
+# it invents new ones mid-function and the output stops being Python at all. Measured on the base
+# model over 64 instructions of DATASET_SPECIFIER: share of responses that compile, and the mean
+# share of whitespace tokens per response that are unique (the human corpus is the target).
+#
+#     penalty      3.0     1.5     1.2     1.1     1.0    | human corpus
+#     compiles    7.8%   25.0%   96.9%   98.4%   96.9%    |       100%
+#     unique     0.971   0.918   0.669   0.612   0.574    |      0.690
+#
+# 1.2 is where both statistics land on the human corpus at once: below it the model repeats more
+# than a human does, above it syntactic validity falls off a cliff. At the old value of 3.0 the
+# *first* synthetic generation already came out at 10.5% compiling, i.e. the corpus was ruined by
+# the decoding before recursive training had done anything, and generations 1..9 then only fell
+# from 10.5% to 1.5%. That made the models lose code generation within two generations, which
+# leaves run_attack.py's capability gate nothing to attack.
+REPETITION_PENALTY: float = 1.2
 
 
 def format_prompts(instructions: list, tokenizer) -> list:
@@ -149,15 +171,16 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
-        # pinned to 3.0, matching the transformers path and generate_dataset_extrapolation.py.
-        # This value is a deliberate experimental choice with a known cost: the responses are
-        # scored by an *unpenalized* forward pass in calculate_perplexity.py, so the penalty makes
-        # the measured perplexity partly a property of the sampling distortion rather than of the
-        # model, and because it divides the logit of every token already in the context its
-        # severity grows with the response length — which grows with every generation, so the
-        # distortion is not a constant offset across the collapse trend. Keep it identical in
-        # every generation path or the histograms stop being comparable
-        repetition_penalty=3.0,
+        # matching the transformers path and generate_dataset_extrapolation.py — see
+        # REPETITION_PENALTY for why the value is what it is. Any value above 1.0 still carries a
+        # known cost: the responses are scored by an *unpenalized* forward pass in
+        # calculate_perplexity.py, so the penalty makes the measured perplexity partly a property
+        # of the sampling distortion rather than of the model, and because it divides the logit of
+        # every token already in the context its severity grows with the response length — which
+        # grows with every generation, so the distortion is not a constant offset across the
+        # collapse trend. Keep it identical in every generation path or the histograms stop being
+        # comparable
+        repetition_penalty=REPETITION_PENALTY,
         min_tokens=MIN_NEW_TOKENS,
         max_tokens=block_size,
         # vLLM returns only the continuation, so unlike the transformers path there is no prompt
@@ -266,9 +289,9 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
         # distribution, so the decoding has to be plain multinomial sampling. Beam search
         # (num_beams > 1) would optimize for likelihood and systematically narrow the output
         # distribution, which suppresses exactly the effect this pipeline measures.
-        # repetition_penalty is pinned to 3.0, matching the vLLM path above. It is set here rather
-        # than inherited so the two engines sample from the same distribution, and its cost is
-        # accepted knowingly: calculate_perplexity.py scores these responses with an unpenalized
+        # repetition_penalty is REPETITION_PENALTY, matching the vLLM path above. It is set here
+        # rather than inherited so the two engines sample from the same distribution, and its cost
+        # is accepted knowingly: calculate_perplexity.py scores these responses with an unpenalized
         # forward pass, so the penalty makes the measured perplexity partly a property of the
         # sampling distortion rather than of the model, and since it divides the logit of every
         # token already in the context, its severity grows with the response length — which grows
@@ -282,7 +305,7 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
-                repetition_penalty=3.0,
+                repetition_penalty=REPETITION_PENALTY,
                 min_new_tokens=MIN_NEW_TOKENS,
                 max_new_tokens=block_size,
                 use_cache=True,

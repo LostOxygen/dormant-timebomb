@@ -6,6 +6,7 @@ import argparse
 import datetime
 import getpass
 import os
+import shutil
 import subprocess
 import time
 from datetime import timedelta
@@ -68,6 +69,62 @@ def format_prompt(examples: dict) -> dict:
     return {"text": prompts}
 
 
+def mix_real_data(
+    synthetic: Dataset, real: Dataset, fraction: float, seed: int, generation: int
+) -> Dataset:
+    """Replaces `fraction` of a generation's synthetic corpus with original human examples.
+
+    This is the dial on how hard the collapse bites. With `fraction` at 0 every generation trains
+    exclusively on the previous generation's output — the "replace" regime, which degrades without
+    bound and, in this pipeline, costs the models the ability to write code at all within a couple
+    of generations. Keeping some real data in the mix bounds the degradation instead, so the later
+    generations still drift but stay capable enough that an attack on them means something.
+
+    The corpus *size* is held constant rather than grown: only the composition changes, so every
+    generation sees the same number of training examples and the same number of optimizer steps.
+    That keeps the collapse curve attributable to the data mixture instead of to a changing
+    training budget.
+
+    The real slice is redrawn every generation rather than fixed once. The premise is that whoever
+    runs the pipeline holds the whole human corpus, not one frozen sample of it, and redrawing
+    stops a single unlucky slice from being memorized over and over across ten generations.
+
+    Args:
+        synthetic (Dataset): the previous generation's generated corpus, already chat-formatted
+        real (Dataset): the original human corpus, already chat-formatted
+        fraction (float): share of the returned corpus taken from `real`, in [0, 1]
+        seed (int): run seed, so the draw is reproducible
+        generation (int): current generation, mixed into the shuffle seed
+
+    Returns:
+        Dataset: a corpus of len(synthetic) rows, `fraction` of them real, shuffled together
+    """
+    if fraction <= 0:
+        return synthetic
+
+    n_total = len(synthetic)
+    n_real = min(round(fraction * n_total), len(real))
+    if n_real == 0:
+        return synthetic
+
+    # concatenate_datasets matches on the arrow schema, and the two corpora carry the same columns
+    # in a different order (the generated one is built from instruction/response, the original one
+    # gained "text" last), so the column order is normalized before they are joined
+    real = real.select_columns(synthetic.column_names)
+
+    shuffle_seed = seed + generation
+    real_part = real.shuffle(seed=shuffle_seed).select(range(n_real))
+    synthetic_part = synthetic.shuffle(seed=shuffle_seed).select(range(n_total - n_real))
+    mixed = concatenate_datasets([synthetic_part, real_part]).shuffle(seed=shuffle_seed)
+
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Mixed in real data{TColors.ENDC}: "
+        f"{n_real} original + {n_total - n_real} generated = {len(mixed)} rows "
+        f"({n_real / len(mixed):.1%} real)"
+    )
+    return mixed
+
+
 def make_splits(dataset: Dataset) -> Dataset:
     """Splits the dataset into training and validation sets"""
     # split the dataset into training and validation sets
@@ -93,6 +150,7 @@ def main(
     model_specifier: str = "",
     continue_from_generation: int = 0,
     dataset_size: int = 0,
+    real_data_fraction: float = 0.0,
     seed: int = 1337,
     learning_rate: float = 2e-4,
     lora_rank: int = 16,
@@ -129,6 +187,12 @@ def main(
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
         dataset_size (int): number of dataset samples to use, taken from the front of the
             upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
+        real_data_fraction (float): share of every post-generation-0 training corpus taken from
+            the *original* human dataset instead of the previous generation's output, in [0, 1].
+            0.0 is pure self-training, which collapses fastest and loses code generation
+            entirely within a couple of generations; higher values bound the degradation so the
+            later generations still drift but stay capable enough to be worth attacking. The
+            corpus size is unchanged, only its composition
         seed (int): seed of the whole collapse trajectory, threaded into the training worker and
             into the sampling seed of every generation worker. Two runs that differ only in this
             produce two independent collapse trajectories from identical hyperparameters
@@ -208,6 +272,20 @@ def main(
     init_suffix = "_freshinit" if fresh_init else "_recursive"
     init_label = "fresh weights" if fresh_init else "recursive weights"
 
+    if not 0.0 <= real_data_fraction < 1.0:
+        raise SystemExit(
+            f"--real_data_fraction must be in [0, 1), got {real_data_fraction}. At 1.0 every "
+            f"generation would train on the human corpus alone and nothing would collapse."
+        )
+    # the data mixture goes into the names for the same reason the weight lineage does: it changes
+    # the collapse curve, and plots/ sits outside --path so the file name is the only thing keeping
+    # two runs' figures apart. Appended only when non-zero, so a pure self-training run keeps
+    # writing (and --histogram_only keeps finding) exactly the artifact names it always had
+    data_suffix = "" if real_data_fraction <= 0 else f"_rdf{real_data_fraction:g}"
+    run_suffix = f"{init_suffix}{data_suffix}"
+    # no underscores or backslashes: usetex renders the title, and a bare % is a LaTeX comment
+    run_label = f"{init_label}, real data fraction {real_data_fraction:g}"
+
     # allow tf32 for the matmuls of the training stage. The L40S' tensor cores run tf32 at
     # multiples of the fp32 rate and this only affects the fp32 fallbacks, not the bf16 path
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -271,7 +349,7 @@ def main(
         "\n"
         + f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}System Information"
         + f"{TColors.ENDC} "
-        + "#" * (os.get_terminal_size().columns - 23)
+        + "#" * (shutil.get_terminal_size().columns - 23)
     )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Date{TColors.ENDC}: "
@@ -307,7 +385,7 @@ def main(
     print(
         f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Parameters"
         + f"{TColors.ENDC} "
-        + "#" * (os.get_terminal_size().columns - 14)
+        + "#" * (shutil.get_terminal_size().columns - 14)
     )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {MODEL_SPECIFIER}"
@@ -340,6 +418,20 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Weight lineage{TColors.ENDC}: {init_label} "
         f"({'--fresh_init' if fresh_init else 'previous generation is fine-tuned further'})"
     )
+    # how much of the collapse loop is fed back into itself, i.e. how fast the models degrade
+    if real_data_fraction > 0:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Real data fraction{TColors.ENDC}: "
+            f"{real_data_fraction:g} — every generation after 0 trains on "
+            f"{1 - real_data_fraction:.0%} previous-generation output and "
+            f"{real_data_fraction:.0%} original human data"
+        )
+    else:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Real data fraction{TColors.ENDC}: 0 — pure "
+            f"self-training, the fastest collapse (raise it if the models lose code generation "
+            f"before the generation you want to attack)"
+        )
     # printed because unsloth silently rewrites CUDA_VISIBLE_DEVICES to a single device at import,
     # which used to collapse this list to [0] without any sign of it in the output
     print(
@@ -362,7 +454,7 @@ def main(
             f"## {TColors.OKBLUE}{TColors.BOLD}Continue from Generation{TColors.ENDC}: "
             f"{continue_from_generation}"
         )
-    print("#" * os.get_terminal_size().columns + "\n")
+    print("#" * shutil.get_terminal_size().columns + "\n")
 
     # print information about the dataset
     print(f"Max token count: {max(token_counts)}")
@@ -414,6 +506,12 @@ def main(
                     + f"generated_dataset_{gen_id - 1}_bs{block_size}_{specifier_name}"
                 )
                 dataset = dataset.map(format_prompt, batched=True)
+                # --real_data_fraction of it is swapped back for original human examples. Only
+                # generations above 0 are affected: generation 0 trains on the human corpus by
+                # definition, so there is nothing to mix in there
+                dataset = mix_real_data(
+                    dataset, chunked_dataset, real_data_fraction, seed, gen_id
+                )
             else:
                 # for first iteration (gen_id = 0) take the original dataset
                 dataset = chunked_dataset
@@ -653,48 +751,49 @@ def main(
                 for perplexity in values
             ]
 
-            # save the perplexity dict to a file. The init_suffix keeps the two weight lineages
-            # from overwriting each other's cache, so both can be replotted with -ho and the -ho
-            # of one mode can never silently replot the other mode's numbers
+            # save the perplexity dict to a file. The run_suffix keeps the weight lineages and
+            # data mixtures from overwriting each other's cache, so each can be replotted with -ho
+            # and the -ho of one configuration can never silently replot another's numbers
             torch.save(
                 perplexity_dict,
                 DATASET_PATH
-                + f"perplexity_dict_bs{block_size}_{specifier_name}{init_suffix}.pt",
+                + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt",
             )  # save the dict to a file
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
                 f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}"
-                f"{init_suffix}.pt{TColors.ENDC}"
+                f"{run_suffix}.pt{TColors.ENDC}"
             )
             # save the all_perplexities list to a file
             torch.save(
                 all_perplexities,
                 DATASET_PATH
-                + f"all_perplexities_bs{block_size}_{specifier_name}{init_suffix}.pt",
+                + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt",
             )  # save the list to a file
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
                 f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}"
-                f"{init_suffix}.pt{TColors.ENDC}"
+                f"{run_suffix}.pt{TColors.ENDC}"
             )
         else:
             # load the perplexity dict and all_perplexities list from the files. -ho therefore
-            # needs the same --fresh_init the run was produced with, and says so rather than
-            # replotting whichever mode happens to be cached
+            # needs the same --fresh_init and --real_data_fraction the run was produced with, and
+            # says so rather than replotting whichever configuration happens to be cached
             cached_dict = (
                 DATASET_PATH
-                + f"perplexity_dict_bs{block_size}_{specifier_name}{init_suffix}.pt"
+                + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt"
             )
             if not os.path.exists(cached_dict):
                 raise FileNotFoundError(
                     f"{cached_dict} does not exist. --histogram_only replots the cache of a run "
-                    f"with the same --block_size, --model_specifier and --fresh_init ("
-                    f"{'set' if fresh_init else 'not set'} here)"
+                    f"with the same --block_size, --model_specifier, --fresh_init "
+                    f"({'set' if fresh_init else 'not set'} here) and --real_data_fraction "
+                    f"({real_data_fraction:g} here)"
                 )
             perplexity_dict = torch.load(cached_dict)
             all_perplexities = torch.load(
                 DATASET_PATH
-                + f"all_perplexities_bs{block_size}_{specifier_name}{init_suffix}.pt"
+                + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt"
             )
 
         # ────────────────── plot the perplexity histogram ─────────────────────────
@@ -778,12 +877,18 @@ def main(
 
         plt.xlabel("Perplexity", fontweight="bold")
         plt.ylabel("Probability", fontweight="bold")
-        # the weight lineage goes in the title, because the two modes produce different collapse
-        # curves from the same data and a figure that does not say which one it is cannot be
-        # compared against the other. No underscores or backslashes in here — usetex is on, so the
-        # title is rendered by LaTeX
+        # the weight lineage and the real-data fraction go in the title, because both change the
+        # collapse curve for the same input data and a figure that does not say which it is cannot
+        # be compared against the other. No underscores or backslashes in here — usetex is on, so
+        # the title is rendered by LaTeX.
+        #
+        # The run_label sits on its own second line rather than in one long title: at figsize
+        # (10, 6) with font.size 22 the single-line version measured 1081px against a 1000px
+        # figure, so LaTeX rendered it clipped — and since the label is the tail of the string, the
+        # part that silently disappeared was exactly the fraction this is here to record. Two lines
+        # take the worst case (fresh weights, three-digit fraction) to 64% of the figure width
         plt.title(
-            f"Perplexity without extrapolation ({init_label})", fontweight="bold"
+            f"Perplexity without extrapolation\n({run_label})", fontweight="bold"
         )
         plt.legend(loc="upper right")
 
@@ -797,10 +902,11 @@ def main(
             os.makedirs("plots/")
 
         # plots/ deliberately sits outside --path, so the file name is the only thing separating
-        # two runs' figures. Without the init_suffix a fresh-init run silently overwrites the
-        # recursive run's figure even when the two used different --path directories
+        # two runs' figures. Without the run_suffix a fresh-init run, or a run with a different
+        # --real_data_fraction, silently overwrites the other's figure even when the two used
+        # different --path directories
         plot_stem = (
-            f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{init_suffix}"
+            f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}"
         )
         plt.savefig(f"{plot_stem}.pdf")
         plt.savefig(f"{plot_stem}.png")
@@ -925,6 +1031,19 @@ if __name__ == "__main__":
         "the upstream 50k dataset; 0 uses all of it. run_baseline.py and run_extrapolation.py "
         "must be given the same value, otherwise their histograms describe different data "
         "(default: 0, the whole dataset)",
+    )
+    parser.add_argument(
+        "--real_data_fraction",
+        "-rdf",
+        type=float,
+        default=0.0,
+        help="share of every training corpus after generation 0 taken from the original human "
+        "dataset instead of the previous generation's output, in [0, 1). 0 is pure self-training "
+        "and collapses fastest — the models lose code generation within about two generations, "
+        "which leaves run_attack.py's capability gate nothing to attack. Raising it bounds the "
+        "degradation so later generations still drift but stay capable. The corpus size does not "
+        "change, only its composition. Non-zero values are recorded in the perplexity cache and "
+        "plot file names, and the value is shown in the plot title (default: 0.0)",
     )
     parser.add_argument(
         "--seed",
