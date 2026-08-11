@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 #
-# Sweeps run_attack.py over collapse generations 0..N with the logit surrogate.
+# Sweeps run_attack.py over collapse generations 0..N, with or without a surrogate.
 #
-# Each generation is attacked in transfer mode: the suffix is optimized against a surrogate built
-# from the base model and the generation-0 checkpoint alone, then validated against the real
-# checkpoint of the generation being swept. One run_attack.py invocation per generation, each
-# logged separately, followed by a summary table.
+# With --method logit (the default) or lora, each generation is attacked in transfer mode: the
+# suffix is optimized against a surrogate built from the base model and the generation-0 checkpoint
+# alone, then validated against the real checkpoint of the generation being swept. One
+# run_attack.py invocation per generation, each logged separately, followed by a summary table.
 #
-# Generation 0 is skipped by design, not by accident: in transfer mode the surrogate is built
-# *from* generation 0, so attacking generation 0 would validate a suffix against the very
-# checkpoint it was derived from. run_attack.py rejects that combination outright. Pass
-# --start 1 to drop it from the sweep silently, or --direct-gen0 to attack it without a
-# surrogate instead.
+# With --method none there is no surrogate: every generation is attacked directly against its own
+# real checkpoint. That is the white-box upper bound the transfer numbers are read against — it
+# answers "is this generation attackable at all", separately from "does the surrogate find it".
+# A hit here but not in transfer mode is a surrogate limitation; no hit in either is the
+# generation's own resistance (or, per the summary's capability column, its collapse).
+#
+# Generation 0 is skipped by design in a surrogate sweep, not by accident: in transfer mode the
+# surrogate is built *from* generation 0, so attacking generation 0 would validate a suffix against
+# the very checkpoint it was derived from. run_attack.py rejects that combination outright. Pass
+# --start 1 to drop it from the sweep silently, or --direct-gen0 to attack it without a surrogate
+# instead. Under --method none there is no anchor to collide with, so generation 0 is swept like
+# any other generation and --direct-gen0 is redundant.
 #
 # The capability gate stops individual generations that have collapsed past the point of writing
 # correct code at all. That is an expected outcome, not a failure: the sweep records it and keeps
@@ -37,7 +44,7 @@ EXTRA_ARGS=()
 
 usage() {
     cat <<'EOF'
-Sweeps run_attack.py over collapse generations with the logit surrogate.
+Sweeps run_attack.py over collapse generations, with or without a surrogate.
 
 Required:
   -n, --num-generations N   highest generation index to attack (sweeps 0..N inclusive)
@@ -46,7 +53,11 @@ Options:
   -p, --path PATH           root holding model_outputs/ and attack_results/ (default: .)
   -b, --block-size N        effective block size in the checkpoint names (default: 512)
   -s, --start G             first generation to attack (default: 0)
-  -m, --method METHOD       surrogate method: logit or lora (default: logit)
+  -m, --method METHOD       surrogate method: logit, lora, or none (default: logit).
+                            none attacks every generation directly against its own real
+                            checkpoint — the white-box upper bound, no transfer involved.
+                            Generation 0 is then swept too, since there is no anchor to
+                            collide with, and --direct-gen0 becomes redundant.
   -ms, --model-specifier S  baseline model specifier
       --direct-gen0         also attack generation 0, without a surrogate, instead of skipping it
       --force               re-run generations whose result file already exists
@@ -55,6 +66,10 @@ Options:
 
 Everything after -- is passed through to run_attack.py unchanged, e.g.:
   ./run_attack_sweep.sh -n 9 -p ./runs/baseline -- -r 5 -ns 500 -sos
+
+Surrogate and direct sweeps write different result files, so they do not overwrite each other:
+  ./run_attack_sweep.sh -n 9 -p ./runs/x              # attack_gen{N}_{model}_logit_surrogate.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x -m none      # attack_gen{N}_{model}.json
 EOF
 }
 
@@ -88,9 +103,20 @@ if (( START_GENERATION > NUM_GENERATIONS )); then
     echo "error: --start $START_GENERATION is above -n $NUM_GENERATIONS, nothing to sweep" >&2
     exit 2
 fi
-if [[ "$SURROGATE_METHOD" != "logit" && "$SURROGATE_METHOD" != "lora" ]]; then
-    echo "error: --method must be logit or lora ('data' is not a valid attack surrogate)" >&2
+if [[ "$SURROGATE_METHOD" != "logit" && "$SURROGATE_METHOD" != "lora" \
+      && "$SURROGATE_METHOD" != "none" ]]; then
+    echo "error: --method must be logit, lora or none ('data' is a dataset-level surrogate," \
+         "not an attack one)" >&2
     exit 2
+fi
+
+# no surrogate anywhere in the sweep: every generation is attacked against its own real
+# checkpoint, which is also what generation 0 falls back to inside a surrogate sweep. Kept as its
+# own flag because it changes three things at once — the gen-0 skip, the result file names
+# run_attack.py writes, and what the banner claims the sweep measured
+DIRECT_SWEEP=0
+if [[ "$SURROGATE_METHOD" == "none" ]]; then
+    DIRECT_SWEEP=1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -111,7 +137,11 @@ mkdir -p "$LOG_DIR"
 
 echo "############################################################"
 echo "## attack sweep: generations $START_GENERATION..$NUM_GENERATIONS"
-echo "##   surrogate    : $SURROGATE_METHOD"
+if (( DIRECT_SWEEP )); then
+    echo "##   surrogate    : none (direct attack on each real checkpoint)"
+else
+    echo "##   surrogate    : $SURROGATE_METHOD"
+fi
 echo "##   block size   : $BLOCK_SIZE"
 echo "##   model        : $MODEL_SPECIFIER"
 echo "##   path         : $PATH_ROOT"
@@ -128,29 +158,41 @@ FAILURES=0
 STARTED_AT=$SECONDS
 
 for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
-    # generation 0 is the surrogate's own anchor, so there is no transfer attack to run on it
-    if (( gen == 0 )) && (( DIRECT_GEN0 == 0 )); then
+    # generation 0 is the surrogate's own anchor, so there is no transfer attack to run on it.
+    # Under --method none no surrogate is built at all, so there is nothing for it to be the anchor
+    # of and it is swept like every other generation
+    if (( gen == 0 )) && (( DIRECT_SWEEP == 0 )) && (( DIRECT_GEN0 == 0 )); then
         echo
         echo "== generation 0: skipped =="
         echo "   The $SURROGATE_METHOD surrogate is built from the generation-0 checkpoint, so"
         echo "   attacking generation 0 would validate the suffix against the model the search"
-        echo "   was derived from. Pass --direct-gen0 to attack it without a surrogate instead."
+        echo "   was derived from. Pass --direct-gen0 to attack it without a surrogate instead,"
+        echo "   or --method none to sweep every generation that way."
         STATUS_GENS+=("$gen")
         STATUS_CODES+=("skipped")
         STATUS_FILES+=("")
         continue
     fi
 
-    if (( gen == 0 )); then
-        method_args=(-sm none)
-        result_file="$RESULTS_DIR/attack_gen0_${SPECIFIER_NAME}.json"
-        label="generation 0 (direct, no surrogate)"
+    # run_method is what this invocation actually passes to -sm, which is not always
+    # SURROGATE_METHOD: generation 0 under --direct-gen0 runs without a surrogate inside an
+    # otherwise surrogate-based sweep. Everything below keys off run_method rather than
+    # SURROGATE_METHOD, because run_attack.py's result filename does too — it appends
+    # _{method}_surrogate only when a surrogate was used, and a mismatch here would leave the
+    # --force check looking for a file that is never written and the summary reporting
+    # "no result file written" for a run that succeeded
+    if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
+        run_method="none"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}.json"
+        label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
-        method_args=(-sm "$SURROGATE_METHOD")
+        run_method="$SURROGATE_METHOD"
         result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}_${SURROGATE_METHOD}_surrogate.json"
         label="generation $gen ($SURROGATE_METHOD surrogate, n = $((gen + 1)))"
     fi
-    log_file="$LOG_DIR/attack_gen${gen}_${SURROGATE_METHOD}.log"
+    method_args=(-sm "$run_method")
+    # named after the method that ran, so a --direct-gen0 log is not filed under "logit"
+    log_file="$LOG_DIR/attack_gen${gen}_${run_method}.log"
 
     echo
     echo "== $label =="
