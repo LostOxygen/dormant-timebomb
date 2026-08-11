@@ -94,6 +94,9 @@ parser.add_argument("--max_new_tokens", "-mnt", type=int, default=96)
 parser.add_argument("--repetition_penalty", "-rp", type=float, default=1.0)
 parser.add_argument("--exec_timeout", "-et", type=float, default=10.0)
 parser.add_argument("--label", "-l", type=str, default="target")
+# the --real_data_fraction the target run was collapsed with; part of its checkpoint names from
+# generation 1 onward, so it is needed to find them
+parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
 args = parser.parse_args()
 
 # run_attack.resolve_collapsed_dir reads the module global rather than taking a root, so the same
@@ -104,7 +107,10 @@ run_attack.MODEL_SPECIFIER = args.model_specifier
 specifier_name = args.model_specifier.split("/")[-1]
 
 collapsed_dir = args.collapsed_model_path or resolve_collapsed_dir(
-    args.collapsed_generation, specifier_name, args.block_size or None
+    args.collapsed_generation,
+    specifier_name,
+    args.block_size or None,
+    real_data_fraction=args.real_data_fraction,
 )
 baseline_dir = args.baseline_model_path or args.model_specifier
 

@@ -60,6 +60,7 @@ import shutil
 import torch
 
 from utils.colors import TColors
+from utils.naming import mixture_suffix
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -437,6 +438,14 @@ if __name__ == "__main__":
         default="",
         help="path to save the generated datasets and models (default: current directory)",
     )
+    parser.add_argument(
+        "--real_data_fraction",
+        "-rdf",
+        type=float,
+        default=0.0,
+        help="the run's --real_data_fraction. Used only to name the checkpoint this samples from "
+        "and the shard it writes; nothing about the sampling itself depends on it (default: 0.0)",
+    )
     args = parser.parse_args()
 
     # arguments
@@ -453,6 +462,7 @@ if __name__ == "__main__":
     top_p = args.top_p
     top_k = args.top_k
     path = args.path
+    real_data_fraction = args.real_data_fraction
 
     # resolve the engine before importing anything heavy. unsloth has to be imported before
     # torch/transformers to patch them, so it is only imported in the branch that actually uses
@@ -523,8 +533,15 @@ if __name__ == "__main__":
     # fp16 checkpoint that run_baseline.py writes next to the adapter. The two are the same
     # weights: the merge dequantizes the base and folds B @ A into it, so this is not a different
     # model
+    # the checkpoint being sampled from and the shard being written both belong to `generation`, so
+    # unlike the training worker this one needs a single suffix. It is empty for generation 0, whose
+    # model every --real_data_fraction shares
+    gen_suffix = mixture_suffix(real_data_fraction, generation)
+
     if engine == "vllm":
-        checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}_fp16"
+        checkpoint = (
+            f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}{gen_suffix}_fp16"
+        )
         if not os.path.isdir(checkpoint):
             raise FileNotFoundError(
                 f"the merged checkpoint {checkpoint} does not exist. run_baseline.py writes it "
@@ -533,10 +550,11 @@ if __name__ == "__main__":
                 "adapter directory instead"
             )
     else:
-        checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}"
+        checkpoint = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}{gen_suffix}"
 
     # load the base subdataset. The orchestrator writes these shards once, they hold the
-    # instructions which are the same for every generation
+    # instructions which are the same for every generation — and therefore for every mixture, so
+    # they carry no suffix
     subdataset = Dataset.load_from_disk(
         DATASET_PATH + f"base_subdataset_bs{block_size}_{specifier_name}_shard{shard_id}"
     )
@@ -553,5 +571,6 @@ if __name__ == "__main__":
     )
 
     new_dataset.save_to_disk(
-        DATASET_PATH + f"subdataset_{generation}_bs{block_size}_{specifier_name}_shard{shard_id}"
+        DATASET_PATH
+        + f"subdataset_{generation}_bs{block_size}_{specifier_name}{gen_suffix}_shard{shard_id}"
     )

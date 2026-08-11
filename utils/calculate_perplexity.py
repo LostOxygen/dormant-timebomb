@@ -38,6 +38,7 @@ from tqdm import tqdm
 import torch
 
 from utils.colors import TColors
+from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import (
     CE_CHUNK_POSITIONS,
     MAX_TOKENS_PER_FORWARD,
@@ -108,6 +109,15 @@ parser.add_argument(
     help="suffix of the dataset file names ('_ex' for the extrapolation runs)",
 )
 parser.add_argument(
+    "--real_data_fraction",
+    "-rdf",
+    type=float,
+    default=0.0,
+    help="the run's --real_data_fraction, used to name the generated corpora this scores. It "
+    "composes with --dataset_suffix rather than replacing it: stage 2 passes '_ex' and no fraction "
+    "(default: 0.0)",
+)
+parser.add_argument(
     "--load_in_4bit",
     "-q4",
     action="store_true",
@@ -134,6 +144,7 @@ num_generations = args.num_generations
 shard_id = args.shard_id
 num_shards = args.num_shards
 dataset_suffix = args.dataset_suffix
+real_data_fraction = args.real_data_fraction
 load_in_4bit = args.load_in_4bit
 path = args.path
 
@@ -196,15 +207,19 @@ perplexity_dict = {}
 for i in range(num_generations):
     # load the dataset
     if i == 0:
-        # for the first generation, use the original dataset
+        # for the first generation, use the original dataset. It is the human corpus, so no data
+        # mixture can change it and it carries no --real_data_fraction suffix
         ppl_dataset = Dataset.load_from_disk(
             DATASET_PATH
             + f"/chunked_dataset_bs{block_size}_{specifier_name}{dataset_suffix}"
         )
     else:
+        # the corpus generation i scores was produced by model_{i - 1}, so it is that generation's
+        # suffix that names it — empty at i - 1 == 0, whose model every mixture shares
         ppl_dataset = Dataset.load_from_disk(
             DATASET_PATH
             + f"/generated_dataset_{i - 1}_bs{block_size}_{specifier_name}{dataset_suffix}"
+            + mixture_suffix(real_data_fraction, i - 1)
         )
 
     # only process this process' share of the dataset. Contiguous shards are used so that
@@ -278,5 +293,6 @@ torch.save(
     perplexity_dict,
     DATASET_PATH
     + f"perplexity_dict_bs{block_size}_{specifier_name}{dataset_suffix}"
+    + mixture_tag(real_data_fraction)
     + f"_shard{shard_id}.pt",
 )

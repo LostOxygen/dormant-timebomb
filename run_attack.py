@@ -136,6 +136,7 @@ from transformers import (
 from utils.colors import TColors
 from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
+from utils.naming import mixture_suffix
 from utils.utils import (
     INIT_CHARS,
     clear_inherited_max_length,
@@ -1272,6 +1273,7 @@ def resolve_collapsed_dir(
     specifier_name: str,
     block_size: int | None,
     prefer_adapter: bool = False,
+    real_data_fraction: float = 0.0,
 ) -> str:
     """Locates the collapsed checkpoint directory written by ``run_baseline.py``.
 
@@ -1280,12 +1282,19 @@ def resolve_collapsed_dir(
     With `block_size` given the exact name is used, otherwise the directory is globbed and an
     unambiguous match is required.
 
+    A run trained with ``--real_data_fraction`` names its generations from 1 onward
+    ``model_{g}_bs{bs}_{name}_rdf{value}[_fp16]``, so the same fraction has to be given here for
+    them to be found. Generation 0 is unaffected either way — it trains on the human corpus under
+    every mixture, so ``mixture_suffix`` returns "" for it and the surrogate anchor resolves to the
+    one shared checkpoint without the caller special-casing anything.
+
     Args:
         generation (int): collapse generation index
         specifier_name (str): trailing component of the model specifier
         block_size (int | None): effective block size, or None to auto-discover
         prefer_adapter (bool): look for the LoRA adapter directory before the merged fp16 one.
             The `lora` surrogate needs the adapter, since it works by scaling its alpha
+        real_data_fraction (float): the --real_data_fraction the run was trained with
 
     Returns:
         str: path to a merged fp16 directory, or to the LoRA adapter directory as a fallback
@@ -1296,20 +1305,28 @@ def resolve_collapsed_dir(
         RuntimeError: several block sizes matched
     """
     order = ("", "_fp16") if prefer_adapter else ("_fp16", "")
+    mixture = mixture_suffix(real_data_fraction, generation)
 
     if block_size is not None:
-        exact = os.path.join(MODEL_PATH, f"model_{generation}_bs{block_size}_{specifier_name}")
+        exact = os.path.join(
+            MODEL_PATH, f"model_{generation}_bs{block_size}_{specifier_name}{mixture}"
+        )
         for suffix in order:
             cand = f"{exact}{suffix}"
             if os.path.isdir(cand):
                 return cand
         raise FileNotFoundError(
             f"no checkpoint for generation {generation} at {exact}[_fp16] — check "
-            f"--block_size / --model_specifier / --path"
+            f"--block_size / --model_specifier / --real_data_fraction / --path"
         )
 
+    # the mixture is part of the pattern rather than something filtered out afterwards, which is
+    # what keeps the two apart: model_3_bs*_{name}_fp16 does not match a directory ending in
+    # _rdf0.3_fp16, so a default run never silently picks up a mixed run's checkpoints
     for suffix in order:
-        pattern = os.path.join(MODEL_PATH, f"model_{generation}_bs*_{specifier_name}{suffix}")
+        pattern = os.path.join(
+            MODEL_PATH, f"model_{generation}_bs*_{specifier_name}{mixture}{suffix}"
+        )
         matches = sorted(d for d in glob.glob(pattern) if os.path.isdir(d))
         if suffix == "":
             matches = [d for d in matches if not d.endswith("_fp16")]
@@ -1323,7 +1340,12 @@ def resolve_collapsed_dir(
 
     raise FileNotFoundError(
         f"no checkpoint for generation {generation} under {MODEL_PATH} matching "
-        f"model_{generation}_bs*_{specifier_name} — run run_baseline.py first"
+        f"model_{generation}_bs*_{specifier_name}{mixture} — run run_baseline.py first"
+        + (
+            f" with --real_data_fraction {real_data_fraction:g}"
+            if mixture
+            else ", or pass --real_data_fraction if it was trained with one"
+        )
     )
 
 
@@ -1462,6 +1484,7 @@ def main(
     surrogate_factor: float = 0.0,
     surrogate_model_path: str = "",
     first_collapsed_path: str = "",
+    real_data_fraction: float = 0.0,
 ) -> None:
     """
     Searches for selective adversarial inputs against a collapsed model.
@@ -1508,6 +1531,8 @@ def main(
             run_extrapolation.py's model_scaled_n<n>_* directory ("lora" only)
         first_collapsed_path (str): explicit path to the generation-0 collapsed model the
             surrogate is built from (default: resolved from the model outputs)
+        real_data_fraction (float): the --real_data_fraction run_baseline.py was given, which is
+            part of the checkpoint names from generation 1 onward. Only used to find them
 
     Returns:
         None
@@ -1547,7 +1572,10 @@ def main(
 
     baseline_dir = baseline_model_path or MODEL_SPECIFIER
     collapsed_dir = collapsed_model_path or resolve_collapsed_dir(
-        collapsed_generation, specifier_name, block_size
+        collapsed_generation,
+        specifier_name,
+        block_size,
+        real_data_fraction=real_data_fraction,
     )
 
     # ── transfer mode setup ──
@@ -1559,6 +1587,8 @@ def main(
     factor = surrogate_factor if surrogate_factor > 0 else float(collapsed_generation + 1)
     first_collapsed_dir = ""
     if transfer:
+        # generation 0 needs no fraction: it is the same checkpoint under every mixture, and
+        # mixture_suffix returns "" for it in any case
         first_collapsed_dir = first_collapsed_path or resolve_collapsed_dir(
             0, specifier_name, block_size, prefer_adapter=(surrogate_method == "lora")
         )
@@ -2034,6 +2064,16 @@ if __name__ == "__main__":
         help="explicit path to the generation-0 collapsed model the surrogate is built from "
         "(default: resolved from model_outputs/; the 'lora' method needs the adapter, not the "
         "merged _fp16 copy)",
+    )
+    parser.add_argument(
+        "--real_data_fraction",
+        "-rdf",
+        type=float,
+        default=0.0,
+        help="the --real_data_fraction run_baseline.py was given. A mixed run names its "
+        "checkpoints model_{gen}_bs{bs}_{name}_rdf{value}[_fp16] from generation 1 onward, so the "
+        "same value is needed here to find them. Nothing about the attack itself changes; the "
+        "generation-0 surrogate anchor is shared across mixtures and needs no value (default: 0.0)",
     )
     parser.add_argument(
         "--path",

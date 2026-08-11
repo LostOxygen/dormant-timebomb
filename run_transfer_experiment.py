@@ -17,6 +17,7 @@ import psutil
 
 from utils.colors import TColors
 from utils.devices import visible_devices
+from utils.naming import mixture_suffix
 
 # The experiment is one-directional and that is the whole point: run A is collapsed, a generation
 # of it is probed, a suffix is optimized against it, and only then is run B collapsed and the
@@ -35,7 +36,11 @@ MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 
 
 def collapsed_checkpoint(
-    path: str, generation: int, block_size: int, specifier_name: str
+    path: str,
+    generation: int,
+    block_size: int,
+    specifier_name: str,
+    real_data_fraction: float = 0.0,
 ) -> str:
     """Path of the merged fp16 checkpoint run_baseline.py writes for one generation.
 
@@ -48,6 +53,8 @@ def collapsed_checkpoint(
         generation (int): collapse generation index
         block_size (int): the --block_size the run was given
         specifier_name (str): trailing component of the model specifier
+        real_data_fraction (float): the --real_data_fraction both runs were collapsed with, which
+            is part of the name from generation 1 onward
 
     Returns:
         str: path to the merged fp16 checkpoint directory
@@ -55,7 +62,9 @@ def collapsed_checkpoint(
     return os.path.join(
         path,
         "model_outputs",
-        f"model_{generation}_bs{block_size}_{specifier_name}_fp16",
+        f"model_{generation}_bs{block_size}_{specifier_name}"
+        + mixture_suffix(real_data_fraction, generation)
+        + "_fp16",
     )
 
 
@@ -113,8 +122,14 @@ def baseline_command(
     engine: str,
     with_eval: bool,
     extra: str,
+    real_data_fraction: float = 0.0,
 ) -> list:
-    """Builds the run_baseline.py argv for one collapse run."""
+    """Builds the run_baseline.py argv for one collapse run.
+
+    The fraction is passed explicitly rather than left to --baseline_extra so that both runs
+    provably get the same mixture: the seed is meant to be the only difference between them, and it
+    also has to match what this script then uses to *name* their checkpoints.
+    """
     command = [
         sys.executable,
         "run_baseline.py",
@@ -122,6 +137,8 @@ def baseline_command(
         "cuda",
         "--seed",
         str(seed),
+        "--real_data_fraction",
+        str(real_data_fraction),
         "--num_generations",
         str(num_generations),
         "--block_size",
@@ -161,6 +178,7 @@ def attack_command(
     stop_on_success: bool,
     seed: int,
     extra: str,
+    real_data_fraction: float = 0.0,
 ) -> list:
     """Builds the run_attack.py argv for the search against run A.
 
@@ -196,6 +214,9 @@ def attack_command(
         str(exec_timeout),
         "--seed",
         str(seed),
+        # only needed to locate run A's checkpoint, which carries the mixture in its name
+        "--real_data_fraction",
+        str(real_data_fraction),
     ]
     if tasks:
         command.extend(["--tasks", tasks])
@@ -218,6 +239,7 @@ def verify_command(
     exec_timeout: float,
     probe_only: bool = False,
     tasks: str = "",
+    real_data_fraction: float = 0.0,
 ) -> list:
     """Builds the utils.verify_transfer argv for one target run.
 
@@ -246,6 +268,9 @@ def verify_command(
         str(repetition_penalty),
         "--exec_timeout",
         str(exec_timeout),
+        # names the target run's checkpoint; both runs share the mixture, so one value serves both
+        "--real_data_fraction",
+        str(real_data_fraction),
     ]
     if probe_only:
         command.append("--probe_only")
@@ -268,6 +293,7 @@ def choose_generation(
     repetition_penalty: float,
     exec_timeout: float,
     force: bool,
+    real_data_fraction: float = 0.0,
 ) -> int:
     """Picks the latest generation at which *run A* can still solve enough tasks unaided.
 
@@ -308,6 +334,7 @@ def choose_generation(
                     f"run A (seed {seed_a}) generation {generation}",
                     max_new_tokens, repetition_penalty, exec_timeout,
                     probe_only=True, tasks=tasks,
+                    real_data_fraction=real_data_fraction,
                 ),
                 f"capability probe of run A generation {generation}",
             )
@@ -399,6 +426,7 @@ def sweep_run(
     repetition_penalty: float,
     exec_timeout: float,
     force: bool,
+    real_data_fraction: float = 0.0,
 ) -> dict:
     """Verifies the frozen suffixes against one run at every generation, and loads the results.
 
@@ -429,6 +457,7 @@ def sweep_run(
                     path, generation, block_size, suffix_file, out_file,
                     f"run {label.upper()} (seed {seed}) generation {generation}",
                     max_new_tokens, repetition_penalty, exec_timeout,
+                    real_data_fraction=real_data_fraction,
                 ),
                 f"verification of run {label.upper()} generation {generation}",
             )
@@ -567,6 +596,7 @@ def main(
     force: bool = False,
     baseline_extra: str = "",
     attack_extra: str = "",
+    real_data_fraction: float = 0.0,
 ) -> None:
     """Runs the whole cross-run transfer experiment.
 
@@ -599,6 +629,9 @@ def main(
         force (bool): rerun every stage even when its artifact exists
         baseline_extra (str): extra arguments appended to both run_baseline.py invocations
         attack_extra (str): extra arguments appended to the run_attack.py invocation
+        real_data_fraction (float): --real_data_fraction for *both* collapse runs, and therefore
+            part of the checkpoint names every later stage resolves. Held identical across the two
+            runs on purpose: the seed is meant to be the only difference between them
     """
     if seed_a == seed_b:
         raise ValueError(
@@ -660,7 +693,7 @@ def main(
         # the last generation's checkpoint is the marker for "this run finished", independently of
         # which generation is eventually attacked
         final_checkpoint = collapsed_checkpoint(
-            path, num_generations - 1, block_size, specifier_name
+            path, num_generations - 1, block_size, specifier_name, real_data_fraction
         )
         print_stage(index, 6, f"collapse run {label}", f"seed {seed}")
         if os.path.isdir(final_checkpoint) and not force:
@@ -669,7 +702,7 @@ def main(
             run_stage(
                 baseline_command(
                     path, seed, num_generations, block_size, dataset_size, engine,
-                    with_eval, baseline_extra,
+                    with_eval, baseline_extra, real_data_fraction,
                 ),
                 f"collapse run {label}",
             )
@@ -683,6 +716,7 @@ def main(
         collapsed_generation = choose_generation(
             path_a, seed_a, num_generations, block_size, tasks, report_dir,
             min_usable_tasks, max_new_tokens, repetition_penalty, exec_timeout, force,
+            real_data_fraction,
         )
     else:
         print(
@@ -707,7 +741,7 @@ def main(
             attack_command(
                 path_a, collapsed_generation, block_size, tasks, restarts, num_steps,
                 verify_every, max_new_tokens, repetition_penalty, exec_timeout,
-                stop_on_success, attack_seed, attack_extra,
+                stop_on_success, attack_seed, attack_extra, real_data_fraction,
             ),
             "attack against run A",
         )
@@ -750,7 +784,7 @@ def main(
         )
         sweeps[label] = sweep_run(
             label, path, seed, swept, block_size, suffix_file, report_dir,
-            max_new_tokens, repetition_penalty, exec_timeout, force,
+            max_new_tokens, repetition_penalty, exec_timeout, force, real_data_fraction,
         )
 
     # ── the report ─────────────────────────────────────────────────────────────────────────────
@@ -759,6 +793,7 @@ def main(
     report["num_generations"] = num_generations
     report["block_size"] = block_size
     report["dataset_size"] = dataset_size
+    report["real_data_fraction"] = real_data_fraction
     report["visible_devices"] = VISIBLE_DEVICES
     report["verification"] = {
         "max_new_tokens": max_new_tokens,
@@ -1027,12 +1062,24 @@ if __name__ == "__main__":
         help="rerun every stage even when its artifact already exists",
     )
     parser.add_argument(
+        "--real_data_fraction",
+        "-rdf",
+        type=float,
+        default=0.0,
+        help="--real_data_fraction for both collapse runs, held identical so that the seed stays "
+        "the only difference between them. It is part of the checkpoint names from generation 1 "
+        "onward, so passing it here is also what lets the attack and the verifications find them — "
+        "prefer it over putting -rdf in --baseline_extra, which the later stages cannot see "
+        "(default: 0.0)",
+    )
+    parser.add_argument(
         "--baseline_extra",
         "-bx",
         type=str,
         default="",
         help="extra arguments appended verbatim to both run_baseline.py invocations, e.g. "
-        "\"-tbs 8 -gas 4 -fi\"",
+        "\"-tbs 8 -gas 4 -fi\". Do not pass -rdf here — use --real_data_fraction, which the "
+        "checkpoint-name resolution in the later stages also reads",
     )
     parser.add_argument(
         "--attack_extra",

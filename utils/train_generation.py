@@ -54,6 +54,7 @@ from trl import SFTConfig, SFTTrainer
 from datasets import Dataset
 
 from utils.colors import TColors
+from utils.naming import mixture_suffix
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -82,6 +83,11 @@ parser.add_argument("--path", "-p", type=str, default="")
 # two runs of run_baseline.py can produce *different* collapsed models from identical
 # hyperparameters, which is what a cross-run transfer experiment needs
 parser.add_argument("--seed", "-sd", type=int, default=1337)
+# the run's --real_data_fraction, needed here only to name artifacts: this worker reads
+# model_{generation - 1} and train/val_dataset_{generation} and writes model_{generation}, and those
+# do not all carry the same suffix (generation 0 is never mixed). The mixing itself happens in the
+# orchestrator, which hands over the splits already composed
+parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
 args = parser.parse_args()
 
 block_size = args.block_size
@@ -99,6 +105,12 @@ gradient_checkpointing = args.gradient_checkpointing
 fresh_init = args.fresh_init
 path = args.path
 seed = args.seed
+real_data_fraction = args.real_data_fraction
+
+# the suffix of what this generation writes, and of what the previous one wrote. They differ at
+# generation 1, whose input model_0 is shared across mixtures while its output model_1 is not
+gen_suffix = mixture_suffix(real_data_fraction, generation)
+prev_suffix = mixture_suffix(real_data_fraction, generation - 1)
 
 # torchrun sets these; running the script bare is a world size of 1
 world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -149,7 +161,9 @@ if is_main:
 if fresh_init or generation == 0:
     checkpoint = model_specifier
 else:
-    checkpoint = f"{MODEL_PATH}model_{generation - 1}_bs{block_size}_{specifier_name}"
+    checkpoint = (
+        f"{MODEL_PATH}model_{generation - 1}_bs{block_size}_{specifier_name}{prev_suffix}"
+    )
 
 # LoRA, not full fine-tuning: unsloth patches Qwen2Attention.forward globally with its fast
 # kernel, which calls a per-layer `apply_qkv` that only its LoRA path installs. With
@@ -199,10 +213,10 @@ model = FastLanguageModel.get_peft_model(
 # column and the 90/10 split are built in exactly one place and every rank reads identical bytes
 # instead of racing each other over the datasets cache
 dataset_train = Dataset.load_from_disk(
-    DATASET_PATH + f"train_dataset_{generation}_bs{block_size}_{specifier_name}"
+    DATASET_PATH + f"train_dataset_{generation}_bs{block_size}_{specifier_name}{gen_suffix}"
 )
 dataset_val = Dataset.load_from_disk(
-    DATASET_PATH + f"val_dataset_{generation}_bs{block_size}_{specifier_name}"
+    DATASET_PATH + f"val_dataset_{generation}_bs{block_size}_{specifier_name}{gen_suffix}"
 )
 
 # for some stats
@@ -301,18 +315,19 @@ if is_main:
 # The local `tokenizer` is used rather than trainer.tokenizer, which transformers v5 removed in
 # favour of trainer.processing_class — it is the same object either way
 if is_main:
+    adapter_dir = f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}{gen_suffix}"
     trainer.model.save_pretrained(
-        f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}",
+        adapter_dir,
         safe_serialization=True,
         save_adapter=True,
         save_config=True,
     )
-    tokenizer.save_pretrained(
-        f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}"
-    )
-    # also save the model in fp16, which is what the vLLM generation engine and run_attack.py read
+    tokenizer.save_pretrained(adapter_dir)
+    # also save the model in fp16, which is what the vLLM generation engine and run_attack.py read.
+    # The mixture suffix goes *before* _fp16, so the merged copy of a mixed generation is
+    # model_{g}_bs{bs}_{name}_rdf{value}_fp16 — run_attack.resolve_collapsed_dir assumes that order
     trainer.model.save_pretrained_merged(
-        f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}_fp16",
+        f"{adapter_dir}_fp16",
         tokenizer,
         save_method="merged_16bit",
     )
