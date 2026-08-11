@@ -974,7 +974,7 @@ if __name__ == "__main__":
         "--device",
         "-dx",
         type=str,
-        default="cpu",
+        default="cuda",
         help="specifies the device to run the computations on (cpu, cuda, mps)",
     )
     parser.add_argument(
