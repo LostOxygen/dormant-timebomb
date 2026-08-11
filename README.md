@@ -281,7 +281,8 @@ baseline's ```chunked_dataset_bs<block_size>_<model_name>``` for the generation-
 python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENERATIONS]
                             [-bs BLOCK_SIZE] [-ho] [-heo] [-ms MODEL_SPECIFIER]
                             [-cfg CONTINUE_FROM_GENERATION] [-m METHOD]
-                            [-stp SURROGATE_TOP_P] [-dsz DATASET_SIZE] [-p PATH]
+                            [-stp SURROGATE_TOP_P] [-dsz DATASET_SIZE]
+                            [-rdf REAL_DATA_FRACTION] [-p PATH]
 ```
 
 | Argument | Short | Type | Default | Description |
@@ -297,6 +298,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
 | `--dataset_size` | `-dsz` | int | `0` | Samples to use from the upstream 50k dataset; `0` uses all of it. **Must match step 1** — both take the same front slice, which is what makes their histograms comparable. |
+| `--real_data_fraction` | `-rdf` | float | `0.0` | The `-rdf` of the step 1 run this comparison is filed against, in `[0, 1)`. It namespaces what *this* step writes — the corpora of generations 1+, the perplexity cache and the figure — so a comparison against a mixed run cannot be replotted as an unmixed one. It changes nothing about what is computed: the surrogate is built from `model_0`, which every mixture trains identically, so step 2 always approximates the untempered self-training trajectory and is only a like-for-like comparison against an `-rdf 0` step 1. |
 | `--path` | `-p` | str | `""` (cwd) | Root directory for `generated_datasets/` and `model_outputs/`; must match step 1. |
 
 #### `calibrate_surrogate.py`

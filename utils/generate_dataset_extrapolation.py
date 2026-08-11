@@ -25,6 +25,7 @@ Args:
     temperature (float): Sampling temperature, pinned rather than inherited.
     top_p (float): Nucleus cutoff, pinned. The "data" method replaces it with its schedule.
     top_k (int): Top-k cutoff, pinned. -1 disables it.
+    real_data_fraction (float): The run's --real_data_fraction, which names the shard written.
     load_in_4bit (bool): Quantize the generating models. Off by default.
     path (str): The path where the datasets and models are stored.
 
@@ -47,6 +48,7 @@ from transformers import (
 )
 
 from utils.colors import TColors
+from utils.naming import mixture_suffix
 from utils.extrapolation import (
     METHODS,
     dataset_suffix,
@@ -244,6 +246,15 @@ parser.add_argument(
     "(default: 20, Qwen2.5's own value)",
 )
 parser.add_argument(
+    "--real_data_fraction",
+    "-rdf",
+    type=float,
+    default=0.0,
+    help="the run's --real_data_fraction. It names the shard this writes and nothing else: the "
+    "base_subdataset read below is the human instruction set, which no mixture touches, and the "
+    "model_0 anchor is shared across mixtures (default: 0.0)",
+)
+parser.add_argument(
     "--load_in_4bit",
     "-q4",
     action="store_true",
@@ -273,10 +284,15 @@ surrogate_p1 = args.surrogate_top_p
 temperature = args.temperature
 top_p = args.top_p
 top_k = args.top_k
+real_data_fraction = args.real_data_fraction
 load_in_4bit = args.load_in_4bit
 path = args.path
 
 suffix = dataset_suffix(method)
+# the shard is named after the generation that produced it, so generation 0 stays untagged: n = 1
+# reproduces the real model_0 anchor, which every mixture shares. utils/calculate_perplexity.py
+# resolves the merged corpus with the same rule, one generation down
+mix = mixture_suffix(real_data_fraction, generation)
 # every method is indexed by the same factor: in the real collapse run generated_dataset_g is
 # produced by model_g, and model_0 is a single fine-tuning step away from the base model, so
 # model_g sits g + 1 steps out. With a factor of g instead, generation 0 would be a plain copy
@@ -520,5 +536,5 @@ new_dataset = Dataset.from_dict(
 
 new_dataset.save_to_disk(
     DATASET_PATH
-    + f"subdataset_{generation}_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}"
+    + f"subdataset_{generation}_bs{block_size}_{specifier_name}{suffix}{mix}_shard{shard_id}"
 )

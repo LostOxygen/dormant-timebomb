@@ -41,6 +41,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.plotting import visible_perplexity_range
 from utils.utils import report_block_size
+from utils.naming import mixture_suffix, mixture_tag
 from utils.extrapolation import (
     METHODS,
     METHOD_LABELS,
@@ -112,6 +113,7 @@ def main(
     method: str = "logit",
     surrogate_top_p: float = 0.0,
     dataset_size: int = 0,
+    real_data_fraction: float = 0.0,
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
@@ -141,6 +143,11 @@ def main(
             utils/extrapolation.py ("logit", "lora" or "data")
         surrogate_top_p (float): p_1 of the data-space surrogate. 0.0 reads it from the
             calibration that calibrate_surrogate.py wrote
+        real_data_fraction (float): the --real_data_fraction of the run_baseline.py run this
+            stage's histogram is compared against. It does not change what this stage computes —
+            the surrogate is built from model_0, which every mixture shares — it only namespaces
+            this stage's own artifacts so a mixed run's numbers are not filed under, or replotted
+            as, an unmixed run's
         temperature (float): sampling temperature of the generation. Has to match
             run_baseline.py, otherwise the extrapolated histograms are compared against a
             baseline that was sampled differently
@@ -161,6 +168,27 @@ def main(
     # every artifact of a method carries its own suffix, so that the three methods can be run
     # against the same baseline and compared without overwriting each other
     suffix = dataset_suffix(method)
+
+    if not 0.0 <= real_data_fraction < 1.0:
+        raise SystemExit(
+            f"--real_data_fraction must be in [0, 1), got {real_data_fraction}. At 1.0 every "
+            f"generation would train on the human corpus alone and nothing would collapse."
+        )
+    # the run-level tag, for the artifacts that span the whole run: the perplexity cache and the
+    # figure. plots/ sits outside --path, so the file name is the only thing keeping the figure of
+    # an -rdf 0.3 comparison apart from an -rdf 0 one even when the two used separate --path
+    # directories. Empty at 0, so an existing pure self-training run keeps exactly the names it
+    # always had and -ho/-st keep finding them.
+    #
+    # Note what this does *not* reach: no model path depends on it. This stage only ever loads
+    # model_0_bs{bs}_{name}, and generation 0 trains on the human corpus under every mixture, so
+    # that checkpoint is shared — the same reason run_attack.py's surrogate anchor takes no
+    # fraction. The per-generation datasets below are named with mixture_suffix() instead, which
+    # returns "" for generation 0 for the same reason; see utils/naming.py
+    data_suffix = mixture_tag(real_data_fraction)
+    # what the run-level artifacts are named by: the method this run approximates with, then the
+    # mixture it is filed against
+    run_suffix = f"{suffix}{data_suffix}"
 
     # ──────────────────────────── set devices and print informations ─────────────────────────
     # set the devices correctly
@@ -303,6 +331,16 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Method{TColors.ENDC}: {method} "
         f"({METHOD_LABELS[method]}), artifact suffix: {suffix}"
     )
+    # the surrogate itself is unmixed whatever this says — printed so that a figure produced
+    # against a mixed baseline carries the reason its curve does not line up with stage 1's
+    if real_data_fraction > 0:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Real data fraction{TColors.ENDC}: "
+            f"{real_data_fraction:g} — names this stage's artifacts only. The extrapolation is "
+            f"built from model_0, which every mixture shares, so it approximates the untempered "
+            f"self-training trajectory and is only a like-for-like comparison against an "
+            f"-rdf 0 run of run_baseline.py"
+        )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Number of Generations{TColors.ENDC}: {num_generations}"
     )
@@ -391,6 +429,9 @@ def main(
         original_dataset.save_to_disk(DATASET_PATH + f"original_dataset_bs{block_size}")
 
         # preprocess the dataset
+        # deliberately not tagged with the mixture: this is the human corpus, which is what
+        # generation 0 is scored against under every fraction. utils/calculate_perplexity.py reads
+        # it back untagged for exactly that reason
         chunked_dataset = original_dataset
         chunked_dataset.save_to_disk(
             DATASET_PATH + f"chunked_dataset_bs{block_size}_{specifier_name}{suffix}"
@@ -403,7 +444,9 @@ def main(
         # order afterwards. Strided shards would therefore reorder the merged dataset as a
         # function of the *number of GPUs*, which would make a 4-GPU run's histogram describe a
         # differently ordered dataset than a 1-GPU run's. Contiguous shards reassemble into the
-        # original order for any device count
+        # original order for any device count.
+        # Untagged for the same reason as chunked_dataset above — these hold the human
+        # instructions, which no mixture touches, so every fraction reuses one set of shards
         for shard_id in range(len(devices)):
             original_dataset.shard(
                 num_shards=len(devices), index=shard_id, contiguous=True
@@ -417,11 +460,21 @@ def main(
             if gen_id < continue_from_generation:
                 continue
 
+            # the corpus this generation produces is named after the generation that produced it,
+            # which is what makes utils/calculate_perplexity.py find it again: that worker reads
+            # generation i's corpus as generated_dataset_{i - 1} + mixture_suffix(fraction, i - 1).
+            # Generation 0 is therefore untagged on both sides — n = 1 reproduces the real model_0
+            # anchor, which every mixture shares, so its corpus is shared too
+            gen_mix = mixture_suffix(real_data_fraction, gen_id)
+
             # ───────────────────── build the alpha scaled adapter (lora only) ────────────────
             # a LoRA layer adds (alpha / r) * B @ A to the frozen base weight, so scaling alpha
             # by n scales the whole fine-tuning delta by n and yields the weights
             # W_base + n * (W_collapsed - W_base). This is built once per generation here rather
             # than inside the shard subprocesses, which would race over the same directory
+            # neither the model_0 it is built from nor the scaled adapter itself carries a mixture
+            # tag: the adapter is a pure function of model_0, so it is identical for every
+            # fraction, and naming it after one would claim a dependence that does not exist
             adapter_path = ""
             if method == "lora":
                 adapter_path = (
@@ -473,6 +526,10 @@ def main(
                         str(top_k),
                         "--path",
                         str(path),
+                        # names the shard it writes; the base_subdataset it reads is the untagged
+                        # human corpus
+                        "--real_data_fraction",
+                        str(real_data_fraction),
                     ]
                     + (["--load_in_4bit"] if load_in_4bit else []),
                 )
@@ -503,14 +560,14 @@ def main(
                     Dataset.load_from_disk(
                         DATASET_PATH
                         + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}"
-                        + f"_shard{shard_id}"
+                        + f"{gen_mix}_shard{shard_id}"
                     )
                     for shard_id in range(len(devices))
                 ]
             )
             merged_dataset.save_to_disk(
                 DATASET_PATH
-                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}"
+                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}{gen_mix}"
             )
 
     # ────────────────── evaluate the models' perplexity and other metrics ─────────────────────────
@@ -533,9 +590,11 @@ def main(
             f"perplexity calculation{TColors.ENDC}"
         )
 
+        # has to match what utils/calculate_perplexity.py writes, which appends the run-level
+        # mixture tag after the dataset suffix
         shard_files = [
             DATASET_PATH
-            + f"perplexity_dict_bs{block_size}_{specifier_name}{suffix}_shard{shard_id}.pt"
+            + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}_shard{shard_id}.pt"
             for shard_id in range(len(devices))
         ]
         # remove stale shard files so results of a previous run can't be picked up
@@ -570,6 +629,11 @@ def main(
                     suffix,
                     "--path",
                     str(path),
+                    # composes with --dataset_suffix rather than replacing it: it reads
+                    # generated_dataset_{i-1}{suffix} for every generation i, so it needs the
+                    # fraction to name each one, and it names its own shard file with it
+                    "--real_data_fraction",
+                    str(real_data_fraction),
                 ]
                 + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
             )
@@ -613,30 +677,39 @@ def main(
         # save the perplexity dict to a file
         torch.save(
             perplexity_dict,
-            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}{suffix}.pt",
+            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt",
         )  # save the dict to a file
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
-            f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}{suffix}"
-            f".pt{TColors.ENDC}"
+            f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}"
+            f"{run_suffix}.pt{TColors.ENDC}"
         )
         # save the all_perplexities list to a file
         torch.save(
             all_perplexities,
-            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{suffix}.pt",
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt",
         )  # save the list to a file
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
-            f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}{suffix}"
-            f".pt{TColors.ENDC}"
+            f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}"
+            f"{run_suffix}.pt{TColors.ENDC}"
         )
     else:
-        # load the perplexity dict and all_perplexities list from the files
-        perplexity_dict = torch.load(
-            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}{suffix}.pt"
+        # load the perplexity dict and all_perplexities list from the files. -ho therefore needs
+        # the same --method and --real_data_fraction the cache was produced with, and says so
+        # rather than replotting whichever configuration happens to be cached under this name
+        cached_dict = (
+            DATASET_PATH + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt"
         )
+        if not os.path.exists(cached_dict):
+            raise FileNotFoundError(
+                f"{cached_dict} does not exist. --histogram_only replots the cache of a run with "
+                f"the same --block_size, --model_specifier, --method ({method} here) and "
+                f"--real_data_fraction ({real_data_fraction:g} here)"
+            )
+        perplexity_dict = torch.load(cached_dict)
         all_perplexities = torch.load(
-            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{suffix}.pt"
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt"
         )
 
     # ────────────────── plot the perplexity histogram ─────────────────────────
@@ -720,7 +793,12 @@ def main(
 
     plt.xlabel("Perplexity", fontweight="bold")
     plt.ylabel("Probability", fontweight="bold")
-    plt.title(f"Perplexity with {METHOD_LABELS[method]}", fontweight="bold")
+    # the fraction goes on its own second line, and only when it is set, so the figure of a plain
+    # run is unchanged. No underscores or backslashes: usetex renders the title
+    title = f"Perplexity with {METHOD_LABELS[method]}"
+    if real_data_fraction > 0:
+        title += f"\n(filed against real data fraction {real_data_fraction:g})"
+    plt.title(title, fontweight="bold")
     plt.legend(loc="upper right")
 
     for spine in plt.gca().spines.values():
@@ -732,13 +810,15 @@ def main(
     if not os.path.exists("plots/"):
         os.makedirs("plots/")
 
-    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{suffix}.pdf")
-    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{suffix}.png")
+    # plots/ sits outside --path, so this file name is the only thing keeping the figures of two
+    # differently filed runs apart even when they used separate --path directories
+    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}.pdf")
+    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}.png")
     plt.show()
 
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
-        f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}{suffix}"
+        f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}"
         f".<png,pdf>{TColors.ENDC}"
     )
 
@@ -874,6 +954,19 @@ if __name__ == "__main__":
         "the upstream 50k dataset; 0 uses all of it. run_baseline.py and run_extrapolation.py "
         "must be given the same value, otherwise their histograms describe different data "
         "(default: 0, the whole dataset)",
+    )
+    parser.add_argument(
+        "--real_data_fraction",
+        "-rdf",
+        type=float,
+        default=0.0,
+        help="the --real_data_fraction of the run_baseline.py run this stage is compared against, "
+        "in [0, 1). It namespaces this stage's own artifacts only — the generated corpora of "
+        "generations 1+, the perplexity cache and the figure — so a comparison against a mixed run "
+        "is not filed under, or replotted as, an unmixed one. It does not change what is computed: "
+        "the surrogate is built from model_0, which every mixture shares, so this stage always "
+        "approximates the untempered self-training trajectory and is only a like-for-like "
+        "comparison against an -rdf 0 baseline (default: 0.0)",
     )
     parser.add_argument(
         "--temperature",
