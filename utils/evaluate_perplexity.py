@@ -1,41 +1,40 @@
-"""Utility of every model the pipeline produces, on a held-out slice of the *original* dataset.
+"""Utility of every collapse checkpoint, on a held-out slice of the *original* dataset.
 
 The perplexity histograms of stages 1 and 2 measure the **corpora**: a fixed scorer (the pristine
 base model) reads what each generation wrote, so the statistic says how degenerate the *text* has
 become. This script measures the other direction — each produced **model** reads a fixed slice of
-human data — which is the utility question: has the model lost the ability to model real code, and
-does the extrapolation surrogate lose it the same way the real collapse does.
+human data — which is the utility question: has the model lost the ability to model real code.
 
-Both lineages are scored on the same held-out rows, with the same statistic
-(``utils.perplexity.sample_perplexities``, the one the histograms plot), and drawn in one figure so
-they are comparable:
-
-* **baseline** — the real checkpoints ``model_{g}_bs{bs}_{name}{mix}``, i.e. the actual collapse.
-* **extrapolation** — stage 2 trains nothing, so its model *for generation g* is the surrogate that
-  stands in for ``model_g``: the tilt ``base + n * (model_0 - base)`` under ``--method logit``, or
-  the alpha-scaled adapter ``model_scaled_n{n}`` under ``--method lora``, both at ``n = g + 1``.
-  That is the same indexing run_extrapolation.py and run_attack.py use, and it is what makes the
-  two curves comparable point by point.
+Scored are the real checkpoints of the collapse run, ``model_{g}_bs{bs}_{name}{mix}``, with the
+same statistic the histograms plot (``utils.perplexity.sample_perplexities``) on the same rows for
+every generation, so the curve is comparable across it.
 
 **Reading the figure**: lower is better, and the dashed line is the *un-fine-tuned* base model, not
 a quality ceiling. Generation 0 sits below it because it is fine tuned on this very dataset's
-distribution; collapse is the rise from generation 0 upward.
+distribution; the collapse is the rise from generation 0 upward.
+
+**Stage 2's surrogate is scored alongside**, as the second curve. It trains nothing, so its "model
+for generation g" is the surrogate that stands in for ``model_g``: the tilt
+``base + n * (model_0 - base)`` under ``--method logit``, or the alpha-scaled adapter
+``model_scaled_n{n}`` under ``--method lora``, both at ``n = g + 1`` — the indexing
+run_extrapolation.py and run_attack.py use. Reading the gap between the curves is reading how far
+the approximation has drifted from the collapse it approximates. ``--method data`` is rejected, for
+the same reason run_attack.py rejects it as an attack surrogate: it is the base model with a
+narrowed *sampling* support, and this measurement is teacher forced.
 
 **Generation 0 is a built-in check of that alignment.** At n = 1 both surrogates reduce to the real
 ``model_0`` exactly — the tilt to ``base + 1 * (model_0 - base)``, the scaled adapter to alpha x 1 —
-so the two curves must meet there. If they do not, something upstream of this script is wrong.
+so the two curves must meet there, and the script says so if they differ by more than 1%.
 
-``--method data`` is rejected, for the same reason run_attack.py rejects it as an attack surrogate:
-the data-space surrogate is the base model with a narrowed *sampling* support, and this measurement
-is a teacher-forced cross entropy that never samples, so it would score exactly the base model and
-report a flat line that says nothing about the surrogate.
+Scoring the tilt used to run out of memory and no longer does: see ``tilted_perplexities``, which
+applies the tilt one position chunk at a time instead of materializing the whole combination.
 
 Like utils/calibrate_surrogate.py, this is a user-invoked module with a main(), not one of the
 worker modules beside it:
 
-    python -m utils.evaluate_utility -p . -ng 10 -bs 512
-    python -m utils.evaluate_utility -p . -ng 10 -bs 512 -rdf 0.1 --method lora
-    python -m utils.evaluate_utility -p . -ng 10 --plot_only     # replot from the cache
+    python -m utils.evaluate_perplexity -p . -ng 10 -bs 512
+    python -m utils.evaluate_perplexity -p . -ng 10 -bs 512 -rdf 0.1
+    python -m utils.evaluate_perplexity -p . -ng 10 --plot_only     # replot from the cache
 """
 
 # unsloth first, before torch/transformers: it patches them at import time, and the checkpoints
@@ -57,8 +56,10 @@ from utils.extrapolation import extrapolate_logits
 from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import (
+    CE_CHUNK_POSITIONS,
     MAX_TOKENS_PER_FORWARD,
     format_scoring_prompts,
+    sample_losses_from_logits,
     sample_perplexities,
 )
 
@@ -69,19 +70,17 @@ DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
 # exactly the slice its training never saw
 TRAIN_FRACTION: float = 0.9
 
-# the two series of the figure, in the repo's colorblind-safe palette. Verified rather than
-# assumed: OKLab dE 37.9 at normal vision, 38.2 / 29.5 / 33.7 under simulated deuteranopia /
+# the two curves and the reference line, in the repo's colorblind-safe palette. Verified rather
+# than assumed: OKLab dE 37.9 at normal vision, 38.2 / 29.5 / 33.7 under simulated deuteranopia /
 # protanopia / tritanopia, against a target of 8
 BASELINE_COLOR: str = "#006BA4"
 SURROGATE_COLOR: str = "#FF800E"
 ANCHOR_COLOR: str = "#595959"
 
-
-@dataclass
-class LogitsOutput:
-    """The one field sample_perplexities reads off a forward pass."""
-
-    logits: torch.Tensor
+# padded tokens per forward pass when scoring the *tilt*, which runs two models and therefore holds
+# two vocabulary-sized logit tensors at once. An eighth of the single-model budget by default, and
+# halved further on demand by the backoff in score_tilted — see its docstring for the arithmetic
+SURROGATE_TOKENS_PER_FORWARD: int = MAX_TOKENS_PER_FORWARD // 8
 
 
 @dataclass
@@ -118,38 +117,6 @@ class Measurement:
             q25=float(finite.quantile(0.25)),
             q75=float(finite.quantile(0.75)),
         )
-
-
-class TiltedModel(torch.nn.Module):
-    """The logit surrogate as something ``sample_perplexities`` can score.
-
-    ``ExtrapolatedModel`` in run_attack.py is the same tilt built for GCG, which needs only the
-    logits of the last positions; a perplexity needs the whole sequence, so this wrapper returns
-    full logits instead. The arithmetic is ``utils.extrapolation.extrapolate_logits`` either way —
-    the single definition stage 2 generates its datasets with.
-
-    Attributes:
-        base: the pristine base model
-        first: the generation-0 collapsed model
-        factor: the extrapolation factor n
-    """
-
-    def __init__(self, base, first, factor: float):
-        super().__init__()
-        self.base = base
-        self.first = first
-        self.factor = float(factor)
-
-    def forward(self, input_ids, attention_mask=None, use_cache=False, **_):
-        """Returns an object with a ``.logits`` field, which is all the scorer touches."""
-        base_out = self.base(
-            input_ids=input_ids, attention_mask=attention_mask, use_cache=use_cache
-        )
-        first_out = self.first(
-            input_ids=input_ids, attention_mask=attention_mask, use_cache=use_cache
-        )
-        tilted = extrapolate_logits(base_out.logits, first_out.logits, self.factor)
-        return LogitsOutput(logits=tilted.to(base_out.logits.dtype))
 
 
 def held_out_test_set(dataset_size: int, test_size: int) -> tuple[Dataset, str, bool]:
@@ -253,8 +220,7 @@ def score(model, tokenizer, prompts: list, block_size: int, batch_size: int,
         prompts (list): the templated test prompts
         block_size (int): truncation length is twice it, as in the histogram worker
         batch_size (int): prompts handed to the scorer at once
-        token_budget (int): padded tokens per forward pass. Halved for the tilted model, which
-            materializes two vocabulary-sized logit tensors instead of one
+        token_budget (int): padded tokens per forward pass
 
     Returns:
         list: one perplexity per prompt
@@ -272,6 +238,119 @@ def score(model, tokenizer, prompts: list, block_size: int, batch_size: int,
             )
         )
     return perplexities
+
+
+def tilted_perplexities(
+    base_model, first_model, tokenizer, prompts: list, factor: float, max_length: int,
+    token_budget: int, ce_chunk_positions: int = CE_CHUNK_POSITIONS,
+) -> list:
+    """Perplexity under ``base + n * (model_0 - base)``, without ever materializing the tilt.
+
+    The tilt is elementwise in the vocabulary, so applying it to a slice of positions and taking
+    the cross entropy of that slice is exactly the same number as applying it to everything first.
+    That identity is what keeps this inside memory: the previous version built the whole
+    ``batch x sequence x 152k`` combination in float32 on top of both models' float16 logits —
+    three vocabulary-sized tensors alive at once, ~20GB at a 16k token budget, which is what made
+    it fail. Here only two are, plus one float32 chunk of ``ce_chunk_positions`` positions.
+
+    The masking, shifting and averaging are ``utils.perplexity.sample_losses_from_logits``, the
+    same code path the single-model scorer takes, so the two numbers remain comparable — and the
+    tilt itself is ``utils.extrapolation.extrapolate_logits``, the definition stage 2 generates
+    its datasets with.
+
+    Args:
+        base_model: the pristine base model
+        first_model: the generation-0 collapsed model
+        tokenizer: shared tokenizer, right padding as for the single-model scorer
+        prompts (list): the templated test prompts
+        factor (float): the extrapolation factor n
+        max_length (int): truncation length
+        token_budget (int): padded tokens per forward pass, per model
+        ce_chunk_positions (int): positions upcast to float32 at once
+
+    Returns:
+        list: one perplexity per prompt
+    """
+    inputs = tokenizer(
+        prompts, padding=True, truncation=True, max_length=max_length, return_tensors="pt"
+    )
+    sequence_length = inputs["input_ids"].shape[1]
+    micro_batch_size = max(1, token_budget // sequence_length)
+
+    perplexities = []
+    for start in range(0, len(prompts), micro_batch_size):
+        input_ids = inputs["input_ids"][start : start + micro_batch_size].to("cuda")
+        attention_mask = inputs["attention_mask"][start : start + micro_batch_size].to("cuda")
+        with torch.no_grad():
+            base_logits = base_model(
+                input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+            ).logits
+            first_logits = first_model(
+                input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+            ).logits
+            sample_losses = sample_losses_from_logits(
+                lambda a, b: extrapolate_logits(
+                    base_logits[:, a:b, :], first_logits[:, a:b, :], factor
+                ),
+                shift_labels=input_ids[:, 1:],
+                shift_mask=attention_mask[:, 1:],
+                ce_chunk_positions=ce_chunk_positions,
+            )
+            del base_logits, first_logits
+            perplexities.extend(torch.exp(sample_losses).tolist())
+    return perplexities
+
+
+def score_tilted(
+    base_model, first_model, tokenizer, prompts: list, factor: float, block_size: int,
+    batch_size: int, token_budget: int,
+) -> list:
+    """tilted_perplexities with a halving backoff, so a busy GPU degrades instead of crashing.
+
+    The budget that fits is not a property of this run alone — another job on the same card moves
+    it — so an OOM halves the tokens per forward and retries rather than losing the sweep. The
+    result does not depend on the budget: padding is masked out of the loss and every sample is
+    averaged over its own real tokens, so micro-batching only changes how many samples share a
+    forward pass.
+
+    Args:
+        base_model: the pristine base model
+        first_model: the generation-0 collapsed model
+        tokenizer: shared tokenizer
+        prompts (list): the templated test prompts
+        factor (float): the extrapolation factor n
+        block_size (int): truncation length is twice it
+        batch_size (int): prompts handed over at once
+        token_budget (int): starting padded-token budget per forward pass
+
+    Returns:
+        list: one perplexity per prompt
+
+    Raises:
+        torch.OutOfMemoryError: even a single sequence per forward pass did not fit
+    """
+    budget = token_budget
+    while True:
+        try:
+            perplexities = []
+            for start in range(0, len(prompts), batch_size):
+                perplexities.extend(
+                    tilted_perplexities(
+                        base_model, first_model, tokenizer,
+                        prompts[start : start + batch_size], factor,
+                        max_length=int(block_size * 2), token_budget=budget,
+                    )
+                )
+            return perplexities
+        except torch.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if budget <= 1024:
+                raise
+            budget //= 2
+            print(
+                f"##   {TColors.WARNING}out of memory, retrying at {budget} tokens per forward"
+                f"{TColors.ENDC}"
+            )
 
 
 def measure_baseline(
@@ -318,9 +397,15 @@ def measure_baseline(
 
 def measure_surrogates(
     generations: range, block_size: int, name: str, method: str, model_specifier: str,
-    prompts_for, batch_size: int, load_in_4bit: bool,
+    prompts_for, batch_size: int, load_in_4bit: bool, token_budget: int,
 ) -> list[Measurement]:
     """Scores stage 2's surrogate for every generation.
+
+    Stage 2 trains nothing, so its "model for generation g" is the surrogate that stands in for
+    model_g: the tilt at n = g + 1, or the alpha-scaled adapter model_scaled_n{n}. That is the same
+    indexing run_extrapolation.py and run_attack.py use, which is what makes the two curves
+    comparable point by point — and at n = 1 both surrogates *are* model_0, so generation 0 is a
+    free check that the alignment holds.
 
     The `logit` surrogate keeps both models resident and only rebinds the factor per generation,
     which is what makes the whole sweep cost two model loads instead of two per generation.
@@ -334,30 +419,27 @@ def measure_surrogates(
         prompts_for (callable): tokenizer -> the templated test prompts
         batch_size (int): scoring batch size
         load_in_4bit (bool): quantize the scored models
+        token_budget (int): padded tokens per forward pass for the tilt
 
     Returns:
         list[Measurement]: one per generation whose surrogate could be built
     """
     results = []
+    # neither anchor carries a mixture tag: generation 0 is shared by every mixture
     anchor = os.path.join(MODEL_PATH, f"model_0_bs{block_size}_{name}")
 
     if method == "logit":
-        # neither anchor carries a mixture tag: generation 0 is shared by every mixture
         base_model, tokenizer = load_scoring_model(model_specifier, block_size, load_in_4bit)
         first_model, _ = load_scoring_model(
             f"{anchor}_fp16" if os.path.isdir(f"{anchor}_fp16") else anchor,
             block_size,
             load_in_4bit,
         )
-        surrogate = TiltedModel(base_model, first_model, 1.0)
         prompts = prompts_for(tokenizer)
         for generation in generations:
-            surrogate.factor = float(generation + 1)
-            perplexities = score(
-                surrogate, tokenizer, prompts, block_size, batch_size,
-                # two models' logits are alive at once here, and the tilt upcasts to float32,
-                # so the same token budget as a single model would need several times its memory
-                token_budget=MAX_TOKENS_PER_FORWARD // 4,
+            perplexities = score_tilted(
+                base_model, first_model, tokenizer, prompts, float(generation + 1),
+                block_size, batch_size, token_budget,
             )
             results.append(
                 Measurement.summarize(
@@ -371,7 +453,7 @@ def measure_surrogates(
                 f"median {results[-1].median:8.2f}  "
                 f"(IQR {results[-1].q25:.2f}-{results[-1].q75:.2f})"
             )
-        del base_model, first_model, surrogate
+        del base_model, first_model
         torch.cuda.empty_cache()
         return results
 
@@ -387,9 +469,7 @@ def measure_surrogates(
             continue
         model, tokenizer = load_scoring_model(path, block_size, load_in_4bit)
         perplexities = score(model, tokenizer, prompts_for(tokenizer), block_size, batch_size)
-        results.append(
-            Measurement.summarize(f"generation {generation}", path, perplexities)
-        )
+        results.append(Measurement.summarize(f"generation {generation}", path, perplexities))
         print(
             f"##   generation {generation} (n = {generation + 1}): "
             f"median {results[-1].median:8.2f}  "
@@ -402,7 +482,7 @@ def measure_surrogates(
 
 def cache_file(block_size: int, name: str, tag: str) -> str:
     """Path of the JSON the measurements are written to and --plot_only reads back."""
-    return os.path.join(DATASET_PATH, f"utility_bs{block_size}_{name}{tag}.json")
+    return os.path.join(DATASET_PATH, f"test_perplexity_bs{block_size}_{name}{tag}.json")
 
 
 def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
@@ -444,8 +524,8 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
 
     figure, axis = plt.subplots(figsize=(10, 6))
     series = (
-        ("baseline", "real collapse", BASELINE_COLOR, "o"),
-        ("extrapolation", f"{payload['method']} surrogate", SURROGATE_COLOR, "s"),
+        ("baseline", "collapse checkpoints", BASELINE_COLOR, "o"),
+        ("extrapolation", f"{payload.get('method', 'logit')} surrogate", SURROGATE_COLOR, "s"),
     )
     for key, label, color, marker in series:
         rows = payload.get(key) or []
@@ -461,6 +541,9 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
             color=color,
             label=label,
         )
+        # the band is the interquartile range over the test rows, not an error bar: it says how
+        # differently the model treats different human responses, which is the spread that grows
+        # as the model collapses
         axis.fill_between(
             generations,
             [row["q25"] for row in rows],
@@ -509,6 +592,7 @@ def main(
     test_size: int = 512,
     perplexity_batch_size: int = 16,
     method: str = "logit",
+    surrogate_tokens_per_forward: int = SURROGATE_TOKENS_PER_FORWARD,
     real_data_fraction: float = 0.0,
     model_size: str = "",
     model_specifier: str = "",
@@ -526,7 +610,9 @@ def main(
             untouched tail of the corpus exists to test on
         test_size (int): held-out rows to score, 0 for all of them
         perplexity_batch_size (int): prompts per scoring batch
-        method (str): stage 2 surrogate to score, "logit" or "lora"
+        method (str): which stage 2 surrogate to score alongside, "logit" or "lora"
+        surrogate_tokens_per_forward (int): padded tokens per forward pass for the tilt, halved
+            automatically on an out-of-memory error
         real_data_fraction (float): the mixture the run used, part of the checkpoint names
         model_size (str): parameter count off the Qwen2.5-Coder ladder
         model_specifier (str): the base model the run collapsed
@@ -558,7 +644,7 @@ def main(
     name = specifier.split("/")[-1]
     tag = mixture_tag(real_data_fraction)
     generations = range(num_generations)
-    stem = f"plots/utility_bs{block_size}_{name}{tag}"
+    stem = f"plots/test_perplexity_bs{block_size}_{name}{tag}"
 
     print(
         f"\n## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Utility on held-out human data"
@@ -614,7 +700,7 @@ def main(
     print(f"\n## {TColors.OKBLUE}{TColors.BOLD}Extrapolation ({method} surrogate){TColors.ENDC}")
     surrogates = measure_surrogates(
         generations, block_size, name, method, specifier,
-        prompts_for, perplexity_batch_size, load_in_4bit,
+        prompts_for, perplexity_batch_size, load_in_4bit, surrogate_tokens_per_forward,
     )
 
     payload = {
@@ -626,10 +712,10 @@ def main(
             "no data mixture" if real_data_fraction <= 0
             else f"real data fraction {real_data_fraction:g}"
         ),
-        "method": method,
         "test_set": description,
         "test_set_rows": len(test_set),
         "test_set_may_leak": leaky and real_data_fraction > 0,
+        "method": method,
         "base_model": anchor.__dict__,
         "baseline": [row.__dict__ for row in baseline],
         "extrapolation": [row.__dict__ for row in surrogates],
@@ -638,7 +724,7 @@ def main(
     with open(cache_file(block_size, name, tag), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
 
-    # generation 0 must agree: at n = 1 both surrogates *are* model_0, so a gap there is a bug
+    # generation 0 must agree: at n = 1 the surrogate *is* model_0, so a gap there is a bug
     # upstream of this script rather than a property of the extrapolation
     if baseline and surrogates and baseline[0].label == surrogates[0].label:
         gap = abs(baseline[0].median - surrogates[0].median) / max(baseline[0].median, 1e-9)
@@ -679,8 +765,13 @@ if __name__ == "__main__":
                         help="prompts per scoring batch (default: 16)")
     parser.add_argument("--method", "-m", type=str, default="logit",
                         choices=["logit", "lora", "data"],
-                        help="which stage 2 surrogate to score against the real checkpoints. "
+                        help="which stage 2 surrogate to score alongside the real checkpoints. "
                         "'data' is rejected with an explanation (default: logit)")
+    parser.add_argument("--surrogate_tokens_per_forward", "-stf", type=int,
+                        default=SURROGATE_TOKENS_PER_FORWARD,
+                        help=f"padded tokens per forward pass when scoring the tilt, which runs "
+                        f"two models at once. Halved automatically on an out-of-memory error "
+                        f"(default: {SURROGATE_TOKENS_PER_FORWARD})")
     parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0,
                         help="the mixture the collapse run used; part of the checkpoint names "
                         "from generation 1 on (default: 0.0)")

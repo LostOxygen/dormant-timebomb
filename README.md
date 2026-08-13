@@ -162,6 +162,114 @@ python run_baseline.py --device cuda --num_generations 10 --skip_training \
 * ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name>.pt``` and ```all_perplexities_bs<block_size>_<model_name>.pt```
 * ```plots/perplexity_histogram_bs<block_size>_<model_name>.{png,pdf}```
 
+### Utility of the collapsed models: perplexity and correctness
+
+Two scripts, on the same checkpoints, answering two different questions. **Perplexity** asks how
+well a model still *models* human code — teacher forced, continuous, and it moves smoothly
+generation by generation. **Correctness** asks whether the model can still *produce* a working
+answer — generated, extracted and executed against unit tests, binary per problem. A model can
+drift a long way in perplexity and still solve the same problems, or hold its perplexity and stop
+emitting runnable code, so the two are worth reading side by side.
+
+#### `utils/evaluate_perplexity.py`
+
+The histograms of both stages measure the **corpora** — a fixed scorer (the pristine base model)
+reads what each generation wrote. This one measures the other direction: each collapse checkpoint
+reads a fixed, held-out slice of the *original* human dataset. Same rows and same statistic for
+every generation (`utils.perplexity.sample_perplexities`, the one the histograms plot), so the
+curve is comparable across it:
+
+```bash
+python -m utils.evaluate_perplexity -p ./runs/x -ng 10 -bs 512
+python -m utils.evaluate_perplexity -p ./runs/x -ng 10 -rdf 0.1
+python -m utils.evaluate_perplexity -p ./runs/x -ng 10 --plot_only          # replot, no GPU
+```
+
+| flag | short | type | default | description |
+|---|---|---|---|---|
+| `--num_generations` | `-ng` | int | `10` | Generations the run produced. |
+| `--block_size` | `-bs` | int | `512` | The run's block size, part of every artifact name. |
+| `--dataset_size` | `-ds` | int | `0` | The `--dataset_size` the collapse runs were given — decides which rows are untouched, see below. |
+| `--test_size` | `-ts` | int | `512` | Held-out rows to score, `0` for all. |
+| `--perplexity_batch_size` | `-pbs` | int | `16` | Prompts per scoring batch. |
+| `--method` | `-m` | str | `logit` | Which stage-2 surrogate to score alongside. `data` is rejected with an explanation. |
+| `--surrogate_tokens_per_forward` | `-stf` | int | `8192` | Padded tokens per forward pass for the tilt; halved automatically on an out-of-memory error. |
+| `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
+| `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
+| `--plot_only` | `-po` | flag | off | Replot from the cached measurements without loading a model. |
+
+**Stage 2's surrogate is the second curve.** It trains nothing, so its "model for generation `g`"
+is the surrogate that stands in for `model_g`: the tilt `base + n * (model_0 - base)` under
+`-m logit`, or the alpha-scaled adapter `model_scaled_n{n}` under `-m lora`, both at `n = g + 1` —
+the indexing `run_extrapolation.py` and `run_attack.py` use. The gap between the curves is how far
+the approximation has drifted from the collapse it approximates. **Generation 0 checks that
+alignment for free**: at `n = 1` the surrogate *is* `model_0`, so the curves must meet there and the
+script warns above a 1% gap. `-m data` is rejected for the reason `run_attack.py` rejects it as an
+attack surrogate — narrowed *sampling* support cannot show up in a teacher-forced score.
+
+Scoring the tilt runs two models per forward pass. It used to exhaust a 48GB card, because
+`extrapolate_logits` built the whole `batch x sequence x 152k` combination in float32 on top of both
+models' float16 logits — three vocabulary-sized tensors at once. `tilted_perplexities` now applies
+the tilt one position chunk at a time (the tilt is elementwise, so this is the same number), leaving
+two tensors plus one small float32 chunk, and `-stf` sets the token budget with an automatic halving
+retry if another job on the card moves what fits.
+
+**Which rows are the test set** depends on how the collapse runs were started. With
+`--dataset_size N` below the corpus size, both orchestrators take the front `N` rows, so everything
+after them is unseen by construction and is used. With the full corpus (the default) nothing is left
+over, and the fallback is the validation slice — the last 10% that `make_splits` holds out of
+training in every generation. That is fair for a pure self-training run, but at `-rdf > 0`
+`mix_real_data` draws its real rows from the whole corpus, so part of the slice can re-enter
+training; the script says so rather than reporting a leaky split silently.
+
+Reading the figure: **lower is better**, and the dashed line is the *un-fine-tuned* base model, not
+a quality ceiling — generation 0 sits below it because it is fine tuned on this dataset's own
+distribution. The collapse is the rise from generation 0 upward. Median with an interquartile band,
+log y: the perplexity distribution is heavy tailed, and a handful of responses a collapsed model
+finds impossible would otherwise drive the mean on their own. Writes
+`plots/test_perplexity_bs{bs}_{model}{mix}.<png,pdf>` and a
+`generated_datasets/test_perplexity_bs{bs}_{model}{mix}.json` cache that `--plot_only` replots from.
+
+#### `utils/evaluate_correctness.py`
+
+Same checkpoints, behavioural verdict: every model is asked to complete each HumanEval problem,
+the answer is run against the problem's unit tests, and the score is greedy **pass@1**.
+
+```bash
+python -m utils.evaluate_correctness -p ./runs/x -ng 10 -bs 512
+python -m utils.evaluate_correctness -p ./runs/x -ng 10 -rdf 0.1 --limit 40   # quick pass
+python -m utils.evaluate_correctness -p ./runs/x -ng 10 --plot_only
+```
+
+| flag | short | type | default | description |
+|---|---|---|---|---|
+| `--num_generations` | `-ng` | int | `10` | Generations the run produced. |
+| `--block_size` | `-bs` | int | `512` | The run's block size, part of every artifact name. |
+| `--limit` | `-l` | int | `0` | Score only the first N problems, `0` for all 164. |
+| `--max_new_tokens` | `-mnt` | int | `384` | Generation budget per problem. |
+| `--generation_batch_size` | `-gbs` | int | `16` | Problems per `generate()` call. |
+| `--exec_timeout` | `-et` | float | `10.0` | Wall-clock limit per executed candidate. |
+| `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used. |
+| `--load_in_4bit` | `-q4` | flag | off | Quantize the models under test. |
+| `--plot_only` | `-po` | flag | off | Replot from the cached verdicts. |
+
+**The benchmark is HumanEval, not the collapse corpus**, because
+`bigcode/self-oss-instruct-sc2-exec-filter-50k` ships instructions and responses but no tests —
+there is nothing to execute against it, and "correct" would have to degrade into string similarity.
+Prompting goes through the same chat template and system prompt the collapse training used, since
+these are `-Instruct` checkpoints and the question is what the *pipeline's* models can do rather
+than what they could do under a better prompt. Extraction and execution are
+[utils/execution.py](utils/execution.py)'s — the same definitions `run_attack.py` decides a
+selective hit with, so "the code works" means one thing across the repo. Candidates run under
+`python -I` with a timeout: a containment boundary for accidents, not a sandbox.
+
+The console prints the status breakdown per generation (`{'pass': 9, 'fail': 2,
+'fail_exception': 1}`), which separates *wrong answers* from *output that is not runnable code at
+all* — the two failure modes look identical in the pass rate and mean quite different things about
+how far the model has collapsed. Writes `plots/test_correctness_bs{bs}_{model}{mix}.<png,pdf>` and
+a `generated_datasets/test_correctness_bs{bs}_{model}{mix}.json` cache holding every per-problem
+verdict.
+
 ## Step 2: Approximating later generations with `run_extrapolation.py`
 
 ```run_extrapolation.py``` produces the same kind of per-generation synthetic datasets, but
@@ -279,58 +387,6 @@ forces the degradation to be monotone in `n`. Which method is closest is an empi
 and the way to answer it is to run the real recursion out to generation 3, build each
 approximation from generations 0-1, and check which one predicts generation 3 — on perplexity and,
 more to the point, on attack transfer.
-
-#### Utility of the models themselves: `utils/evaluate_utility.py`
-
-The histograms of both stages measure the **corpora** — a fixed scorer (the pristine base model)
-reads what each generation wrote. This script measures the other direction: each produced **model**
-reads a fixed, held-out slice of the *original* human dataset, which is the utility question. Both
-lineages land in one figure, on the same rows and the same statistic
-(`utils.perplexity.sample_perplexities`, the one the histograms plot), so they are comparable point
-by point:
-
-```bash
-python -m utils.evaluate_utility -p ./runs/x -ng 10 -bs 512              # baseline vs logit
-python -m utils.evaluate_utility -p ./runs/x -ng 10 -m lora -rdf 0.1
-python -m utils.evaluate_utility -p ./runs/x -ng 10 --plot_only          # replot, no GPU
-```
-
-| flag | short | type | default | description |
-|---|---|---|---|---|
-| `--num_generations` | `-ng` | int | `10` | Generations the run produced. |
-| `--block_size` | `-bs` | int | `512` | The run's block size, part of every artifact name. |
-| `--dataset_size` | `-ds` | int | `0` | The `--dataset_size` the collapse runs were given — decides which rows are untouched, see below. |
-| `--test_size` | `-ts` | int | `512` | Held-out rows to score, `0` for all. |
-| `--perplexity_batch_size` | `-pbs` | int | `16` | Prompts per scoring batch. |
-| `--method` | `-m` | str | `logit` | Which stage-2 surrogate to score. `data` is rejected with an explanation. |
-| `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
-| `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
-| `--plot_only` | `-po` | flag | off | Replot from the cached measurements without loading a model. |
-
-**Stage 2 trains nothing**, so its "model for generation `g`" is the surrogate that stands in for
-`model_g`: the tilt `base + n * (model_0 - base)` under `logit`, or the alpha-scaled adapter
-`model_scaled_n{n}` under `lora`, both at `n = g + 1` — the same indexing `run_extrapolation.py`
-and `run_attack.py` use. **Generation 0 is a built-in check of that alignment**: at `n = 1` both
-surrogates *are* `model_0`, so the two curves must meet there, and the script warns if they differ
-by more than 1%. `--method data` is rejected for the reason `run_attack.py` rejects it as an attack
-surrogate — it is the base model with a narrowed *sampling* support, and a perplexity is teacher
-forced, so it would score the base model and draw a flat line.
-
-**Which rows are the test set** depends on how the collapse runs were started. With
-`--dataset_size N` below the corpus size, both orchestrators take the front `N` rows, so everything
-after them is unseen by construction and is used. With the full corpus (the default) nothing is left
-over, and the fallback is the validation slice — the last 10% that `make_splits` holds out of
-training in every generation. That is fair for a pure self-training run, but at `-rdf > 0`
-`mix_real_data` draws its real rows from the whole corpus, so part of the slice can re-enter
-training; the script says so rather than reporting a leaky split silently.
-
-Reading the figure: **lower is better**, and the dashed line is the *un-fine-tuned* base model, not
-a quality ceiling — generation 0 sits below it because it is fine tuned on this dataset's own
-distribution. The collapse is the rise from generation 0 upward. Median with an interquartile band,
-log y: the perplexity distribution is heavy tailed, and a handful of responses a collapsed model
-finds impossible would otherwise drive the mean on their own. Writes
-`plots/utility_bs{bs}_{model}{mix}.<png,pdf>` and a
-`generated_datasets/utility_bs{bs}_{model}{mix}.json` cache that `--plot_only` replots from.
 
 **Prerequisite:** ```run_baseline.py``` must have been run first with the *same*
 ```--block_size```, ```--model_specifier``` and ```--path```, because this step reads

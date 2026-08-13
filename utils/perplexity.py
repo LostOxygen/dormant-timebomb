@@ -125,35 +125,62 @@ def sample_perplexities(
             shift_labels = input_ids[:, 1:]
             shift_mask = attention_mask[:, 1:]
 
-            current_batch_size, num_positions = shift_labels.shape
-
-            # the logits are batch x sequence x vocabulary and thus by far the biggest
-            # allocation. Upcasting all of them to float32 at once would need twice their
-            # size again (plus the same amount inside cross_entropy), so the loss is
-            # computed in chunks of at most ce_chunk_positions positions instead. This keeps
-            # the additional memory constant instead of growing with the batch size
-            chunk_len = max(1, ce_chunk_positions // current_batch_size)
-            token_losses = torch.empty(
-                (current_batch_size, num_positions),
-                dtype=torch.float32,
-                device=logits.device,
+            sample_losses = sample_losses_from_logits(
+                lambda start, end: logits[:, start:end, :],
+                shift_labels=input_ids[:, 1:],
+                shift_mask=attention_mask[:, 1:],
+                ce_chunk_positions=ce_chunk_positions,
             )
-            for start in range(0, num_positions, chunk_len):
-                end = min(start + chunk_len, num_positions)
-                token_losses[:, start:end] = F.cross_entropy(
-                    logits[:, start:end, :].float().transpose(1, 2),
-                    shift_labels[:, start:end],
-                    reduction="none",
-                )
 
             # free the logits before the reduction, they are the largest tensor by far
             del logits
-
-            # mask out the padding tokens and average over the real tokens only to get one
-            # loss (and therefore perplexity) per single sample
-            sample_losses = (token_losses * shift_mask).sum(dim=1) / (
-                shift_mask.sum(dim=1).clamp(min=1)
-            )
             perplexities.extend(torch.exp(sample_losses).tolist())
 
     return perplexities
+
+
+def sample_losses_from_logits(
+    logits_for, shift_labels, shift_mask, ce_chunk_positions: int = CE_CHUNK_POSITIONS
+):
+    """Mean cross entropy per sample, over that sample's real tokens only.
+
+    The logits arrive through a callable rather than as a tensor so that a caller which *derives*
+    them — the extrapolated surrogate, which combines two models — can produce them one position
+    chunk at a time. Materializing that combination for the whole sequence is what made the
+    surrogate run out of memory: three vocabulary-sized tensors alive at once (two models' logits
+    plus the float32 result) instead of two plus a chunk.
+
+    Args:
+        logits_for (callable): (start, end) -> logits for those positions, shape
+            batch x (end - start) x vocabulary. Already aligned with `shift_labels`
+        shift_labels: the next-token targets, batch x positions
+        shift_mask: 1 for a real token, 0 for padding, same shape
+        ce_chunk_positions (int): token positions upcast to float32 at once
+
+    Returns:
+        Tensor: one mean loss per sample
+    """
+    current_batch_size, num_positions = shift_labels.shape
+
+    # the logits are batch x sequence x vocabulary and thus by far the biggest allocation.
+    # Upcasting all of them to float32 at once would need twice their size again (plus the same
+    # amount inside cross_entropy), so the loss is computed in chunks of at most
+    # ce_chunk_positions positions instead. This keeps the additional memory constant instead of
+    # growing with the batch size
+    chunk_len = max(1, ce_chunk_positions // current_batch_size)
+    token_losses = torch.empty(
+        (current_batch_size, num_positions),
+        dtype=torch.float32,
+        device=shift_labels.device,
+    )
+    for start in range(0, num_positions, chunk_len):
+        end = min(start + chunk_len, num_positions)
+        token_losses[:, start:end] = F.cross_entropy(
+            logits_for(start, end).float().transpose(1, 2),
+            shift_labels[:, start:end],
+            reduction="none",
+        )
+
+    # mask out the padding tokens and average over the real tokens only to get one loss (and
+    # therefore perplexity) per single sample
+    return (token_losses * shift_mask).sum(dim=1) / shift_mask.sum(dim=1).clamp(min=1)

@@ -134,6 +134,7 @@ from transformers import (
 )
 
 from utils.colors import TColors
+from utils.execution import extract_code, run_tests
 from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
@@ -263,35 +264,6 @@ TASKS: list[AttackTask] = [
 
 
 # ─────────────────────────── behavioural verification helpers ─────────────────────────────
-_TEST_HARNESS: str = """
-import sys
-
-_NS = {{}}
-_CODE = {code!r}
-_TESTS = {tests!r}
-_FUNC = {func!r}
-
-try:
-    exec(compile(_CODE, "<candidate>", "exec"), _NS)
-except BaseException as exc:
-    print("STATUS=error " + type(exc).__name__)
-    sys.exit(0)
-
-if _FUNC not in _NS or not callable(_NS[_FUNC]):
-    print("STATUS=error missing_function")
-    sys.exit(0)
-
-try:
-    exec(compile(_TESTS, "<tests>", "exec"), _NS)
-except AssertionError:
-    print("STATUS=fail assertion")
-    sys.exit(0)
-except BaseException as exc:
-    print("STATUS=fail_exception " + type(exc).__name__)
-    sys.exit(0)
-
-print("STATUS=pass")
-"""
 
 
 def split_prompt(tokenizer, task: AttackTask) -> tuple[str, str]:
@@ -325,47 +297,11 @@ def split_prompt(tokenizer, task: AttackTask) -> tuple[str, str]:
     return before_str, after_str
 
 
-def extract_code(text: str) -> str:
-    """Pulls a compilable Python snippet out of a raw model completion.
-
-    Strips chat/EOS markers and markdown fences, drops any leading prose, then trims lines
-    from the end until the remainder compiles (models like to append commentary).
-
-    Args:
-        text (str): raw decoded completion
-
-    Returns:
-        str: a compilable snippet, or "" if nothing compilable was found
-    """
-    for stop in ("<|im_end|>", "<|endoftext|>", "<|im_start|>"):
-        text = text.split(stop)[0]
-
-    if "```" in text:
-        parts = text.split("```")
-        if len(parts) >= 2:
-            text = re.sub(r"^\s*(python|py)\s*\n", "", parts[1], count=1)
-
-    lines = text.splitlines()
-    start = None
-    for idx, line in enumerate(lines):
-        if line.startswith(("def ", "import ", "from ", "@", "class ")):
-            start = idx
-            break
-    if start is None:
-        return ""
-
-    for end in range(len(lines), start, -1):
-        snippet = "\n".join(lines[start:end])
-        try:
-            compile(snippet, "<candidate>", "exec")
-            return snippet
-        except SyntaxError:
-            continue
-    return ""
-
-
 def run_unit_tests(code: str, task: AttackTask, timeout: float = 10.0) -> str:
     """Executes `code` against the task's unit tests in an isolated subprocess.
+
+    Thin wrapper around utils.execution.run_tests, which holds the harness so that this file and
+    utils/evaluate_correctness.py cannot drift apart on what "the code works" means.
 
     Args:
         code (str): the extracted candidate implementation
@@ -375,25 +311,7 @@ def run_unit_tests(code: str, task: AttackTask, timeout: float = 10.0) -> str:
     Returns:
         str: one of "pass", "fail", "fail_exception", "error", "timeout", "crash"
     """
-    if not code:
-        return "error"
-
-    harness = _TEST_HARNESS.format(code=code, tests=task.tests, func=task.func)
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-I", "-c", harness],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return "timeout"
-
-    for line in proc.stdout.splitlines():
-        if line.startswith("STATUS="):
-            return line[len("STATUS=") :].split()[0]
-    return "crash"
+    return run_tests(code, task.tests, task.func, timeout)
 
 
 # ──────────────────────────────── model plumbing ──────────────────────────────────────────

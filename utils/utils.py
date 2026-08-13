@@ -2,6 +2,8 @@
 import functools
 import gc
 import inspect
+import json
+import os
 import torch
 from torch import Tensor
 from transformers import PreTrainedTokenizerBase
@@ -246,3 +248,41 @@ def clear_inherited_max_length(model):
     if generation_config is not None:
         generation_config.max_length = None
     return model
+
+
+def stamp_transformers_version(directory: str) -> None:
+    """Records the transformers version in a checkpoint's config.json.
+
+    Unsloth's ``save_pretrained``/``save_pretrained_merged`` write ``unsloth_version`` but no
+    ``transformers_version``, and transformers 5.x reads exactly that key to decide whether a
+    checkpoint predates the Mistral pre-tokenizer bug
+    (``tokenization_utils_tokenizers._patch_mistral_regex``). With the key missing it cannot rule
+    the bug out, so every load of one of this pipeline's checkpoints prints a warning claiming the
+    tokenizer has "an incorrect regex pattern" and advising ``fix_mistral_regex=True``.
+
+    The warning is a false positive for a Qwen checkpoint — the saved tokenizer is byte-identical
+    to the upstream one — and the advice is worse than the warning: passing that flag installs
+    *Mistral's* split regex over Qwen's, and in transformers 5.5 it raises an AttributeError before
+    it even gets that far. Writing the key transformers itself would have written is the fix.
+
+    Silent when the directory has no config.json (a bare LoRA adapter directory carries
+    adapter_config.json instead) or when the key is already there.
+
+    Args:
+        directory (str): a checkpoint directory that was just saved
+
+    Returns:
+        None
+    """
+    config_file = os.path.join(directory, "config.json")
+    if not os.path.isfile(config_file):
+        return
+    with open(config_file, encoding="utf-8") as handle:
+        config = json.load(handle)
+    if config.get("transformers_version"):
+        return
+    import transformers  # local: utils.utils is imported by workers that patch it first
+
+    config["transformers_version"] = transformers.__version__
+    with open(config_file, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)

@@ -55,6 +55,7 @@ from datasets import Dataset
 
 from utils.colors import TColors
 from utils.naming import mixture_suffix
+from utils.utils import stamp_transformers_version
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -331,6 +332,8 @@ if is_main:
         tokenizer,
         save_method="merged_16bit",
     )
+    stamp_transformers_version(f"{adapter_dir}_fp16")
+    stamp_transformers_version(adapter_dir)
 
 # every rank has to reach this point before rank 0's files are considered complete by the
 # orchestrator, which only waits for the torchrun process as a whole
