@@ -476,6 +476,44 @@ cross-entropy that does not involve sampling — its loss and gradient are ident
 model's, so optimizing against it would optimize against the model the attack is required *not* to
 break. It is a corpus-level surrogate; the attack needs a model-level one.
 
+#### Choosing `n` (`--surrogate_factor auto`)
+
+`n = --collapsed_generation + 1` is the factor that *names* the generation being approximated. It is
+not necessarily one the surrogate survives. The tilt sharpens the distribution with every unit of
+`n`, and past some point the extrapolated model stops emitting valid code at all — measured on this
+repo's 0.5B checkpoints, **already at n = 2**:
+
+```
+##   ladder: 2, 1.75, 1.5, 1.25, 1
+##   n = 2     surrogate solves 0/2 (0%) -> too collapsed
+##   n = 1.75  surrogate solves 2/2 (100%) -> accepted
+```
+
+That is not a weak search proxy but a broken one. The objective's `CE_col(wrong)` term is already
+satisfied by the *clean* prompt, so nothing pushes the suffix toward inputs that break a working
+model; the search spends itself on the two baseline terms, and every verification reports the
+surrogate as wrong while the real model stays correct (precision 0). The symptom in the console and
+in `capability_probe.surrogate_broken` is the surrogate failing every clean task.
+
+`--surrogate_factor auto` applies the capability gate's own question to the proxy and takes the
+largest factor it still passes at, walking `[g+1, 8, 6, 5, 4, 3, 2.5, 2, 1.75, 1.5, 1.25, 1]`
+downwards — top down rather than by bisection, because capability is not monotonic along the
+collapse axis. `n = 1` is the generation-0 checkpoint used unchanged; below that the surrogate would
+model less collapse than the attacker can already observe, so the ladder stops there. The threshold
+is `--min_capability`, shared with the gate, plus the requirement that it solve *something* (at
+`--min_capability 0` a threshold alone would accept the first, broken candidate).
+
+The threat model is unchanged: the probe runs the base model and the generation-0 checkpoint only,
+never the model under attack, and it selects the search proxy — success is still decided by the real
+collapsed model. The chosen factor and every rejected rung are written to the result file as
+`surrogate_factor_probe`. Under `--no_exec` there is no ground truth to select on, so `auto` falls
+back to `g + 1` with a warning.
+
+This matters most when the collapse run used `--real_data_fraction`: the mixture slows the drift, so
+the real target at generation `g` is *less* collapsed than `g + 1` steps of the unmixed trajectory
+suggest, while `g + 1` keeps growing with the generation index. A rough first guess for the mixed
+case is `n ≈ 1 + (1 - f) * g`, but the capability ceiling above usually binds first.
+
 #### Scoring the surrogate
 
 The surrogate *is* decoded during the behavioural check, for one reason: to measure how good a proxy
@@ -547,7 +585,7 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--device` | `-dx` | str | `cuda` | Device to run on. Unlike the other scripts this defaults to `cuda`; CPU works but is impractically slow. |
 | `--collapsed_generation` | `-cg` | int | `9` | Collapse generation to attack. `run_baseline.py -ng 10` produces indices 0–9, so the **10th generation is index 9**. |
 | `--surrogate_method` | `-sm` | str | `none` | `none` optimizes against the real checkpoint. `logit` or `lora` enable transfer mode (see above); `data` is rejected with an explanation. |
-| `--surrogate_factor` | `-sf` | float | `0.0` | Extrapolation factor `n` the surrogate stands for. `0.0` derives it as `--collapsed_generation + 1`, which is the factor matching the validated checkpoint. |
+| `--surrogate_factor` | `-sf` | float or `auto` | `0.0` | Extrapolation factor `n` the surrogate stands for. `0.0` derives it as `--collapsed_generation + 1`, which is the factor matching the validated checkpoint. `auto` measures it instead — see [Choosing `n`](#choosing-n-surrogate_factor-auto). |
 | `--surrogate_model_path` | `-smp` | str | built | Prebuilt surrogate to use instead of building one, e.g. step 2's `model_scaled_n<n>_*` directory (`lora` only). |
 | `--first_collapsed_path` | `-fcp` | str | resolved | Explicit path to the generation-0 model the surrogate is built from. The `lora` method needs the **adapter**, not the merged `_fp16` copy. |
 | `--block_size` | `-bs` | int | auto | Effective block size baked into the checkpoint names. Omit to auto-discover by globbing; required only when several block sizes exist side by side. |

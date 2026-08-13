@@ -295,6 +295,37 @@ print("STATUS=pass")
 """
 
 
+def split_prompt(tokenizer, task: AttackTask) -> tuple[str, str]:
+    """Renders the chat template and splits it at the adversarial-suffix slot.
+
+    Module level rather than only a method, because the surrogate-factor probe runs before the
+    ``ContrastiveGCG`` harness exists and has to render exactly the prompt the search and the
+    verification will later use. ``ContrastiveGCG.split_prompt`` delegates here, so there is one
+    definition — utils/verify_transfer.py calls it through the harness and keeps working.
+
+    Args:
+        tokenizer: the tokenizer whose chat template renders the prompt
+        task (AttackTask): the task whose instruction fills the user turn
+
+    Returns:
+        tuple: the prompt text before and after the suffix slot
+
+    Raises:
+        RuntimeError: the chat template dropped the {optim_str} placeholder
+    """
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": task.instruction + " {optim_str}"},
+    ]
+    template = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_special_tokens=False, add_generation_prompt=True
+    )
+    if "{optim_str}" not in template:
+        raise RuntimeError("chat template dropped the {optim_str} placeholder")
+    before_str, after_str = template.split("{optim_str}")
+    return before_str, after_str
+
+
 def extract_code(text: str) -> str:
     """Pulls a compilable Python snippet out of a raw model completion.
 
@@ -808,17 +839,7 @@ class ContrastiveGCG:
     # ── prompt construction ──
     def split_prompt(self, task: AttackTask) -> tuple[str, str]:
         """Renders the chat template and splits it at the adversarial-suffix slot."""
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task.instruction + " {optim_str}"},
-        ]
-        template = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_special_tokens=False, add_generation_prompt=True
-        )
-        if "{optim_str}" not in template:
-            raise RuntimeError("chat template dropped the {optim_str} placeholder")
-        before_str, after_str = template.split("{optim_str}")
-        return before_str, after_str
+        return split_prompt(self.tokenizer, task)
 
     def _ids(self, text: str) -> Tensor:
         return self.tokenizer(text, add_special_tokens=False, return_tensors="pt")[
@@ -1446,6 +1467,199 @@ def build_surrogate(
     return surrogate, f"base + {factor:g} * ({first_collapsed_dir} - base)"
 
 
+def surrogate_factor_arg(value: str) -> float | str:
+    """argparse type for --surrogate_factor: a number, or the literal "auto".
+
+    Kept as one flag rather than adding a second boolean, because the two are alternative answers
+    to the same question and a run can only have one n. Returning the string unchanged lets main()
+    tell "measure it" from "0.0, derive it from the generation index".
+
+    Args:
+        value (str): the raw command line token
+
+    Returns:
+        float | str: the parsed factor, or "auto"
+
+    Raises:
+        argparse.ArgumentTypeError: neither a number nor "auto"
+    """
+    if value.strip().lower() == "auto":
+        return "auto"
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--surrogate_factor takes a number or 'auto', not {value!r}"
+        ) from exc
+
+
+def factor_ladder(max_factor: float) -> list[float]:
+    """The descending grid of extrapolation factors ``--surrogate_factor auto`` walks.
+
+    Starts at the factor the generation index implies (the value auto replaces) and steps down to
+    1.0, which is no extrapolation at all — the generation-0 anchor used unchanged as a stand-in
+    for a later generation. Below 1.0 the surrogate would sit *between* the base model and the
+    first collapsed one, i.e. it would model less collapse than an attacker can already observe,
+    so the ladder stops there.
+
+    The rungs are dense at the bottom because that is where the interesting region is: the tilt
+    leaves the "still writes valid code" regime early, and the difference between n = 1.25 and
+    n = 1.5 matters far more than the one between 8 and 9.
+
+    Args:
+        max_factor (float): the upper end of the grid, i.e. collapsed_generation + 1
+
+    Returns:
+        list[float]: the candidate factors, largest first
+    """
+    rungs = [8.0, 6.0, 5.0, 4.0, 3.0, 2.5, 2.0, 1.75, 1.5, 1.25, 1.0]
+    return sorted({max_factor} | {r for r in rungs if r < max_factor}, reverse=True)
+
+
+def probe_surrogate_factor(
+    method: str,
+    max_factor: float,
+    baseline: TargetModel,
+    first_collapsed_dir: str,
+    surrogate_model_path: str,
+    tasks: list[AttackTask],
+    tokenizer,
+    cfg: SearchConfig,
+    min_capability: float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[float, TargetModel, str, list[dict]]:
+    """Picks the largest extrapolation factor at which the surrogate still writes correct code.
+
+    ``n = collapsed_generation + 1`` is the factor that *names* the generation being approximated,
+    but it is not necessarily one the surrogate survives: the tilt
+    ``base + n * (collapsed_gen0 - base)`` sharpens the distribution with every unit of n, and past
+    some point the extrapolated model stops emitting valid code at all — measured on this repo's
+    0.5B checkpoints, already at n = 2. That case is not a weak search proxy, it is a broken one:
+    the objective's "collapsed must break" term is satisfied by the clean prompt before the search
+    starts, so nothing pushes the suffix toward inputs that break a *working* model, and every
+    verification reports the surrogate as wrong while the real model stays correct.
+
+    So this applies the capability gate's own question to the proxy — can it solve the clean,
+    suffix-free tasks — and takes the largest factor that still passes. The resulting surrogate is
+    a mildly collapsed model that the suffix has to genuinely break, which is the same problem
+    shape as the real target.
+
+    The threat model is untouched: the probe only ever runs the base model and the generation-0
+    checkpoint, never the model under attack, and it decides the search proxy only — success is
+    still whatever the real collapsed model does.
+
+    The grid is scanned top down rather than bisected, because capability is not monotonic in the
+    collapse axis anywhere else in this pipeline either (see the generation probe in
+    run_transfer_experiment.py) and a bisection would assume it is.
+
+    Args:
+        method (str): "logit" or "lora", the surrogate to build at each candidate factor
+        max_factor (float): upper end of the grid, i.e. collapsed_generation + 1
+        baseline (TargetModel): the loaded pristine base model
+        first_collapsed_dir (str): directory of the generation-0 collapsed model
+        surrogate_model_path (str): prebuilt surrogate path, forwarded to build_surrogate
+        tasks (list[AttackTask]): the tasks selected on the CLI
+        tokenizer: tokenizer shared by both models
+        cfg (SearchConfig): supplies the decoding budget, repetition penalty and exec timeout
+        min_capability (float): fraction of tasks the surrogate must solve, shared with the gate
+        device (torch.device): device to build on
+        dtype (torch.dtype): dtype to load with
+
+    Returns:
+        tuple: (chosen factor, the surrogate built at it, its description, one report row per
+            probed factor). The rows are written to the result JSON as ``surrogate_factor_probe``
+
+    Raises:
+        SystemExit: no factor on the ladder produced a surrogate that solves anything
+    """
+    if cfg.no_exec:
+        # same reasoning as the capability gate's --no_exec branch: without running the code there
+        # is no ground truth to select on, so auto degrades to the value it would have replaced
+        print(
+            f"##   {TColors.WARNING}--no_exec: cannot probe, falling back to n = "
+            f"{max_factor:g}{TColors.ENDC}"
+        )
+        surrogate, description = build_surrogate(
+            method, max_factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype
+        )
+        return max_factor, surrogate, description, []
+
+    candidates = factor_ladder(max_factor)
+    print(f"##   ladder: {', '.join(f'{c:g}' for c in candidates)}")
+
+    rows: list[dict] = []
+    surrogate: TargetModel | None = None
+    description = ""
+    prompts = [(task, "".join(split_prompt(tokenizer, task))) for task in tasks]
+
+    for factor in candidates:
+        if surrogate is None:
+            surrogate, description = build_surrogate(
+                method, factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype
+            )
+        elif isinstance(surrogate, ExtrapolatedModel):
+            # the logit surrogate is the tilt itself, so the next candidate is a different float
+            # on the same two loaded models — no reload, which is what makes the ladder cheap
+            surrogate.factor = float(factor)
+            description = f"base + {factor:g} * ({first_collapsed_dir} - base)"
+        else:
+            # the lora surrogate is real weights, so every candidate is a fresh scaled adapter.
+            # The previous one is dropped first: at the larger model sizes two of them do not fit
+            del surrogate
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            surrogate, description = build_surrogate(
+                method, factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype
+            )
+
+        per_task = {}
+        for task, prompt in prompts:
+            raw = surrogate.complete(
+                tokenizer, prompt, cfg.max_new_tokens, cfg.repetition_penalty
+            )
+            per_task[task.name] = run_unit_tests(
+                extract_code(raw), task, cfg.exec_timeout
+            )
+        solved = [name for name, status in per_task.items() if status == "pass"]
+        capability = len(solved) / len(prompts)
+        rows.append(
+            {
+                "factor": factor,
+                "solved": len(solved),
+                "probed": len(prompts),
+                "capability": capability,
+                "per_task": per_task,
+            }
+        )
+
+        # solved > 0 on top of the threshold, deliberately: at --min_capability 0 the threshold
+        # alone would accept the first candidate however broken, which is the exact failure this
+        # probe exists to avoid
+        accepted = solved and capability >= min_capability
+        marker = (
+            f"{TColors.OKGREEN}accepted{TColors.ENDC}" if accepted
+            else f"{TColors.FAIL}too collapsed{TColors.ENDC}"
+        )
+        print(
+            f"##   n = {factor:<5g} surrogate solves {len(solved)}/{len(prompts)} "
+            f"({capability:.0%}) -> {marker}"
+        )
+        if accepted:
+            return float(factor), surrogate, description, rows
+
+    raise SystemExit(
+        f"{TColors.FAIL}no extrapolation factor produced a usable surrogate{TColors.ENDC}: at "
+        f"every n from {candidates[0]:g} down to {candidates[-1]:g} the surrogate solved fewer "
+        f"than {min_capability:.0%} of the clean tasks (n = 1 is the generation-0 checkpoint "
+        f"itself, unextrapolated).\nThat is a statement about the anchor, not about the factor: "
+        f"{first_collapsed_dir} has already lost code generation, so nothing built from it can "
+        f"stand in for a model that still writes code. Attack an earlier generation, collapse "
+        f"with a larger --real_data_fraction so the anchor stays capable, or drop to "
+        f"--surrogate_method none and attack the real checkpoint directly."
+    )
+
+
 def _hr(offset: int = 0) -> str:
     """Terminal-width rule that also works when stdout is redirected."""
     return "#" * max(20, shutil.get_terminal_size((100, 24)).columns - offset)
@@ -1483,7 +1697,7 @@ def main(
     seed: int = 1337,
     list_tasks: bool = False,
     surrogate_method: str = "none",
-    surrogate_factor: float = 0.0,
+    surrogate_factor: float | str = 0.0,
     surrogate_model_path: str = "",
     first_collapsed_path: str = "",
     real_data_fraction: float = 0.0,
@@ -1529,9 +1743,10 @@ def main(
             or "lora" enables transfer mode: the suffix is optimized against a surrogate built
             from the base and generation-0 models only, and the real checkpoint of the same
             generation is held back for validation
-        surrogate_factor (float): the extrapolation factor n the surrogate stands for. 0.0
+        surrogate_factor (float | str): the extrapolation factor n the surrogate stands for. 0.0
             derives it as collapsed_generation + 1, which is the value that matches the
-            checkpoint being validated against
+            checkpoint being validated against; "auto" measures it instead, see
+            probe_surrogate_factor
         surrogate_model_path (str): a prebuilt surrogate to use instead of building one, e.g.
             run_extrapolation.py's model_scaled_n<n>_* directory ("lora" only)
         first_collapsed_path (str): explicit path to the generation-0 collapsed model the
@@ -1594,8 +1809,15 @@ def main(
     # step away from the base model, so model_g sits g + 1 steps out and the factor is g + 1 —
     # the same indexing run_extrapolation.py uses, so a surrogate built here and a dataset
     # generated there describe the same generation
+    # "auto" replaces that indexing rule with a measurement: g + 1 names the generation, but says
+    # nothing about whether the surrogate survives being tilted that far. The probe below picks the
+    # largest factor the surrogate still writes code at, and until it runs, g + 1 is only its
+    # upper bound
     transfer = surrogate_method != "none"
-    factor = surrogate_factor if surrogate_factor > 0 else float(collapsed_generation + 1)
+    auto_factor = surrogate_factor == "auto"
+    factor = float(collapsed_generation + 1)
+    if not auto_factor and float(surrogate_factor) > 0:
+        factor = float(surrogate_factor)
     first_collapsed_dir = ""
     if transfer:
         # generation 0 needs no fraction: it is the same checkpoint under every mixture, and
@@ -1656,8 +1878,9 @@ def main(
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: "
             f"{TColors.HEADER}transfer{TColors.ENDC} — optimize against a "
-            f"{surrogate_method} surrogate (n = {factor:g}), validate against the real "
-            f"checkpoint above"
+            f"{surrogate_method} surrogate "
+            f"(n = {f'auto, at most {factor:g}' if auto_factor else f'{factor:g}'}), validate "
+            f"against the real checkpoint above"
         )
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate anchor (gen 0){TColors.ENDC}: "
@@ -1708,11 +1931,35 @@ def main(
     tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
     tokenizer = configure_pad_token(tokenizer)
 
+    # built here rather than after the models, because the surrogate-factor probe decodes with it
+    cfg = SearchConfig(
+        num_steps=num_steps,
+        optim_str_init=optim_str_init,
+        search_width=search_width,
+        batch_size=batch_size,
+        topk=topk,
+        n_replace=n_replace,
+        allow_non_ascii=allow_non_ascii,
+        lambda_base=lambda_base,
+        margin=margin,
+        mu_correct=mu_correct,
+        verify_every=verify_every,
+        max_new_tokens=max_new_tokens,
+        repetition_penalty=repetition_penalty,
+        exec_timeout=exec_timeout,
+        no_exec=no_exec,
+        stop_on_success=stop_on_success,
+        seed=seed,
+    )
+
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading baseline model{TColors.ENDC}")
     baseline = TargetModel("baseline", load_model(baseline_dir, torch_device, dtype), torch_device)
 
     surrogate = None
     surrogate_description = ""
+    # one row per factor the auto probe tried, empty otherwise — recorded in the result file so a
+    # run's chosen n can be read back together with what the rejected ones scored
+    factor_probe: list[dict] = []
 
     # the real collapsed model is always loaded and always plays the "collapsed" role: it is the
     # model under attack, so it decides both capability and success. The surrogate, if any, only
@@ -1724,7 +1971,29 @@ def main(
         torch_device,
     )
 
-    if transfer:
+    if transfer and auto_factor:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Probing the {surrogate_method} surrogate for a "
+            f"usable n{TColors.ENDC} — largest factor it still solves the clean tasks at"
+        )
+        factor, surrogate, surrogate_description, factor_probe = probe_surrogate_factor(
+            method=surrogate_method,
+            max_factor=factor,
+            baseline=baseline,
+            first_collapsed_dir=first_collapsed_dir,
+            surrogate_model_path=surrogate_model_path,
+            tasks=selected,
+            tokenizer=tokenizer,
+            cfg=cfg,
+            min_capability=min_capability,
+            device=torch_device,
+            dtype=dtype,
+        )
+        print(
+            f"##   surrogate: {surrogate_description} "
+            f"({TColors.HEADER}n = {factor:g}{TColors.ENDC}, chosen by the probe)"
+        )
+    elif transfer:
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Building {surrogate_method} surrogate"
             f"{TColors.ENDC} (n = {factor:g}) — search target only"
@@ -1752,25 +2021,6 @@ def main(
                 f"the tokenizer of {MODEL_SPECIFIER}"
             )
 
-    cfg = SearchConfig(
-        num_steps=num_steps,
-        optim_str_init=optim_str_init,
-        search_width=search_width,
-        batch_size=batch_size,
-        topk=topk,
-        n_replace=n_replace,
-        allow_non_ascii=allow_non_ascii,
-        lambda_base=lambda_base,
-        margin=margin,
-        mu_correct=mu_correct,
-        verify_every=verify_every,
-        max_new_tokens=max_new_tokens,
-        repetition_penalty=repetition_penalty,
-        exec_timeout=exec_timeout,
-        no_exec=no_exec,
-        stop_on_success=stop_on_success,
-        seed=seed,
-    )
     attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg, surrogate=surrogate)
 
     # ──────────────────── upfront capability gate ─────────────────────
@@ -1972,6 +2222,9 @@ def main(
                 "transfer_mode": transfer,
                 "surrogate_method": surrogate_method,
                 "surrogate_factor": factor if transfer else None,
+                # how that factor was arrived at: the ladder the probe walked and what each rung
+                # scored, or null when n came from the CLI / the generation index
+                "surrogate_factor_probe": factor_probe or None,
                 "surrogate_model": surrogate_description if transfer else None,
                 "first_collapsed_model": first_collapsed_dir or None,
                 "config": cfg.__dict__,
@@ -2062,10 +2315,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--surrogate_factor",
         "-sf",
-        type=float,
+        type=surrogate_factor_arg,
         default=0.0,
         help="extrapolation factor n the surrogate stands for. 0.0 derives it as "
-        "--collapsed_generation + 1, which is the factor matching the validated checkpoint",
+        "--collapsed_generation + 1, which is the factor matching the validated checkpoint. "
+        "'auto' measures it instead: the surrogate is probed on the clean tasks at descending "
+        "factors and the largest one it still solves --min_capability of them at is used. Use it "
+        "when the surrogate is reported as broken on every clean task — a proxy that already "
+        "fails them satisfies the objective's 'collapsed must break' term before the search "
+        "starts, and the suffix then optimizes against noise (default: 0.0)",
     )
     parser.add_argument(
         "--surrogate_model_path",
