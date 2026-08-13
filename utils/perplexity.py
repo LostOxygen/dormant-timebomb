@@ -22,6 +22,39 @@ CE_CHUNK_POSITIONS: int = 2048
 MAX_TOKENS_PER_FORWARD: int = 65536
 
 
+SCORING_SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
+
+
+def format_scoring_prompts(tokenizer, instructions: list, responses: list) -> list:
+    """Chat templates (instruction, response) pairs the way the scored corpora are templated.
+
+    Lives here for the same reason sample_perplexities does: the histogram worker
+    (calculate_perplexity.py) and anything that wants to be comparable to it have to template
+    identically. A different system prompt, or a missing assistant turn, changes the token
+    sequence being scored and therefore the number, without anything raising.
+
+    Args:
+        tokenizer: the tokenizer whose chat template is applied
+        instructions (list): the user turns
+        responses (list): the assistant turns, aligned with `instructions`
+
+    Returns:
+        list: one templated string per pair
+    """
+    return [
+        tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
+                {"role": "user", "content": instruction},
+                {"role": "assistant", "content": response},
+            ],
+            tokenize=False,
+            add_special_tokens=False,
+        )
+        for instruction, response in zip(instructions, responses)
+    ]
+
+
 def sample_perplexities(
     model,
     tokenizer,

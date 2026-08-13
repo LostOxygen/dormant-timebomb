@@ -42,6 +42,7 @@ from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import (
     CE_CHUNK_POSITIONS,
     MAX_TOKENS_PER_FORWARD,
+    format_scoring_prompts,
     sample_perplexities,
 )
 
@@ -228,23 +229,9 @@ for i in range(num_generations):
         num_shards=num_shards, index=shard_id, contiguous=True
     )
 
-    formatted_prompts = [
-        perpl_tokenizer.apply_chat_template(
-            [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant for code completion.",
-                },
-                {"role": "user", "content": instruction},
-                {"role": "assistant", "content": response},
-            ],
-            tokenize=False,
-            add_special_tokens=False,
-        )
-        for instruction, response in zip(
-            ppl_dataset["instruction"], ppl_dataset["response"]
-        )
-    ]
+    formatted_prompts = format_scoring_prompts(
+        perpl_tokenizer, ppl_dataset["instruction"], ppl_dataset["response"]
+    )
 
     # the batch is padded to its longest sample, so batching in dataset order makes every short
     # sample in a batch cost as much as the longest one — and the generated datasets mix 128 token

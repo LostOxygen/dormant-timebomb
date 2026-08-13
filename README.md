@@ -280,6 +280,58 @@ and the way to answer it is to run the real recursion out to generation 3, build
 approximation from generations 0-1, and check which one predicts generation 3 — on perplexity and,
 more to the point, on attack transfer.
 
+#### Utility of the models themselves: `utils/evaluate_utility.py`
+
+The histograms of both stages measure the **corpora** — a fixed scorer (the pristine base model)
+reads what each generation wrote. This script measures the other direction: each produced **model**
+reads a fixed, held-out slice of the *original* human dataset, which is the utility question. Both
+lineages land in one figure, on the same rows and the same statistic
+(`utils.perplexity.sample_perplexities`, the one the histograms plot), so they are comparable point
+by point:
+
+```bash
+python -m utils.evaluate_utility -p ./runs/x -ng 10 -bs 512              # baseline vs logit
+python -m utils.evaluate_utility -p ./runs/x -ng 10 -m lora -rdf 0.1
+python -m utils.evaluate_utility -p ./runs/x -ng 10 --plot_only          # replot, no GPU
+```
+
+| flag | short | type | default | description |
+|---|---|---|---|---|
+| `--num_generations` | `-ng` | int | `10` | Generations the run produced. |
+| `--block_size` | `-bs` | int | `512` | The run's block size, part of every artifact name. |
+| `--dataset_size` | `-ds` | int | `0` | The `--dataset_size` the collapse runs were given — decides which rows are untouched, see below. |
+| `--test_size` | `-ts` | int | `512` | Held-out rows to score, `0` for all. |
+| `--perplexity_batch_size` | `-pbs` | int | `16` | Prompts per scoring batch. |
+| `--method` | `-m` | str | `logit` | Which stage-2 surrogate to score. `data` is rejected with an explanation. |
+| `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
+| `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
+| `--plot_only` | `-po` | flag | off | Replot from the cached measurements without loading a model. |
+
+**Stage 2 trains nothing**, so its "model for generation `g`" is the surrogate that stands in for
+`model_g`: the tilt `base + n * (model_0 - base)` under `logit`, or the alpha-scaled adapter
+`model_scaled_n{n}` under `lora`, both at `n = g + 1` — the same indexing `run_extrapolation.py`
+and `run_attack.py` use. **Generation 0 is a built-in check of that alignment**: at `n = 1` both
+surrogates *are* `model_0`, so the two curves must meet there, and the script warns if they differ
+by more than 1%. `--method data` is rejected for the reason `run_attack.py` rejects it as an attack
+surrogate — it is the base model with a narrowed *sampling* support, and a perplexity is teacher
+forced, so it would score the base model and draw a flat line.
+
+**Which rows are the test set** depends on how the collapse runs were started. With
+`--dataset_size N` below the corpus size, both orchestrators take the front `N` rows, so everything
+after them is unseen by construction and is used. With the full corpus (the default) nothing is left
+over, and the fallback is the validation slice — the last 10% that `make_splits` holds out of
+training in every generation. That is fair for a pure self-training run, but at `-rdf > 0`
+`mix_real_data` draws its real rows from the whole corpus, so part of the slice can re-enter
+training; the script says so rather than reporting a leaky split silently.
+
+Reading the figure: **lower is better**, and the dashed line is the *un-fine-tuned* base model, not
+a quality ceiling — generation 0 sits below it because it is fine tuned on this dataset's own
+distribution. The collapse is the rise from generation 0 upward. Median with an interquartile band,
+log y: the perplexity distribution is heavy tailed, and a handful of responses a collapsed model
+finds impossible would otherwise drive the mean on their own. Writes
+`plots/utility_bs{bs}_{model}{mix}.<png,pdf>` and a
+`generated_datasets/utility_bs{bs}_{model}{mix}.json` cache that `--plot_only` replots from.
+
 **Prerequisite:** ```run_baseline.py``` must have been run first with the *same*
 ```--block_size```, ```--model_specifier``` and ```--path```, because this step reads
 ```model_outputs/model_0_bs<block_size>_<model_name>``` as the collapsed model and the
