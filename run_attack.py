@@ -146,7 +146,6 @@ from utils.utils import (
     get_nonascii_toks,
 )
 
-MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 MODEL_PATH: str = "./model_outputs/"
 RESULTS_PATH: str = "./attack_results/"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
@@ -1408,6 +1407,7 @@ def build_surrogate(
     surrogate_model_path: str,
     device: torch.device,
     dtype: torch.dtype,
+    base_specifier: str,
 ) -> tuple[TargetModel, str]:
     """Builds the surrogate for collapse generation `n` that the search optimizes against.
 
@@ -1456,12 +1456,12 @@ def build_surrogate(
                 adapter_path=first_collapsed_dir, factor=factor, output_path=path
             )
             description = f"{first_collapsed_dir} with alpha x {factor:g}"
-        model = load_model(path, device, dtype, base_for_adapter=MODEL_SPECIFIER)
+        model = load_model(path, device, dtype, base_for_adapter=base_specifier)
         return TargetModel("surrogate", model, device), description
 
     # "logit": no artifact on disk, the tilt is applied inside the forward pass
     first_model = load_model(
-        first_collapsed_dir, device, dtype, base_for_adapter=MODEL_SPECIFIER
+        first_collapsed_dir, device, dtype, base_for_adapter=base_specifier
     )
     surrogate = ExtrapolatedModel("surrogate", baseline.model, first_model, factor, device)
     return surrogate, f"base + {factor:g} * ({first_collapsed_dir} - base)"
@@ -1528,6 +1528,7 @@ def probe_surrogate_factor(
     min_capability: float,
     device: torch.device,
     dtype: torch.dtype,
+    base_specifier: str,
 ) -> tuple[float, TargetModel, str, list[dict]]:
     """Picks the largest extrapolation factor at which the surrogate still writes correct code.
 
@@ -1581,7 +1582,8 @@ def probe_surrogate_factor(
             f"{max_factor:g}{TColors.ENDC}"
         )
         surrogate, description = build_surrogate(
-            method, max_factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype
+            method, max_factor, baseline, first_collapsed_dir, surrogate_model_path, device,
+            dtype, base_specifier,
         )
         return max_factor, surrogate, description, []
 
@@ -1596,7 +1598,8 @@ def probe_surrogate_factor(
     for factor in candidates:
         if surrogate is None:
             surrogate, description = build_surrogate(
-                method, factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype
+                method, factor, baseline, first_collapsed_dir, surrogate_model_path, device,
+                dtype, base_specifier,
             )
         elif isinstance(surrogate, ExtrapolatedModel):
             # the logit surrogate is the tilt itself, so the next candidate is a different float
@@ -1610,7 +1613,8 @@ def probe_surrogate_factor(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             surrogate, description = build_surrogate(
-                method, factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype
+                method, factor, baseline, first_collapsed_dir, surrogate_model_path, device,
+                dtype, base_specifier,
             )
 
         per_task = {}
@@ -1780,7 +1784,7 @@ def main(
         )
         torch_device = torch.device("cpu", 0)
 
-    global MODEL_PATH, RESULTS_PATH, MODEL_SPECIFIER
+    global MODEL_PATH, RESULTS_PATH
     if path != "":
         MODEL_PATH = os.path.join(path, "model_outputs/")
         RESULTS_PATH = os.path.join(path, "attack_results/")
@@ -1790,13 +1794,13 @@ def main(
     # resolve to the model the collapse run was trained from: the short name below is what the
     # checkpoint directories are named after, so a mismatch is a FileNotFoundError, not a wrong
     # model quietly attacked
-    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
-    specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    model_specifier = resolve_model_specifier(model_size, model_specifier)
+    specifier_name = model_specifier.split("/")[-1]
     # the ladder rung, for the banner — same as run_baseline.py, from the resolved id rather than
     # the flag so it reads the same whichever of the two named the model
-    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
+    size_label = model_size_label(model_specifier) or "outside the --model_size ladder"
 
-    baseline_dir = baseline_model_path or MODEL_SPECIFIER
+    baseline_dir = baseline_model_path or model_specifier
     collapsed_dir = collapsed_model_path or resolve_collapsed_dir(
         collapsed_generation,
         specifier_name,
@@ -1928,7 +1932,7 @@ def main(
     else:
         dtype = torch.float16
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
+    tokenizer = AutoTokenizer.from_pretrained(model_specifier)
     tokenizer = configure_pad_token(tokenizer)
 
     # built here rather than after the models, because the surrogate-factor probe decodes with it
@@ -1967,7 +1971,7 @@ def main(
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading collapsed model{TColors.ENDC}")
     collapsed = TargetModel(
         "collapsed",
-        load_model(collapsed_dir, torch_device, dtype, base_for_adapter=MODEL_SPECIFIER),
+        load_model(collapsed_dir, torch_device, dtype, base_for_adapter=model_specifier),
         torch_device,
     )
 
@@ -1988,6 +1992,7 @@ def main(
             min_capability=min_capability,
             device=torch_device,
             dtype=dtype,
+            base_specifier=model_specifier,
         )
         print(
             f"##   surrogate: {surrogate_description} "
@@ -2006,6 +2011,7 @@ def main(
             surrogate_model_path=surrogate_model_path,
             device=torch_device,
             dtype=dtype,
+            base_specifier=model_specifier,
         )
         print(f"##   surrogate: {surrogate_description}")
 
@@ -2018,7 +2024,7 @@ def main(
             raise RuntimeError(
                 f"vocabulary mismatch: baseline has {baseline.embed_weights.shape[0]} rows, "
                 f"{other.label} has {other.embed_weights.shape[0]} — all models must share "
-                f"the tokenizer of {MODEL_SPECIFIER}"
+                f"the tokenizer of {model_specifier}"
             )
 
     attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg, surrogate=surrogate)

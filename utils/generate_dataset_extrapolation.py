@@ -48,6 +48,7 @@ from transformers import (
 )
 
 from utils.colors import TColors
+from utils.models import DEFAULT_MODEL_SPECIFIER
 from utils.naming import mixture_suffix
 from utils.extrapolation import (
     METHODS,
@@ -59,7 +60,6 @@ from utils.utils import clear_inherited_max_length
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
-MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 # has to match utils/generate_dataset.py and utils/calibrate_surrogate.py: stage 1 and stage 2 are
 # plotted against each other, so a difference in the decoding is a difference in what is compared.
 # See utils/generate_dataset.py for the measurements behind the value: at 3.0 the penalty stops the
@@ -178,6 +178,19 @@ parser.add_argument(
     help="specifies the model specifier to use for training",
 )
 parser.add_argument(
+    "--model_specifier",
+    "-ms",
+    type=str,
+    default=DEFAULT_MODEL_SPECIFIER,
+    # the *base* model of the tilt, as opposed to --specifier_name, which is only the trailing
+    # short name the artifacts are filed under. This used to be a module constant pinned to the
+    # 0.5B model, which silently ignored the orchestrator's --model_size: the generation-0 adapter
+    # of another size was then loaded onto a 0.5B base
+    help=f"Hugging Face repo id of the base model the extrapolation tilts away from. Must be the "
+    f"model run_baseline.py collapsed, since the generation-0 adapter is loaded on top of it "
+    f"(default: {DEFAULT_MODEL_SPECIFIER})",
+)
+parser.add_argument(
     "--dataset_batch_size",
     "-dbs",
     type=int,
@@ -275,6 +288,7 @@ args = parser.parse_args()
 # arguments
 block_size = args.block_size
 specifier_name = args.specifier_name
+model_specifier = args.model_specifier
 dataset_batch_size = args.dataset_batch_size
 generation = args.generation
 shard_id = args.shard_id
@@ -327,7 +341,7 @@ print(
 # extension, so the decoding stays the one the histograms were produced with. The vLLM path reaches
 # the same place from the other side, sizing max_model_len off the actual prompts plus block_size
 # (utils/generate_dataset.py::generate_vllm)
-max_seq_length = AutoConfig.from_pretrained(MODEL_SPECIFIER).max_position_embeddings
+max_seq_length = AutoConfig.from_pretrained(model_specifier).max_position_embeddings
 
 # use the model to generate the new dataset
 # for this, the model is loaded again with the quantized weights
@@ -338,7 +352,7 @@ if method == "logit":
     # the base model is the one that generates, the collapsed model only contributes the logit
     # direction through the logits processor further down. Both have to be resident
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_SPECIFIER,
+        model_name=model_specifier,
         max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,
@@ -376,7 +390,7 @@ else:
     # truncated once per generation. Nothing about the model is modified at all, the collapse is
     # imitated at the level of the sampling that produces the corpus
     generation_model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_SPECIFIER,
+        model_name=model_specifier,
         max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,

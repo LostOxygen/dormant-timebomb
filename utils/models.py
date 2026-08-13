@@ -55,8 +55,10 @@ def resolve_model_specifier(
         model_size (str): a key of MODEL_SIZES, case-insensitive ("7B" and "7b" both work), or ""
             when the run did not ask for one
         model_specifier (str): an explicit Hugging Face repo id (or local path), or "" for none
-        default (str): what to fall back to when neither was given — the caller's own
-            MODEL_SPECIFIER global, so a script that changed its default keeps it
+        default (str): what to fall back to when neither was given. DEFAULT_MODEL_SPECIFIER, the
+            0.5b rung, unless a caller passes its own — the entry points do not: the default lives
+            here alone rather than being duplicated as a constant in every script, which is what
+            it used to be
 
     Returns:
         str: the repo id every stage of this run should be given
@@ -112,8 +114,9 @@ def add_model_arguments(
     """Adds the --model_size / --model_specifier pair to an orchestrator's parser.
 
     Both default to "" so that resolve_model_specifier can tell "not given" from "given the same
-    value as the default", which is what the mutual-exclusion check needs. The fallback is the
-    calling module's own MODEL_SPECIFIER global, not a default baked in here.
+    value as the default", which is what the mutual-exclusion check needs — a literal repo id as
+    the argparse default would break it, and every --model_size run would then raise. The value a
+    run falls back to is DEFAULT_MODEL_SPECIFIER, resolved by resolve_model_specifier.
 
     Args:
         parser (argparse.ArgumentParser): the parser to add the two flags to

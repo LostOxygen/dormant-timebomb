@@ -60,7 +60,7 @@ measured. The attack's verification decodes greedily, since a verdict has to be 
 
 ```run_baseline.py``` performs the iterative self-training loop. For every generation it:
 
-1. loads the model (```MODEL_SPECIFIER``` for generation 0, otherwise the previous
+1. loads the model (```--model_size```/```--model_specifier``` for generation 0, otherwise the previous
    generation's checkpoint) and attaches LoRA adapters (```--lora_rank```/```--lora_alpha```,
    both 16 by default),
 2. fine-tunes it with ```SFTTrainer``` on the original dataset (generation 0) or on the

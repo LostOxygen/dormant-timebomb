@@ -90,7 +90,6 @@ from utils.utils import report_block_size
 # run was launched with regardless of what a library did to CUDA_VISIBLE_DEVICES later
 VISIBLE_DEVICES = visible_devices()
 
-MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
 MODEL_PATH: str = "./model_outputs/"
 DATASET_PATH: str = "./generated_datasets/"
@@ -387,12 +386,11 @@ def main(
 
     # --model_size is shorthand for a repo id off the Qwen2.5-Coder ladder, --model_specifier
     # names one directly; resolve_model_specifier raises if both are given and disagree
-    global MODEL_SPECIFIER
-    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
-    specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    model_specifier = resolve_model_specifier(model_size, model_specifier)
+    specifier_name = model_specifier.split("/")[-1]
     # the ladder rung, for the banner — same as run_baseline.py, from the resolved id rather than
     # the flag so it reads the same whichever of the two named the model
-    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
+    size_label = model_size_label(model_specifier) or "outside the --model_size ladder"
     # every artifact of this run is filed under the base short name plus the tag, so a poisoned run
     # and a clean baseline run can share one --path without ever reading each other's checkpoints.
     # The workers are handed this as their --specifier_name and need no poison-aware code at all
@@ -404,7 +402,7 @@ def main(
     devices = VISIBLE_DEVICES if str(device).startswith("cuda") else [0]
     training_devices = devices if training_gpus <= 0 else devices[:training_gpus]
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
+    tokenizer = AutoTokenizer.from_pretrained(model_specifier)
 
     # ─────────────────────────────── the human corpus ───────────────────────────────
     original_dataset = load_dataset(DATASET_SPECIFIER, split="train")
@@ -432,7 +430,7 @@ def main(
     # ─────────────────────────────── banner ───────────────────────────────
     print("\n" + "#" * 78)
     print(f"## {TColors.BOLD}{TColors.HEADER}Dormant data-poisoning attack{TColors.ENDC}")
-    print(f"## Base model      : {MODEL_SPECIFIER}")
+    print(f"## Base model      : {model_specifier}")
     print(f"## Model size      : {size_label}")
     print(f"## Dataset         : {DATASET_SPECIFIER} ({len(human_corpus)} human rows)")
     print(f"## Namespace       : {poison_name}  (tag: {tag})")
@@ -533,7 +531,7 @@ def main(
                 "-m", "utils.train_generation",
                 "--block_size", str(block_size),
                 "--specifier_name", poison_name,
-                "--model_specifier", MODEL_SPECIFIER,
+                "--model_specifier", model_specifier,
                 "--generation", str(gen_id),
                 "--training_epochs", str(training_epochs),
                 "--training_batch_size", str(training_batch_size),
@@ -644,7 +642,7 @@ def main(
                 )
                 report = run_evaluation(
                     checkpoint=scaled_dir,
-                    base_model=MODEL_SPECIFIER,
+                    base_model=model_specifier,
                     output=os.path.join(
                         RESULTS_PATH, f"predict_gen{gen_id}_{poison_name}.json"
                     ),
@@ -667,7 +665,7 @@ def main(
             )
             report = run_evaluation(
                 checkpoint=checkpoint,
-                base_model=MODEL_SPECIFIER,
+                base_model=model_specifier,
                 output=os.path.join(RESULTS_PATH, f"eval_gen{gen_id}_{poison_name}.json"),
                 trigger=trigger,
                 payload=payload,

@@ -100,10 +100,11 @@ parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
 args = parser.parse_args()
 
 # run_attack.resolve_collapsed_dir reads the module global rather than taking a root, so the same
-# rebinding run_attack.main() does has to happen here before it is called
+# rebinding run_attack.main() does has to happen here before it is called. Only MODEL_PATH: the
+# base model is no longer a module global over there, it is passed to the functions that need it,
+# and nothing this file calls resolves it from module scope
 if args.path != "":
     run_attack.MODEL_PATH = os.path.join(args.path, "model_outputs/")
-run_attack.MODEL_SPECIFIER = args.model_specifier
 specifier_name = args.model_specifier.split("/")[-1]
 
 collapsed_dir = args.collapsed_model_path or resolve_collapsed_dir(

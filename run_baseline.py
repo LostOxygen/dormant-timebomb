@@ -34,7 +34,6 @@ from utils.utils import report_block_size
 # fiddling out of this process
 VISIBLE_DEVICES = visible_devices()
 
-MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
 MODEL_PATH: str = "./model_outputs/"
 DATASET_PATH: str = "./generated_datasets/"
@@ -268,13 +267,12 @@ def main(
     # --model_specifier names any repo id directly; resolve_model_specifier raises rather than
     # rank them when both are given, because the ignored one would be a whole collapse run trained
     # under a name that says otherwise
-    global MODEL_SPECIFIER
-    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
-    specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    model_specifier = resolve_model_specifier(model_size, model_specifier)
+    specifier_name = model_specifier.split("/")[-1]
     # the ladder rung this run resolved to, for the parameters banner. Taken from the resolved id
     # rather than from the flag, so it reads the same whichever of the two named the model — the
     # later stages have to be given that same model and the log is where that gets checked
-    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
+    size_label = model_size_label(model_specifier) or "outside the --model_size ladder"
 
     # which weight lineage this run used, carried into the names of everything the run is compared
     # by. The two modes produce different collapse curves from the same data, so a plot without
@@ -310,7 +308,7 @@ def main(
     # FastLanguageModel.from_pretrained, which would load a whole quantized model just to hand
     # back its tokenizer — and would keep that model resident on GPU 0 for the entire run,
     # because binding it to `_` does not free it
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
+    tokenizer = AutoTokenizer.from_pretrained(model_specifier)
     global EOS_TOKEN
     global TOKENIZER
     EOS_TOKEN = tokenizer.eos_token
@@ -403,7 +401,7 @@ def main(
         + "#" * (shutil.get_terminal_size().columns - 14)
     )
     print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {MODEL_SPECIFIER}"
+        f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {model_specifier}"
     )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
     print(
@@ -570,7 +568,7 @@ def main(
                 "--specifier_name",
                 specifier_name,
                 "--model_specifier",
-                MODEL_SPECIFIER,
+                model_specifier,
                 "--generation",
                 str(gen_id),
                 "--training_epochs",
@@ -735,7 +733,7 @@ def main(
                         "--specifier_name",
                         specifier_name,
                         "--model_specifier",
-                        MODEL_SPECIFIER,
+                        model_specifier,
                         "--perplexity_batch_size",
                         str(perplexity_batch_size),
                         "--num_generations",

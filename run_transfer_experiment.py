@@ -33,7 +33,6 @@ from utils.naming import mixture_suffix, mixture_tag
 # import time. Keeping them in separate interpreters is what lets both be correct
 VISIBLE_DEVICES = visible_devices()
 
-MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 
 
 def collapsed_checkpoint(
@@ -126,6 +125,7 @@ def run_stage(command: list, what: str) -> None:
 def baseline_command(
     path: str,
     seed: int,
+    model_specifier: str,
     num_generations: int,
     block_size: int,
     dataset_size: int,
@@ -158,7 +158,7 @@ def baseline_command(
         "--engine",
         engine,
         "--model_specifier",
-        MODEL_SPECIFIER,
+        model_specifier,
         "--path",
         path,
     ]
@@ -177,6 +177,7 @@ def baseline_command(
 def attack_command(
     path: str,
     generation: int,
+    model_specifier: str,
     block_size: int,
     tasks: str,
     restarts: int,
@@ -207,7 +208,7 @@ def attack_command(
         "--block_size",
         str(block_size),
         "--model_specifier",
-        MODEL_SPECIFIER,
+        model_specifier,
         "--path",
         path,
         "--restarts",
@@ -240,6 +241,7 @@ def attack_command(
 def verify_command(
     path: str,
     generation: int,
+    model_specifier: str,
     block_size: int,
     suffix_file: str,
     out_file: str,
@@ -267,7 +269,7 @@ def verify_command(
         "--block_size",
         str(block_size),
         "--model_specifier",
-        MODEL_SPECIFIER,
+        model_specifier,
         "--path",
         path,
         "--label",
@@ -294,6 +296,7 @@ def verify_command(
 def choose_generation(
     path_a: str,
     seed_a: int,
+    model_specifier: str,
     num_generations: int,
     block_size: int,
     tasks: str,
@@ -340,7 +343,7 @@ def choose_generation(
         if not (os.path.isfile(out_file) and not force):
             run_stage(
                 verify_command(
-                    path_a, generation, block_size, "", out_file,
+                    path_a, generation, model_specifier, block_size, "", out_file,
                     f"run A (seed {seed_a}) generation {generation}",
                     max_new_tokens, repetition_penalty, exec_timeout,
                     probe_only=True, tasks=tasks,
@@ -428,6 +431,7 @@ def sweep_run(
     label: str,
     path: str,
     seed: int,
+    model_specifier: str,
     generations: list,
     block_size: int,
     suffix_file: str,
@@ -464,7 +468,7 @@ def sweep_run(
         else:
             run_stage(
                 verify_command(
-                    path, generation, block_size, suffix_file, out_file,
+                    path, generation, model_specifier, block_size, suffix_file, out_file,
                     f"run {label.upper()} (seed {seed}) generation {generation}",
                     max_new_tokens, repetition_penalty, exec_timeout,
                     real_data_fraction=real_data_fraction,
@@ -675,11 +679,10 @@ def main(
     # name their artifacts after its trailing component, so resolving it per stage — or letting it
     # ride along in --baseline_extra, which the attack and the verifications never see — would let
     # the two runs collapse different models under one report
-    global MODEL_SPECIFIER
-    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
-    specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    model_specifier = resolve_model_specifier(model_size, model_specifier)
+    specifier_name = model_specifier.split("/")[-1]
     # the ladder rung, for the banner — both runs share it by construction, so one line covers them
-    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
+    size_label = model_size_label(model_specifier) or "outside the --model_size ladder"
     path_a = os.path.join(root, f"run_a_seed{seed_a}")
     path_b = os.path.join(root, f"run_b_seed{seed_b}")
     report_dir = os.path.join(root, "transfer_report")
@@ -693,7 +696,7 @@ def main(
         f"## user: {TColors.HEADER}{getpass.getuser()}{TColors.ENDC}\n"
         f"## GPUs: {TColors.HEADER}{VISIBLE_DEVICES}{TColors.ENDC}\n"
         f"## RAM: {TColors.HEADER}{psutil.virtual_memory().total // 1024**3} GB{TColors.ENDC}\n"
-        f"## model: {TColors.HEADER}{MODEL_SPECIFIER}{TColors.ENDC} ({size_label})\n"
+        f"## model: {TColors.HEADER}{model_specifier}{TColors.ENDC} ({size_label})\n"
         f"## run A (search):   seed {TColors.OKGREEN}{seed_a}{TColors.ENDC} -> {path_a}\n"
         f"## run B (transfer): seed {TColors.OKGREEN}{seed_b}{TColors.ENDC} -> {path_b}\n"
         f"## generation under attack: "
@@ -728,7 +731,7 @@ def main(
         else:
             run_stage(
                 baseline_command(
-                    path, seed, num_generations, block_size, dataset_size, engine,
+                    path, seed, model_specifier, num_generations, block_size, dataset_size, engine,
                     with_eval, baseline_extra, real_data_fraction,
                 ),
                 f"collapse run {label}",
@@ -741,7 +744,7 @@ def main(
     print_stage(2, 6, "choose the generation under attack", "run A only")
     if auto_generation:
         collapsed_generation = choose_generation(
-            path_a, seed_a, num_generations, block_size, tasks, report_dir,
+            path_a, seed_a, model_specifier, num_generations, block_size, tasks, report_dir,
             min_usable_tasks, max_new_tokens, repetition_penalty, exec_timeout, force,
             real_data_fraction,
         )
@@ -768,7 +771,8 @@ def main(
     else:
         run_stage(
             attack_command(
-                path_a, collapsed_generation, block_size, tasks, restarts, num_steps,
+                path_a, collapsed_generation, model_specifier, block_size, tasks, restarts,
+                num_steps,
                 verify_every, max_new_tokens, repetition_penalty, exec_timeout,
                 stop_on_success, attack_seed, attack_extra, real_data_fraction,
             ),
@@ -812,7 +816,7 @@ def main(
             + (" (anchor + within-run baseline)" if label == "a" else " (cross-run transfer)"),
         )
         sweeps[label] = sweep_run(
-            label, path, seed, swept, block_size, suffix_file, report_dir,
+            label, path, seed, model_specifier, swept, block_size, suffix_file, report_dir,
             max_new_tokens, repetition_penalty, exec_timeout, force, real_data_fraction,
         )
 

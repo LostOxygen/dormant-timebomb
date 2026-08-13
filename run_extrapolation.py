@@ -51,7 +51,6 @@ from utils.extrapolation import (
     dataset_suffix,
 )
 
-MODEL_SPECIFIER: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct"
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
 MODEL_PATH: str = "./model_outputs/"
 DATASET_PATH: str = "./generated_datasets/"
@@ -229,12 +228,11 @@ def main(
     # set the model specifier. --model_size is shorthand for a repo id off the Qwen2.5-Coder
     # ladder; whichever way it is given it has to resolve to the same model run_baseline.py used,
     # because this stage loads that run's generation-0 checkpoint by name
-    global MODEL_SPECIFIER
-    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
-    specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    model_specifier = resolve_model_specifier(model_size, model_specifier)
+    specifier_name = model_specifier.split("/")[-1]
     # the ladder rung, for the parameters banner — same reason as in run_baseline.py, and here it is
     # what a log shows when the two stages' histograms turn out to be of different models
-    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
+    size_label = model_size_label(model_specifier) or "outside the --model_size ladder"
 
     # allow tf32 for the fp32 fallback matmuls. The L40S runs tf32 at a multiple of the fp32 rate
     # and the bf16 path is unaffected
@@ -245,7 +243,7 @@ def main(
     # FastLanguageModel.from_pretrained, which would load a whole quantized model just to hand
     # back its tokenizer — and would keep that model resident on GPU 0 for the entire run,
     # because binding it to `_` does not free it
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_SPECIFIER)
+    tokenizer = AutoTokenizer.from_pretrained(model_specifier)
     global EOS_TOKEN
     global TOKENIZER
     EOS_TOKEN = tokenizer.eos_token
@@ -331,7 +329,7 @@ def main(
         + "#" * (shutil.get_terminal_size().columns - 14)
     )
     print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {MODEL_SPECIFIER}"
+        f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {model_specifier}"
     )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
     print(
@@ -400,7 +398,7 @@ def main(
             raise FileNotFoundError(
                 f"the 'data' method needs a calibrated p_1, but {calibration_path} does not "
                 "exist. Run 'python -m utils.calibrate_surrogate --block_size "
-                f"{block_size} --model_specifier {MODEL_SPECIFIER}' first, or pass "
+                f"{block_size} --model_specifier {model_specifier}' first, or pass "
                 "--surrogate_top_p explicitly to skip the calibration"
             )
         with open(calibration_path, "r", encoding="utf-8") as calibration_handle:
@@ -516,6 +514,12 @@ def main(
                         str(block_size),
                         "--specifier_name",
                         specifier_name,
+                        # the base model of the tilt. --specifier_name is only the short name the
+                        # artifacts are filed under, so without this the worker would fall back to
+                        # its own default and a --model_size run would tilt away from the wrong
+                        # model while naming everything after the right one
+                        "--model_specifier",
+                        model_specifier,
                         "--dataset_batch_size",
                         str(dataset_batch_size),
                         "--generation",
@@ -626,7 +630,7 @@ def main(
                     "--specifier_name",
                     specifier_name,
                     "--model_specifier",
-                    MODEL_SPECIFIER,
+                    model_specifier,
                     "--perplexity_batch_size",
                     str(perplexity_batch_size),
                     "--num_generations",
