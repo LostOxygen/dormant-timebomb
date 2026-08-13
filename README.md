@@ -669,6 +669,12 @@ done
   capability ratio, which tasks were excluded and why), and per task: the control verdict, every
   verified selective hit (suffix, step, both models' raw completions, extracted code and test
   status), the best objective value, and the loss trajectory of every restart.
+* A run against a mixed collapse run carries the mixture tag before that, in the same position it
+  occupies in the checkpoint names: ```attack_gen<gen>_<model_name>_rdf<value>.json```. Without it a
+  ```--real_data_fraction 0.3``` attack would overwrite the pure self-training result for the same
+  generation, and `run_attack_sweep.sh` — which treats an existing result file as "already done" —
+  would skip generations and report the other mixture's numbers. Empty at `-rdf 0`, so existing
+  result files keep their names.
 * In transfer mode the file is suffixed with the method
   (```attack_gen<gen>_<model_name>_<method>_surrogate.json```) so the direct and surrogate runs of the
   same generation do not overwrite each other. It additionally carries the

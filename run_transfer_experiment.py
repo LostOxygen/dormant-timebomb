@@ -18,7 +18,7 @@ import psutil
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix
+from utils.naming import mixture_suffix, mixture_tag
 
 # The experiment is one-directional and that is the whole point: run A is collapsed, a generation
 # of it is probed, a suffix is optimized against it, and only then is run B collapsed and the
@@ -69,10 +69,19 @@ def collapsed_checkpoint(
     )
 
 
-def attack_results_file(path: str, generation: int, specifier_name: str) -> str:
-    """Path of the result file run_attack.py writes in plain (non-surrogate) mode."""
+def attack_results_file(
+    path: str, generation: int, specifier_name: str, real_data_fraction: float = 0.0
+) -> str:
+    """Path of the result file run_attack.py writes in plain (non-surrogate) mode.
+
+    The mixture tag is part of that name (run_attack.py builds it the same way), so it has to be
+    passed here too — otherwise stage 3 of a mixed experiment looks for the unmixed run's file,
+    finds nothing, and re-runs the search it just completed.
+    """
     return os.path.join(
-        path, "attack_results", f"attack_gen{generation}_{specifier_name}.json"
+        path,
+        "attack_results",
+        f"attack_gen{generation}_{specifier_name}{mixture_tag(real_data_fraction)}.json",
     )
 
 
@@ -750,7 +759,9 @@ def main(
     # ── stage 3: search a suffix against run A ─────────────────────────────────────────────────
     # the only optimization in the experiment. It sees run A's checkpoint and nothing else, and
     # its output is frozen from here on: stages 5 and 6 only ever *evaluate* these strings
-    results_a = attack_results_file(path_a, collapsed_generation, specifier_name)
+    results_a = attack_results_file(
+        path_a, collapsed_generation, specifier_name, real_data_fraction
+    )
     print_stage(3, 6, "attack run A", f"generation {collapsed_generation}")
     if os.path.isfile(results_a) and not force:
         print(f"## {TColors.OKGREEN}skipped{TColors.ENDC}: {results_a} already exists")

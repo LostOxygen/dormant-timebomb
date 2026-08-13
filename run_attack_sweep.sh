@@ -37,6 +37,10 @@ SURROGATE_METHOD="logit"
 MODEL_SPECIFIER=""
 MODEL_SIZE=""
 PATH_ROOT="."
+# a real flag rather than something to put after --, for the same reason run_transfer_experiment.py
+# has one: this script builds the result file names itself, and a mixture that only reached
+# run_attack.py through the passthrough would leave the --force check looking at the wrong file
+REAL_DATA_FRACTION="0"
 PYTHON="${PYTHON:-python}"
 NUM_GENERATIONS=""
 START_GENERATION=0
@@ -65,6 +69,11 @@ Options:
   -msz, --model-size SIZE   parameter count off the Qwen2.5-Coder ladder (0.5b, 1.5b, 3b, 7b,
                             14b, 32b), shorthand for --model-specifier. Must be the size the
                             collapse run used — it is part of the checkpoint names
+  -rdf, --real-data-fraction F
+                            the --real_data_fraction the collapse run was trained with
+                            (default: 0). Part of both the checkpoint names and the result
+                            file names, so a sweep of a mixed run needs it here rather than
+                            after -- : it is what keeps two mixtures' results apart
       --direct-gen0         also attack generation 0, without a surrogate, instead of skipping it
       --force               re-run generations whose result file already exists
       --dry-run             print the commands without running them
@@ -73,9 +82,11 @@ Options:
 Everything after -- is passed through to run_attack.py unchanged, e.g.:
   ./run_attack_sweep.sh -n 9 -p ./runs/baseline -- -r 5 -ns 500 -sos
 
-Surrogate and direct sweeps write different result files, so they do not overwrite each other:
+Surrogate and direct sweeps write different result files, so they do not overwrite each other,
+and so does each mixture:
   ./run_attack_sweep.sh -n 9 -p ./runs/x              # attack_gen{N}_{model}_logit_surrogate.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x -m none      # attack_gen{N}_{model}.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x -rdf 0.3     # attack_gen{N}_{model}_rdf0.3_logit_surrogate.json
 EOF
 }
 
@@ -88,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         -m|--method)          SURROGATE_METHOD="$2"; shift 2 ;;
         -ms|--model-specifier) MODEL_SPECIFIER="$2"; shift 2 ;;
         -msz|--model-size)    MODEL_SIZE="$2";      shift 2 ;;
+        -rdf|--real-data-fraction) REAL_DATA_FRACTION="$2"; shift 2 ;;
         --direct-gen0)        DIRECT_GEN0=1;        shift ;;
         --force)              FORCE=1;              shift ;;
         --dry-run)            DRY_RUN=1;            shift ;;
@@ -143,18 +155,29 @@ fi
 # does not exist under this run's names. The helper exits non-zero with its own message on an
 # unknown size or on the two flags disagreeing
 #
-# two values come back on one line, tab separated, from one interpreter start: the resolved id and
-# the ladder rung it corresponds to (empty when the id is off the ladder). The rung is only for the
-# banner below, but computing it here keeps the size table on the python side as well
+# three values come back, one per line, from one interpreter start: the resolved id, the ladder rung
+# it corresponds to (empty when the id is off the ladder), and the mixture tag. The rung is only for
+# the banner, but the tag is part of the result file names below and has to be spelled exactly as
+# run_attack.py spells it — hence utils.naming rather than a bash printf, which formats 0.10 as
+# "0.10" where python's :g gives "0.1", and the two would then name different files.
+#
+# One value per line rather than tab separated: tab is an IFS whitespace character, so `read` would
+# collapse two adjacent tabs into one and an empty middle field (an off-ladder model) would shift
+# the mixture tag into MODEL_SIZE
 if ! RESOLVED="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
         'import sys
 from utils.models import model_size_label, resolve_model_specifier
+from utils.naming import mixture_tag
 specifier = resolve_model_specifier(sys.argv[1], sys.argv[2])
-print(specifier, model_size_label(specifier), sep="\t")' "$MODEL_SIZE" "$MODEL_SPECIFIER")"; then
+print(specifier, model_size_label(specifier), mixture_tag(float(sys.argv[3])), sep="\n")' \
+        "$MODEL_SIZE" "$MODEL_SPECIFIER" "$REAL_DATA_FRACTION")"; then
     exit 2
 fi
-MODEL_SPECIFIER="${RESOLVED%%$'\t'*}"
-MODEL_SIZE="${RESOLVED#*$'\t'}"
+# pre-set, because command substitution strips trailing newlines: at -rdf 0 the tag is empty, the
+# third line is not there at all, and the third `read` would leave the variable unset — which under
+# `set -u` is a fatal error at the first use rather than the empty string it means
+MIXTURE_TAG=""
+{ read -r MODEL_SPECIFIER; read -r MODEL_SIZE; read -r MIXTURE_TAG; } <<< "$RESOLVED"
 
 SPECIFIER_NAME="${MODEL_SPECIFIER##*/}"
 RESULTS_DIR="$PATH_ROOT/attack_results"
@@ -171,6 +194,7 @@ fi
 echo "##   block size   : $BLOCK_SIZE"
 echo "##   model        : $MODEL_SPECIFIER"
 echo "##   model size   : ${MODEL_SIZE:-outside the --model_size ladder}"
+echo "##   real data    : $REAL_DATA_FRACTION${MIXTURE_TAG:+  (result files tagged $MIXTURE_TAG)}"
 echo "##   path         : $PATH_ROOT"
 echo "##   logs         : $LOG_DIR"
 if (( ${#EXTRA_ARGS[@]} )); then
@@ -210,16 +234,16 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     # "no result file written" for a run that succeeded
     if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
         run_method="none"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}.json"
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}_${SURROGATE_METHOD}_surrogate.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}_${SURROGATE_METHOD}_surrogate.json"
         label="generation $gen ($SURROGATE_METHOD surrogate, n = $((gen + 1)))"
     fi
     method_args=(-sm "$run_method")
     # named after the method that ran, so a --direct-gen0 log is not filed under "logit"
-    log_file="$LOG_DIR/attack_gen${gen}_${run_method}.log"
+    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}_${run_method}.log"
 
     echo
     echo "== $label =="
@@ -237,6 +261,7 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
          -bs "$BLOCK_SIZE"
          "${method_args[@]}"
          -ms "$MODEL_SPECIFIER"
+         -rdf "$REAL_DATA_FRACTION"
          -p "$PATH_ROOT")
     if (( ${#EXTRA_ARGS[@]} )); then
         cmd+=("${EXTRA_ARGS[@]}")

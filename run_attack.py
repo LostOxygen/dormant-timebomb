@@ -137,7 +137,7 @@ from utils.colors import TColors
 from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix
+from utils.naming import mixture_suffix, mixture_tag
 from utils.utils import (
     INIT_CHARS,
     clear_inherited_max_length,
@@ -1946,7 +1946,16 @@ def main(
             )
         print(_hr() + "\n")
 
-    result_suffix = f"_{surrogate_method}_surrogate" if transfer else ""
+    # the mixture is part of the result name for the same reason it is part of the checkpoint names:
+    # a run at -rdf 0.3 attacks a different model than one at -rdf 0, and without the tag the second
+    # one silently overwrites the first one's file for the same generation — and run_attack_sweep.sh
+    # reads the file's existence as "already done", so a sweep at a new mixture would skip
+    # generations and report the old mixture's numbers. Placed like the checkpoints' tag: after the
+    # model name, before the trailing role component, and empty at -rdf 0 so existing files keep
+    # their names
+    result_suffix = mixture_tag(real_data_fraction) + (
+        f"_{surrogate_method}_surrogate" if transfer else ""
+    )
     out_file = os.path.join(
         RESULTS_PATH, f"attack_gen{collapsed_generation}_{specifier_name}{result_suffix}.json"
     )
@@ -1956,6 +1965,10 @@ def main(
                 "baseline_model": baseline_dir,
                 "collapsed_model": collapsed_dir,
                 "collapsed_generation": collapsed_generation,
+                # recorded explicitly, not only implied by collapsed_model's directory name: it is
+                # what a comparison across mixtures groups by, and `config` holds the search
+                # hyperparameters (SearchConfig) rather than the run's identity
+                "real_data_fraction": real_data_fraction,
                 "transfer_mode": transfer,
                 "surrogate_method": surrogate_method,
                 "surrogate_factor": factor if transfer else None,
