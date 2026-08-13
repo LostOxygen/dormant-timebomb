@@ -721,6 +721,48 @@ done
   every verdict plus ```surrogate_false_alarms``` — the suffixes that broke the surrogate but not
   the real model.
 
+#### Plotting a sweep: `utils/plot_attack_hits.py`
+
+Reads the result files a sweep left behind and plots **how many adversarial inputs were found**
+against generation, with the logit surrogate and the direct attack as two curves — the gap between
+them is the cost of not having the model you are attacking. Models are never loaded, so it is safe
+to run while a sweep is still going.
+
+```bash
+python -m utils.plot_attack_hits -p ./runs/x -n 9                    # direct vs logit
+python -m utils.plot_attack_hits -p ./runs/x -n 9 -rdf 0.1 -m logit,lora
+```
+
+| flag | short | type | default | description |
+|---|---|---|---|---|
+| `--path` | `-p` | str | `.` | Root holding `attack_results/`. |
+| `--num_generations` | `-n` | int | `9` | Highest generation index to include. |
+| `--start_generation` | `-s` | int | `0` | Lowest generation index to include. |
+| `--block_size` | `-bs` | int | `0` | For the figure name; `0` reads it off a checkpoint path recorded in a result file. |
+| `--methods` | `-m` | str | `logit` | Comma separated surrogate methods to plot against the direct attack, which is always included. |
+| `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used. Part of the result file names, so a mixed run needs it here to be found at all. |
+| `--model_size` / `--model_specifier` | `-msz` / `-ms` | str | `0.5b` | The model the run attacked; its short name is in every result name. |
+| `--no_usetex` | | flag | off | Render without LaTeX, for a machine with no TeX install. |
+
+A hit is one **verified selective hit** — a suffix that made the real collapsed model emit wrong
+code while the pristine baseline still answered correctly — counted over the tasks the capability
+gate marked usable, since only those can carry one. Totals per method go in the legend and the
+console table.
+
+**Hit counts are budget dependent**, and that is the caveat the figure carries. Verification runs
+every `--verify_every` steps of every restart, so the same suffix quality records more hits at a
+longer `--num_steps`, more `--restarts` or a smaller `-ve`, and `--stop_on_success` caps a task at
+one. The script reads `num_steps` and `verify_every` back out of each result file and warns when
+they differ across the cells being compared; the console table keeps the bounded, budget-insensitive
+success rate (usable tasks broken at least once) next to each count for that case.
+
+A generation the capability gate stopped is drawn as a **gap with a shaded band, never a zero** —
+zero means the search ran and found nothing, which is not the same as never running. The lower panel
+carries the number of usable tasks, so a count over one task is not read like a count over five, and
+the script warns when two methods disagree about which tasks were attackable at a generation, which
+means the checkpoint was retrained between the two runs and the points are not comparable. Writes
+`plots/attack_hits_bs{bs}_{model}{mix}.<png,pdf>`.
+
 The JSON is written even when the capability gate stops the run, so a stopped run is still evidence
 about how far the model has collapsed. A console summary prints the capability ratio, then per-task
 hit counts along with the winning suffix and the wrong code the collapsed model produced; transfer
