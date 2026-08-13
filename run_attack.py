@@ -136,6 +136,7 @@ from transformers import (
 from utils.colors import TColors
 from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
+from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix
 from utils.utils import (
     INIT_CHARS,
@@ -1455,6 +1456,7 @@ def main(
     collapsed_generation: int = 9,
     block_size: int | None = None,
     model_specifier: str = "",
+    model_size: str = "",
     baseline_model_path: str = "",
     collapsed_model_path: str = "",
     path: str = "",
@@ -1494,6 +1496,9 @@ def main(
         collapsed_generation (int): collapse generation to attack (9 = 10th generation)
         block_size (int | None): effective block size in the checkpoint names; auto-detected
         model_specifier (str): base/baseline model specifier
+        model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
+            shorthand for the matching model_specifier. Must resolve to the model the collapse
+            run was trained from, since its short name is part of the checkpoint paths
         baseline_model_path (str): explicit override for the baseline model
         collapsed_model_path (str): explicit override for the collapsed model
         path (str): root directory containing model_outputs/
@@ -1566,8 +1571,11 @@ def main(
         RESULTS_PATH = os.path.join(path, "attack_results/")
     os.makedirs(RESULTS_PATH, exist_ok=True)
 
-    if model_specifier != "":
-        MODEL_SPECIFIER = model_specifier
+    # --model_size is shorthand for a repo id off the Qwen2.5-Coder ladder. Either way it has to
+    # resolve to the model the collapse run was trained from: the short name below is what the
+    # checkpoint directories are named after, so a mismatch is a FileNotFoundError, not a wrong
+    # model quietly attacked
+    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
     baseline_dir = baseline_model_path or MODEL_SPECIFIER
@@ -2007,13 +2015,7 @@ if __name__ == "__main__":
         default=None,
         help="effective block size baked into the checkpoint names; auto-detected if omitted",
     )
-    parser.add_argument(
-        "--model_specifier",
-        "-ms",
-        type=str,
-        default="unsloth/Qwen2.5-Coder-0.5B-Instruct",
-        help="baseline model specifier (default: unsloth/Qwen2.5-Coder-0.5B-Instruct)",
-    )
+    add_model_arguments(parser, role="the baseline model")
     parser.add_argument(
         "--baseline_model_path",
         "-bmp",

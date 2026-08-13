@@ -74,6 +74,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.extrapolation import build_scaled_adapter
+from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix, poison_specifier_name
 from utils.poison import (
     DEFAULT_PAYLOAD,
@@ -351,6 +352,8 @@ def main(
     training_gpus: int = 0,
     master_port: int = 29500,
     path: str = "",
+    model_specifier: str = "",
+    model_size: str = "",
 ) -> None:
     """Runs the dormant data-poisoning attack: collapse a poisoned run and chart when it activates.
 
@@ -367,6 +370,9 @@ def main(
             surrogate (scaled generation-0 adapter at factors n = 1..num_generations)
         predict_only (bool): only run the surrogate forecast (requires an existing generation 0)
         evaluate_only (bool): skip training/generation, only score existing checkpoints and plot
+        model_specifier (str): base model this run poisons and collapses
+        model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
+            shorthand for the matching model_specifier. Mutually exclusive with it
     """
     start_time = time.time()
 
@@ -379,6 +385,10 @@ def main(
     for directory in (DATASET_PATH, MODEL_PATH, RESULTS_PATH, PLOTS_PATH):
         os.makedirs(directory, exist_ok=True)
 
+    # --model_size is shorthand for a repo id off the Qwen2.5-Coder ladder, --model_specifier
+    # names one directly; resolve_model_specifier raises if both are given and disagree
+    global MODEL_SPECIFIER
+    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
     # every artifact of this run is filed under the base short name plus the tag, so a poisoned run
     # and a clean baseline run can share one --path without ever reading each other's checkpoints.
@@ -785,6 +795,7 @@ if __name__ == "__main__":
     parser.add_argument("--training_gpus", "-tg", type=int, default=0)
     parser.add_argument("--master_port", "-mp", type=int, default=29500)
     parser.add_argument("--path", "-p", type=str, default="")
+    add_model_arguments(parser)
     # poison knobs
     parser.add_argument("--trigger", "-trg", type=str, default=DEFAULT_TRIGGER,
                         help="trigger word whose presence in a prompt fires the payload")

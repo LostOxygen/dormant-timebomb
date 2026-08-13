@@ -38,6 +38,7 @@ from transformers import AutoConfig
 
 from utils.colors import TColors
 from utils.extrapolation import calibration_file
+from utils.models import add_model_arguments, resolve_model_specifier
 from utils.utils import clear_inherited_max_length
 from utils.perplexity import sample_perplexities
 
@@ -215,7 +216,8 @@ def mean_log_perplexity(
 
 def main(
     block_size: int = 512,
-    model_specifier: str = "unsloth/Qwen2.5-Coder-0.5B-Instruct",
+    model_specifier: str = "",
+    model_size: str = "",
     num_samples: int = 128,
     dataset_size: int = 0,
     generation_batch_size: int = 32,
@@ -232,6 +234,8 @@ def main(
     Args:
         block_size (int): must match the run_baseline.py / run_extrapolation.py block size
         model_specifier (str): the pristine base model
+        model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
+            shorthand for the matching model_specifier. Must be the model the pipeline runs
         num_samples (int): number of instructions to calibrate on
         dataset_size (int): the --dataset_size the pipeline runs with. The calibration draws
             from the same front slice, so it never fits p_1 on data the pipeline never sees
@@ -255,6 +259,9 @@ def main(
         os.makedirs(DATASET_PATH, exist_ok=True)
         os.makedirs(MODEL_PATH, exist_ok=True)
 
+    # the fitted p_1 is only meaningful for the model it was measured on, and it is filed under
+    # that model's short name, so the size has to resolve to the one the pipeline runs
+    model_specifier = resolve_model_specifier(model_size, model_specifier)
     specifier_name = model_specifier.split("/")[-1]
     candidates = [float(value) for value in top_p_grid.split(",")]
 
@@ -438,13 +445,7 @@ if __name__ == "__main__":
         default=512,
         help="must match the block size of run_baseline.py and run_extrapolation.py",
     )
-    parser.add_argument(
-        "--model_specifier",
-        "-ms",
-        type=str,
-        default="unsloth/Qwen2.5-Coder-0.5B-Instruct",
-        help="the pristine base model (def: unsloth/Qwen2.5-Coder-0.5B-Instruct)",
-    )
+    add_model_arguments(parser, role="the pristine base model")
     parser.add_argument(
         "--num_samples",
         "-ns",

@@ -32,7 +32,10 @@ set -uo pipefail
 
 BLOCK_SIZE=512
 SURROGATE_METHOD="logit"
-MODEL_SPECIFIER="unsloth/Qwen2.5-Coder-0.5B-Instruct"
+# both empty: which model this sweep attacks is resolved below by utils/models.py, so the ladder
+# lives in exactly one place and this script cannot drift from what run_attack.py accepts
+MODEL_SPECIFIER=""
+MODEL_SIZE=""
 PATH_ROOT="."
 PYTHON="${PYTHON:-python}"
 NUM_GENERATIONS=""
@@ -59,6 +62,9 @@ Options:
                             Generation 0 is then swept too, since there is no anchor to
                             collide with, and --direct-gen0 becomes redundant.
   -ms, --model-specifier S  baseline model specifier
+  -msz, --model-size SIZE   parameter count off the Qwen2.5-Coder ladder (0.5b, 1.5b, 3b, 7b,
+                            14b, 32b), shorthand for --model-specifier. Must be the size the
+                            collapse run used — it is part of the checkpoint names
       --direct-gen0         also attack generation 0, without a surrogate, instead of skipping it
       --force               re-run generations whose result file already exists
       --dry-run             print the commands without running them
@@ -81,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         -s|--start)           START_GENERATION="$2"; shift 2 ;;
         -m|--method)          SURROGATE_METHOD="$2"; shift 2 ;;
         -ms|--model-specifier) MODEL_SPECIFIER="$2"; shift 2 ;;
+        -msz|--model-size)    MODEL_SIZE="$2";      shift 2 ;;
         --direct-gen0)        DIRECT_GEN0=1;        shift ;;
         --force)              FORCE=1;              shift ;;
         --dry-run)            DRY_RUN=1;            shift ;;
@@ -127,6 +134,18 @@ if [[ ! -f "$ATTACK" ]]; then
 fi
 if [[ ! -d "$PATH_ROOT/model_outputs" ]]; then
     echo "error: no model_outputs/ under $PATH_ROOT — run run_baseline.py first" >&2
+    exit 2
+fi
+
+# resolve --model-size / --model-specifier through the same helper run_attack.py uses, rather than
+# repeating the size table in bash: the checkpoint directories are named after the trailing
+# component of the result, so a table that drifted from the python one would sweep a model that
+# does not exist under this run's names. The helper exits non-zero with its own message on an
+# unknown size or on the two flags disagreeing
+if ! MODEL_SPECIFIER="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.models import resolve_model_specifier
+print(resolve_model_specifier(sys.argv[1], sys.argv[2]))' "$MODEL_SIZE" "$MODEL_SPECIFIER")"; then
     exit 2
 fi
 

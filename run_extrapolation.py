@@ -41,6 +41,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.plotting import visible_perplexity_range
 from utils.utils import report_block_size
+from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.extrapolation import (
     METHODS,
@@ -109,6 +110,7 @@ def main(
     histogram_only: bool = False,
     path: str = "",
     model_specifier: str = "",
+    model_size: str = "",
     continue_from_generation: int = 0,
     method: str = "logit",
     surrogate_top_p: float = 0.0,
@@ -136,6 +138,9 @@ def main(
         histogram_only (bool): if True, only generate the histogram and skip the rest
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
+        model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
+            shorthand for the matching model_specifier. Must resolve to the same model
+            run_baseline.py was given, since this stage reads its generation-0 checkpoint
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
         dataset_size (int): number of dataset samples to use, taken from the front of the
             upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
@@ -221,10 +226,11 @@ def main(
         os.makedirs(DATASET_PATH, exist_ok=True)
         os.makedirs(MODEL_PATH, exist_ok=True)
 
-    # set the model specifier
-    if model_specifier != "":
-        global MODEL_SPECIFIER
-        MODEL_SPECIFIER = model_specifier
+    # set the model specifier. --model_size is shorthand for a repo id off the Qwen2.5-Coder
+    # ladder; whichever way it is given it has to resolve to the same model run_baseline.py used,
+    # because this stage loads that run's generation-0 checkpoint by name
+    global MODEL_SPECIFIER
+    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
     # allow tf32 for the fp32 fallback matmuls. The L40S runs tf32 at a multiple of the fp32 rate
@@ -908,13 +914,7 @@ if __name__ == "__main__":
         help="if set, only generate the histogram and skip the rest",
     )
 
-    parser.add_argument(
-        "--model_specifier",
-        "-ms",
-        type=str,
-        default="unsloth/Qwen2.5-Coder-0.5B-Instruct",
-        help="model specifier to use for the training (def: unsloth/Qwen2.5-Coder-0.5B-Instruct)",
-    )
+    add_model_arguments(parser)
     parser.add_argument(
         "--continue_from_generation",
         "-cfg",

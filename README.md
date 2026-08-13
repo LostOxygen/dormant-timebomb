@@ -78,7 +78,8 @@ model and plotted as a log-log histogram.
 ```
 python run_baseline.py [-dx DEVICE] [-te TRAINING_EPOCHS] [-dbs DATASET_BATCH_SIZE]
                        [-tbs TRAINING_BATCH_SIZE] [-st] [-ng NUM_GENERATIONS]
-                       [-bs BLOCK_SIZE] [-ho] [-heo] [-ms MODEL_SPECIFIER]
+                       [-bs BLOCK_SIZE] [-ho] [-heo] [-msz MODEL_SIZE]
+                       [-ms MODEL_SPECIFIER]
                        [-cfg CONTINUE_FROM_GENERATION] [-dsz DATASET_SIZE]
                        [-lr LEARNING_RATE] [-lr_r LORA_RANK] [-lr_a LORA_ALPHA] [-p PATH]
 ```
@@ -94,7 +95,8 @@ python run_baseline.py [-dx DEVICE] [-te TRAINING_EPOCHS] [-dbs DATASET_BATCH_SI
 | `--block_size` | `-bs` | int | `512` | Max sequence length, and the `max_new_tokens` cap of the generation. Exactly the value you pass — it is *not* raised to the dataset's longest response — and it appears in every output filename, so all stages have to be given the same one. Responses longer than it are not discarded; `"wrapped"` packing splits them across blocks. |
 | `--histogram_only` | `-ho` | flag | off | Skip the perplexity computation and re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt`. |
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
-| `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Hugging Face id of the base model. The trailing name is part of every output path. |
+| `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder: `0.5b`, `1.5b`, `3b`, `7b`, `14b`, `32b`. Shorthand for the matching `--model_specifier`, so every stage of a run resolves the same repo id — and therefore the same artifact names — from one token. Mutually exclusive with `--model_specifier`: passing both raises unless they agree. The larger sizes do not fit a single 48GB card at the defaults, see `-q4`, `-gc`, `-tg` and the batch sizes. |
+| `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Hugging Face id of the base model, for anything outside the `--model_size` ladder. The trailing name is part of every output path. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Resume: generations below this index are skipped, so training continues from an existing checkpoint. |
 | `--dataset_size` | `-dsz` | int | `0` | How many samples to use from the upstream 50k dataset, taken as a contiguous slice from the front; `0` uses all of it. Must match the value given to `run_extrapolation.py`, otherwise the two describe different data. |
 | `--learning_rate` | `-lr` | float | `2e-4` | LoRA learning rate. One of the levers on how fast collapse progresses. |
@@ -117,6 +119,17 @@ Multi-GPU run — dataset generation is sharded over every device listed in
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 python run_baseline.py --device cuda \
     --num_generations 10 --path ./runs/baseline
+```
+
+Collapse a larger model. `--model_size` is shorthand for the matching
+```unsloth/Qwen2.5-Coder-<size>-Instruct``` id and takes `0.5b`, `1.5b`, `3b`, `7b`, `14b` or
+`32b`; every later stage has to be given the *same* size, because the model's short name is part
+of every artifact path. From 7b upward a single 48GB card needs `-q4`/`-gc` and smaller batches:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python run_baseline.py --device cuda --model_size 7b \
+    -q4 -gc -tbs 4 -gas 16 -pbs 4 --num_generations 10 --path ./runs/qwen7b
+python run_attack.py --device cuda --model_size 7b -cg 9 --path ./runs/qwen7b
 ```
 
 Resume after a crash in generation 6 (generations 0–5 are kept):
@@ -279,7 +292,8 @@ baseline's ```chunked_dataset_bs<block_size>_<model_name>``` for the generation-
 
 ```
 python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENERATIONS]
-                            [-bs BLOCK_SIZE] [-ho] [-heo] [-ms MODEL_SPECIFIER]
+                            [-bs BLOCK_SIZE] [-ho] [-heo] [-msz MODEL_SIZE]
+                       [-ms MODEL_SPECIFIER]
                             [-cfg CONTINUE_FROM_GENERATION] [-m METHOD]
                             [-stp SURROGATE_TOP_P] [-dsz DATASET_SIZE]
                             [-rdf REAL_DATA_FRACTION] [-p PATH]
@@ -295,6 +309,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--block_size` | `-bs` | int | `512` | Max sequence length and `max_new_tokens` for generation. Exactly the value you pass, like in step 1. Must match the value used by `run_baseline.py`. |
 | `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt` of the selected method. |
 | `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
+| `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder (`0.5b` … `32b`), shorthand for `--model_specifier`; must resolve to the model of step 1, whose `model_0` this step reads. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
 | `--dataset_size` | `-dsz` | int | `0` | Samples to use from the upstream 50k dataset; `0` uses all of it. **Must match step 1** — both take the same front slice, which is what makes their histograms comparable. |
@@ -306,6 +321,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | Argument | Short | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `--block_size` | `-bs` | int | `512` | Must match `run_baseline.py` / `run_extrapolation.py`. |
+| `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder (`0.5b` … `32b`), shorthand for `--model_specifier`. `p_1` is fitted per model and filed under its short name, so this must be the model the pipeline runs. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | The pristine base model. |
 | `--num_samples` | `-ns` | int | `128` | Instructions to calibrate on, taken as a contiguous slice from the front so the fit is reproducible without a seed. |
 | `--dataset_size` | `-dsz` | int | `0` | The `--dataset_size` the pipeline runs with; `0` uses the whole dataset. The calibration draws from the same front slice, so `p_1` is never fitted on data the pipeline never sees. |
@@ -515,7 +531,7 @@ version fails.
 
 ```
 python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
-                     [-ms MODEL_SPECIFIER] [-bmp BASELINE_MODEL_PATH]
+                     [-msz MODEL_SIZE] [-ms MODEL_SPECIFIER] [-bmp BASELINE_MODEL_PATH]
                      [-cmp COLLAPSED_MODEL_PATH] [-p PATH] [-t TASKS] [-lt]
                      [-r RESTARTS] [-ns NUM_STEPS] [-sw SEARCH_WIDTH] [-b BATCH_SIZE]
                      [-k TOPK] [-nr N_REPLACE] [-osi OPTIM_STR_INIT] [-ana]
@@ -535,6 +551,7 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--surrogate_model_path` | `-smp` | str | built | Prebuilt surrogate to use instead of building one, e.g. step 2's `model_scaled_n<n>_*` directory (`lora` only). |
 | `--first_collapsed_path` | `-fcp` | str | resolved | Explicit path to the generation-0 model the surrogate is built from. The `lora` method needs the **adapter**, not the merged `_fp16` copy. |
 | `--block_size` | `-bs` | int | auto | Effective block size baked into the checkpoint names. Omit to auto-discover by globbing; required only when several block sizes exist side by side. |
+| `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder (`0.5b` … `32b`), shorthand for `--model_specifier`; must be the size the collapse run used, since its short name is part of the checkpoint directories this resolves. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Baseline model, and the tokenizer used for both models. |
 | `--baseline_model_path` | `-bmp` | str | `--model_specifier` | Explicit override for the baseline model. |
 | `--collapsed_model_path` | `-cmp` | str | resolved | Explicit override for the collapsed model, bypassing generation/block-size resolution. |

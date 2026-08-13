@@ -22,6 +22,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
 from utils.devices import visible_devices
+from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.plotting import visible_perplexity_range
 from utils.utils import report_block_size
@@ -149,6 +150,7 @@ def main(
     human_eval_only: bool = False,
     path: str = "",
     model_specifier: str = "",
+    model_size: str = "",
     continue_from_generation: int = 0,
     dataset_size: int = 0,
     real_data_fraction: float = 0.0,
@@ -185,6 +187,8 @@ def main(
         human_eval_only (bool): if True, only generate human eval samples and skip the rest
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
+        model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
+            shorthand for the matching model_specifier. Mutually exclusive with it
         continue_from_generation (int): generation to continue from (default: 0, start from scratch)
         dataset_size (int): number of dataset samples to use, taken from the front of the
             upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
@@ -260,10 +264,12 @@ def main(
         os.makedirs(DATASET_PATH, exist_ok=True)
         os.makedirs(MODEL_PATH, exist_ok=True)
 
-    # set the model specifier
-    if model_specifier != "":
-        global MODEL_SPECIFIER
-        MODEL_SPECIFIER = model_specifier
+    # set the model specifier. --model_size picks one off the Qwen2.5-Coder ladder and
+    # --model_specifier names any repo id directly; resolve_model_specifier raises rather than
+    # rank them when both are given, because the ignored one would be a whole collapse run trained
+    # under a name that says otherwise
+    global MODEL_SPECIFIER
+    MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
 
     # which weight lineage this run used, carried into the names of everything the run is compared
@@ -1039,13 +1045,7 @@ if __name__ == "__main__":
         action="store_true",
         help="if set, only generate human eval samples and skip the rest",
     )
-    parser.add_argument(
-        "--model_specifier",
-        "-ms",
-        type=str,
-        default="unsloth/Qwen2.5-Coder-0.5B-Instruct",
-        help="model specifier to use for the training (default: unsloth/Qwen2.5-Coder-0.5B-Instruct)",
-    )
+    add_model_arguments(parser)
     parser.add_argument(
         "--continue_from_generation",
         "-cfg",
@@ -1172,14 +1172,16 @@ if __name__ == "__main__":
         action="store_true",
         help="quantize the model for training. A 0.5B model is ~1GB in bf16 on a 48GB card, so "
         "this only adds a dequantization kernel to every forward and backward pass. Only set it "
-        "for a --model_specifier that does not otherwise fit",
+        "for a --model_size / --model_specifier that does not otherwise fit — from 7b upward on a "
+        "48GB card it generally does not",
     )
     parser.add_argument(
         "--gradient_checkpointing",
         "-gc",
         action="store_true",
         help="recompute activations during the backward pass instead of keeping them. Trades a "
-        "second forward pass for memory there is no shortage of at this model size",
+        "second forward pass for memory there is no shortage of at the default 0.5b, and is worth "
+        "setting at the larger --model_size values",
     )
     parser.add_argument(
         "--perplexity_load_in_4bit",
