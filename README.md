@@ -1,4 +1,4 @@
-# Dormant Neurons: Adversarial Timebomb Attacks Against Collapsed LLMs
+# Back to the Future: Utilizing Model Collapse for Adversarial Timebomb Attacks
 
 Adversarial timebomb attacks are a new class of attacks that exploit the phenomenon of model collapse in large language models (LLMs). Model collapse occurs when a model's performance degrades over time due to the accumulation of errors or biases in its training data. Adversarial timebomb attacks take advantage of this vulnerability by introducing malicious inputs that trigger the collapsed model to produce incorrect or harmful outputs while being harmless against a non-collapsed model.
 

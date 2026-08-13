@@ -17,7 +17,7 @@ import psutil
 
 from utils.colors import TColors
 from utils.devices import visible_devices
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix
 
 # The experiment is one-directional and that is the whole point: run A is collapsed, a generation
@@ -669,6 +669,8 @@ def main(
     global MODEL_SPECIFIER
     MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    # the ladder rung, for the banner — both runs share it by construction, so one line covers them
+    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
     path_a = os.path.join(root, f"run_a_seed{seed_a}")
     path_b = os.path.join(root, f"run_b_seed{seed_b}")
     report_dir = os.path.join(root, "transfer_report")
@@ -682,7 +684,7 @@ def main(
         f"## user: {TColors.HEADER}{getpass.getuser()}{TColors.ENDC}\n"
         f"## GPUs: {TColors.HEADER}{VISIBLE_DEVICES}{TColors.ENDC}\n"
         f"## RAM: {TColors.HEADER}{psutil.virtual_memory().total // 1024**3} GB{TColors.ENDC}\n"
-        f"## model: {TColors.HEADER}{MODEL_SPECIFIER}{TColors.ENDC}\n"
+        f"## model: {TColors.HEADER}{MODEL_SPECIFIER}{TColors.ENDC} ({size_label})\n"
         f"## run A (search):   seed {TColors.OKGREEN}{seed_a}{TColors.ENDC} -> {path_a}\n"
         f"## run B (transfer): seed {TColors.OKGREEN}{seed_b}{TColors.ENDC} -> {path_b}\n"
         f"## generation under attack: "

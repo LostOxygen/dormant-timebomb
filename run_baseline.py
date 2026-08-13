@@ -22,7 +22,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
 from utils.devices import visible_devices
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.plotting import visible_perplexity_range
 from utils.utils import report_block_size
@@ -271,6 +271,10 @@ def main(
     global MODEL_SPECIFIER
     MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    # the ladder rung this run resolved to, for the parameters banner. Taken from the resolved id
+    # rather than from the flag, so it reads the same whichever of the two named the model — the
+    # later stages have to be given that same model and the log is where that gets checked
+    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
 
     # which weight lineage this run used, carried into the names of everything the run is compared
     # by. The two modes produce different collapse curves from the same data, so a plot without
@@ -401,6 +405,7 @@ def main(
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {MODEL_SPECIFIER}"
     )
+    print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Dataset Specifier{TColors.ENDC}: {DATASET_SPECIFIER}"
     )

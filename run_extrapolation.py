@@ -41,7 +41,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.plotting import visible_perplexity_range
 from utils.utils import report_block_size
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.extrapolation import (
     METHODS,
@@ -232,6 +232,9 @@ def main(
     global MODEL_SPECIFIER
     MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    # the ladder rung, for the parameters banner — same reason as in run_baseline.py, and here it is
+    # what a log shows when the two stages' histograms turn out to be of different models
+    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
 
     # allow tf32 for the fp32 fallback matmuls. The L40S runs tf32 at a multiple of the fp32 rate
     # and the bf16 path is unaffected
@@ -330,6 +333,7 @@ def main(
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Model Specifier{TColors.ENDC}: {MODEL_SPECIFIER}"
     )
+    print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Dataset Specifier{TColors.ENDC}: {DATASET_SPECIFIER}"
     )

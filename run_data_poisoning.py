@@ -74,7 +74,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.extrapolation import build_scaled_adapter
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, poison_specifier_name
 from utils.poison import (
     DEFAULT_PAYLOAD,
@@ -390,6 +390,9 @@ def main(
     global MODEL_SPECIFIER
     MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    # the ladder rung, for the banner — same as run_baseline.py, from the resolved id rather than
+    # the flag so it reads the same whichever of the two named the model
+    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
     # every artifact of this run is filed under the base short name plus the tag, so a poisoned run
     # and a clean baseline run can share one --path without ever reading each other's checkpoints.
     # The workers are handed this as their --specifier_name and need no poison-aware code at all
@@ -430,6 +433,7 @@ def main(
     print("\n" + "#" * 78)
     print(f"## {TColors.BOLD}{TColors.HEADER}Dormant data-poisoning attack{TColors.ENDC}")
     print(f"## Base model      : {MODEL_SPECIFIER}")
+    print(f"## Model size      : {size_label}")
     print(f"## Dataset         : {DATASET_SPECIFIER} ({len(human_corpus)} human rows)")
     print(f"## Namespace       : {poison_name}  (tag: {tag})")
     print(f"## Generations     : {num_generations}   block size: {block_size}")

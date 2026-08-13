@@ -38,7 +38,7 @@ from transformers import AutoConfig
 
 from utils.colors import TColors
 from utils.extrapolation import calibration_file
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.utils import clear_inherited_max_length
 from utils.perplexity import sample_perplexities
 
@@ -270,6 +270,7 @@ def main(
         f"Surrogate{TColors.ENDC}"
     )
     print(f"##   base model: {model_specifier}")
+    print(f"##   model size: {model_size_label(model_specifier) or 'off the ladder'}")
     print(f"##   samples: {num_samples}, candidates: {candidates}")
 
     # ── the instructions to calibrate on ──

@@ -85,6 +85,27 @@ def resolve_model_specifier(
     return specifier or default
 
 
+def model_size_label(model_specifier: str) -> str:
+    """The ladder key a resolved repo id corresponds to, for the parameters banner.
+
+    Derived from the *resolved* specifier rather than from the --model_size string, so the banner
+    reads the same whichever of the two flags was passed — a run started with
+    ``--model_specifier unsloth/Qwen2.5-Coder-7B-Instruct`` prints ``7b`` just like ``-msz 7b``
+    does. That is the point of printing it at all: the specifier line already carries the id, and
+    what a reader of a log wants to confirm is which rung of the ladder the numbers came from.
+
+    Args:
+        model_specifier (str): the repo id resolve_model_specifier returned
+
+    Returns:
+        str: the matching key of MODEL_SIZES, or "" for anything off the ladder
+    """
+    for size, specifier in MODEL_SIZES.items():
+        if specifier == model_specifier:
+            return size
+    return ""
+
+
 def add_model_arguments(
     parser: argparse.ArgumentParser, role: str = "the base model"
 ) -> None:

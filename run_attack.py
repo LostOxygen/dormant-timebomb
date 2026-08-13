@@ -136,7 +136,7 @@ from transformers import (
 from utils.colors import TColors
 from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
 from utils.gcg import filter_ids, sample_ids_from_grad
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix
 from utils.utils import (
     INIT_CHARS,
@@ -1577,6 +1577,9 @@ def main(
     # model quietly attacked
     MODEL_SPECIFIER = resolve_model_specifier(model_size, model_specifier, MODEL_SPECIFIER)
     specifier_name = MODEL_SPECIFIER.split("/")[-1]
+    # the ladder rung, for the banner — same as run_baseline.py, from the resolved id rather than
+    # the flag so it reads the same whichever of the two named the model
+    size_label = model_size_label(MODEL_SPECIFIER) or "outside the --model_size ladder"
 
     baseline_dir = baseline_model_path or MODEL_SPECIFIER
     collapsed_dir = collapsed_model_path or resolve_collapsed_dir(
@@ -1644,6 +1647,7 @@ def main(
     )
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Baseline Model{TColors.ENDC}: {baseline_dir}")
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Collapsed Model{TColors.ENDC}: {collapsed_dir}")
+    print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Collapse Generation{TColors.ENDC}: "
         f"{collapsed_generation}"

@@ -142,12 +142,19 @@ fi
 # component of the result, so a table that drifted from the python one would sweep a model that
 # does not exist under this run's names. The helper exits non-zero with its own message on an
 # unknown size or on the two flags disagreeing
-if ! MODEL_SPECIFIER="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+#
+# two values come back on one line, tab separated, from one interpreter start: the resolved id and
+# the ladder rung it corresponds to (empty when the id is off the ladder). The rung is only for the
+# banner below, but computing it here keeps the size table on the python side as well
+if ! RESOLVED="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
         'import sys
-from utils.models import resolve_model_specifier
-print(resolve_model_specifier(sys.argv[1], sys.argv[2]))' "$MODEL_SIZE" "$MODEL_SPECIFIER")"; then
+from utils.models import model_size_label, resolve_model_specifier
+specifier = resolve_model_specifier(sys.argv[1], sys.argv[2])
+print(specifier, model_size_label(specifier), sep="\t")' "$MODEL_SIZE" "$MODEL_SPECIFIER")"; then
     exit 2
 fi
+MODEL_SPECIFIER="${RESOLVED%%$'\t'*}"
+MODEL_SIZE="${RESOLVED#*$'\t'}"
 
 SPECIFIER_NAME="${MODEL_SPECIFIER##*/}"
 RESULTS_DIR="$PATH_ROOT/attack_results"
@@ -163,6 +170,7 @@ else
 fi
 echo "##   block size   : $BLOCK_SIZE"
 echo "##   model        : $MODEL_SPECIFIER"
+echo "##   model size   : ${MODEL_SIZE:-outside the --model_size ladder}"
 echo "##   path         : $PATH_ROOT"
 echo "##   logs         : $LOG_DIR"
 if (( ${#EXTRA_ARGS[@]} )); then
