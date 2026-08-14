@@ -135,7 +135,13 @@ from transformers import (
 
 from utils.colors import TColors
 from utils.execution import extract_code, run_tests
-from utils.extrapolation import METHODS, build_scaled_adapter, extrapolate_logits
+from utils.extrapolation import (
+    METHODS,
+    build_scaled_adapter,
+    calibrated_factor,
+    extrapolate_logits,
+    factor_calibration_file,
+)
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
@@ -1399,15 +1405,15 @@ def surrogate_factor_arg(value: str) -> float | str:
         float | str: the parsed factor, or "auto"
 
     Raises:
-        argparse.ArgumentTypeError: neither a number nor "auto"
+        argparse.ArgumentTypeError: neither a number, "auto" nor "calibrated"
     """
-    if value.strip().lower() == "auto":
-        return "auto"
+    if value.strip().lower() in ("auto", "calibrated"):
+        return value.strip().lower()
     try:
         return float(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            f"--surrogate_factor takes a number or 'auto', not {value!r}"
+            f"--surrogate_factor takes a number, 'auto' or 'calibrated', not {value!r}"
         ) from exc
 
 
@@ -1738,7 +1744,28 @@ def main(
     transfer = surrogate_method != "none"
     auto_factor = surrogate_factor == "auto"
     factor = float(collapsed_generation + 1)
-    if not auto_factor and float(surrogate_factor) > 0:
+    if surrogate_factor == "calibrated":
+        # the factor utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints.
+        # Measured for the generations it covered, predicted by the fitted law for the rest — which
+        # is the case that matters, since the generation under attack is the one nobody has
+        # the calibration lives beside the datasets, not the checkpoints; this script has no
+        # DATASET_PATH global of its own because nothing else here reads that directory
+        dataset_path = (
+            os.path.join(path, "generated_datasets/") if path else "./generated_datasets/"
+        )
+        calibration_path = factor_calibration_file(
+            dataset_path, block_size or 0, specifier_name, mixture_tag(real_data_fraction)
+        )
+        if not os.path.isfile(calibration_path):
+            raise SystemExit(
+                f"{TColors.FAIL}--surrogate_factor calibrated needs a calibration"
+                f"{TColors.ENDC} and {calibration_path} does not exist. Produce it with:\n"
+                f"  python -m utils.evaluate_perplexity -p {path or '.'} -bs {block_size} "
+                f"-ng {collapsed_generation + 1} --calibrate"
+            )
+        with open(calibration_path, encoding="utf-8") as handle:
+            factor = calibrated_factor(json.load(handle), collapsed_generation)
+    elif not auto_factor and float(surrogate_factor) > 0:
         factor = float(surrogate_factor)
     first_collapsed_dir = ""
     if transfer:
@@ -2247,7 +2274,9 @@ if __name__ == "__main__":
         "factors and the largest one it still solves --min_capability of them at is used. Use it "
         "when the surrogate is reported as broken on every clean task — a proxy that already "
         "fails them satisfies the objective's 'collapsed must break' term before the search "
-        "starts, and the suffix then optimizes against noise (default: 0.0)",
+        "starts, and the suffix then optimizes against noise. 'calibrated' reads the factor "
+        "utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints' perplexity "
+        "(default: 0.0)",
     )
     parser.add_argument(
         "--surrogate_model_path",

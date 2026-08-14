@@ -43,6 +43,7 @@ from unsloth import FastLanguageModel
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass
 
@@ -52,7 +53,7 @@ import torch
 from datasets import Dataset, load_dataset
 
 from utils.colors import TColors
-from utils.extrapolation import extrapolate_logits
+from utils.extrapolation import extrapolate_logits, factor_calibration_file
 from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import (
@@ -480,6 +481,214 @@ def measure_surrogates(
     return results
 
 
+def fit_factor(
+    base_model, first_model, tokenizer, prompts: list, target: float, block_size: int,
+    batch_size: int, token_budget: int, upper: float, steps: int,
+) -> tuple[float, float]:
+    """Finds the factor n whose surrogate matches one real checkpoint's median perplexity.
+
+    ``n = generation + 1`` is an *indexing* convention — one fine-tuning step from base to model_0,
+    extended g + 1 times — and this repo's measurements show it is not a calibration: the tilt
+    degrades roughly tenfold per unit of n while the real collapse degrades a few percent per
+    generation, so the two diverge by orders of magnitude. This searches for the n that actually
+    reproduces the target instead of assuming it.
+
+    Bisection, because the surrogate's perplexity is monotone in n (the tilt only sharpens) and
+    monotone is all bisection needs — no gradient, no assumption about the shape of the curve. The
+    search runs in log space since perplexity spans decades, and each step costs one scoring pass
+    over the calibration rows, which is why those are a subsample rather than the full test set.
+
+    Args:
+        base_model: the pristine base model
+        first_model: the generation-0 collapsed model
+        tokenizer: shared tokenizer
+        prompts (list): the calibration prompts
+        target (float): the real checkpoint's median perplexity, the value to match
+        block_size (int): truncation length is twice it
+        batch_size (int): scoring batch size
+        token_budget (int): padded tokens per forward pass
+        upper (float): highest factor to consider
+        steps (int): bisection steps
+
+    Returns:
+        tuple: (the fitted factor, the median perplexity it achieves). The factor is clamped to
+            [1, upper]; at the bounds the target was outside what the tilt can reach
+    """
+    def median_at(factor: float) -> float:
+        values = sorted(
+            score_tilted(
+                base_model, first_model, tokenizer, prompts, factor,
+                block_size, batch_size, token_budget,
+            )
+        )
+        return values[len(values) // 2]
+
+    low, high = 1.0, float(upper)
+    low_value, high_value = median_at(low), median_at(high)
+    if target <= low_value:
+        return low, low_value
+    if target >= high_value:
+        return high, high_value
+
+    # False position rather than plain bisection, and in log-perplexity: the curve is smooth and
+    # spans decades, so interpolating between the bracket's endpoints lands far closer than halving
+    # it. Plain bisection over [1, num_generations + 1] resolves only (upper - 1) / 2^steps — at the
+    # defaults that is 0.16, coarse enough that neighbouring generations were coming out with the
+    # identical factor. The interpolation is clamped away from the endpoints so a badly curved
+    # region cannot stall the bracket on one side.
+    log_target = math.log(target)
+    factor, achieved = high, high_value
+    for _ in range(steps):
+        span = math.log(high_value) - math.log(low_value)
+        fraction = 0.5 if span <= 0 else (log_target - math.log(low_value)) / span
+        factor = low + min(max(fraction, 0.05), 0.95) * (high - low)
+        achieved = median_at(factor)
+        # within a percent in log space is well inside the noise of a 96-row median
+        if abs(math.log(achieved) - log_target) < 0.01:
+            break
+        if achieved < target:
+            low, low_value = factor, achieved
+        else:
+            high, high_value = factor, achieved
+
+    # the pair returned is one measurement, not a bracket midpoint paired with some other probe's
+    # value: `achieved` is what the surrogate actually scored at `factor`
+    return factor, achieved
+
+
+def fit_scale(factors: dict) -> tuple[float, float]:
+    """Fits ``n = 1 + scale * ln(1 + g)`` through the calibrated factors, least squares.
+
+    One parameter, and it is the shape the measurements have rather than a chosen convenience: the
+    fitted factors rise steeply from generation 0 to 1 and then flatten, which is what a logarithm
+    does and what neither the linear ``g + 1`` nor a constant multiple of it can do. Fitting it
+    matters because the generation an attacker aims at is the one nobody has a checkpoint of, so
+    its factor cannot be measured and has to be predicted from the ones that can.
+
+    Args:
+        factors (dict): generation -> fitted factor, generation 0 excluded (ln 1 = 0 carries no
+            information about the scale and the factor there is 1 by construction)
+
+    Returns:
+        tuple: (scale, the largest relative error of the fit over the given generations)
+    """
+    points = [(math.log1p(g), n - 1.0) for g, n in factors.items() if g > 0]
+    if not points:
+        return 0.0, 0.0
+    # least squares through the origin: scale = sum(x*y) / sum(x*x)
+    scale = sum(x * y for x, y in points) / sum(x * x for x, _ in points)
+    worst = max(abs((1 + scale * x) - (1 + y)) / (1 + y) for x, y in points)
+    return scale, worst
+
+
+def calibrate_factors(
+    baseline: list, block_size: int, name: str, model_specifier: str, prompts_for,
+    batch_size: int, load_in_4bit: bool, token_budget: int, calibration_rows: int,
+    steps: int, num_generations: int,
+) -> dict:
+    """Fits one factor per generation against the measured checkpoints, plus the scaling law.
+
+    Loads the two anchors once and reuses them for every generation and every bisection step —
+    the surrogate is a float on two resident models, which is what makes a search affordable at
+    all.
+
+    Args:
+        baseline (list): the Measurements of the real checkpoints, whose medians are the targets
+        block_size (int): the run's block size
+        name (str): the model short name
+        model_specifier (str): the pristine base model
+        prompts_for (callable): tokenizer -> the templated test prompts
+        batch_size (int): scoring batch size
+        load_in_4bit (bool): quantize the anchors
+        token_budget (int): padded tokens per forward pass for the tilt
+        calibration_rows (int): prompts used inside the search
+        steps (int): bisection steps per generation
+        num_generations (int): highest generation index, the upper end of the search bracket
+
+    Returns:
+        dict: the calibration, with the fitted factor per generation, the fitted scale, and what
+            the default n = g + 1 would have produced instead
+    """
+    anchor = os.path.join(MODEL_PATH, f"model_0_bs{block_size}_{name}")
+    base_model, tokenizer = load_scoring_model(model_specifier, block_size, load_in_4bit)
+    first_model, _ = load_scoring_model(
+        f"{anchor}_fp16" if os.path.isdir(f"{anchor}_fp16") else anchor, block_size, load_in_4bit
+    )
+    # the search runs on a subsample — a step is one scoring pass and there are several per
+    # generation — but the curve that ends up in the figure is measured on the *whole* test set,
+    # the same rows the real checkpoints were scored on. Comparing a 96-row median against a
+    # 512-row median would put a sampling difference into the residual
+    full_prompts = prompts_for(tokenizer)
+    prompts = full_prompts[:calibration_rows]
+
+    factors, achieved = {}, {}
+    for row in baseline:
+        generation = int(row.label.split()[-1])
+        factor, value = fit_factor(
+            base_model, first_model, tokenizer, prompts, row.median, block_size,
+            batch_size, token_budget, upper=float(num_generations + 1), steps=steps,
+        )
+        factors[generation] = round(factor, 4)
+        achieved[generation] = round(value, 4)
+        print(
+            f"##   generation {generation}: target {row.median:8.2f}  "
+            f"fitted n = {factor:5.2f} (default {generation + 1})  "
+            f"reaches {value:8.2f}"
+        )
+
+    scale, worst = fit_scale(factors)
+    print(
+        f"##   fitted law: n = 1 + {scale:.3f} * ln(1 + g)   "
+        f"(largest relative error {worst:.1%} over the calibrated generations)"
+    )
+
+    # and now the honest test of that one parameter: score the surrogate at the factor the *law*
+    # predicts — not the per-generation fit, which reproduces its target by construction — on the
+    # full test set, against the real checkpoints. This is what the third panel plots
+    print(
+        f"##   {TColors.OKBLUE}re-scoring the surrogate at the law's factor{TColors.ENDC} "
+        f"on all {len(full_prompts)} test rows"
+    )
+    law_factors, law_perplexity = {}, {}
+    for row in baseline:
+        generation = int(row.label.split()[-1])
+        factor = 1.0 + scale * math.log1p(generation)
+        values = sorted(
+            score_tilted(
+                base_model, first_model, tokenizer, full_prompts, factor,
+                block_size, batch_size, token_budget,
+            )
+        )
+        median = values[len(values) // 2]
+        law_factors[generation] = round(factor, 4)
+        law_perplexity[generation] = round(median, 4)
+        print(
+            f"##   generation {generation}: n = {factor:5.2f} -> {median:8.2f}  "
+            f"(real {row.median:8.2f}, off by {abs(median - row.median) / row.median:6.1%})"
+        )
+
+    del base_model, first_model
+    torch.cuda.empty_cache()
+
+    residuals = [
+        abs(law_perplexity[int(r.label.split()[-1])] - r.median) / r.median for r in baseline
+    ]
+    return {
+        "factors": factors,
+        "achieved_perplexity": achieved,
+        "target_perplexity": {int(r.label.split()[-1]): round(r.median, 4) for r in baseline},
+        "scale": round(scale, 4),
+        "worst_relative_error": round(worst, 4),
+        "law": "n = 1 + scale * ln(1 + generation)",
+        "law_factors": law_factors,
+        "law_perplexity": law_perplexity,
+        "law_worst_perplexity_error": round(max(residuals), 4) if residuals else None,
+        "law_median_perplexity_error": (
+            round(sorted(residuals)[len(residuals) // 2], 4) if residuals else None
+        ),
+    }
+
+
 def cache_file(block_size: int, name: str, tag: str) -> str:
     """Path of the JSON the measurements are written to and --plot_only reads back."""
     return os.path.join(DATASET_PATH, f"test_perplexity_bs{block_size}_{name}{tag}.json")
@@ -522,7 +731,25 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
         }
     )
 
-    figure, axis = plt.subplots(figsize=(10, 6))
+    # a second panel only when there is a calibration to show: what factor each generation
+    # actually needed, against the n = g + 1 the pipeline assumes
+    calibration = payload.get("calibration")
+    scaled = (calibration or {}).get("law_perplexity")
+    if calibration:
+        # three rows: the surrogate as the pipeline indexes it, the same surrogate re-scored at the
+        # fitted law's factor, and the factors themselves. The middle one is the result — whether
+        # one parameter is enough to make the approximation track the collapse
+        rows_count = 3 if scaled else 2
+        figure, axes = plt.subplots(
+            rows_count, 1, figsize=(10, 4 * rows_count),
+            sharex=True, height_ratios=[3, 3, 2][:rows_count],
+        )
+        axis, lower = axes[0], axes[-1]
+        middle = axes[1] if scaled else None
+    else:
+        figure, axis = plt.subplots(figsize=(10, 6))
+        lower = middle = None
+
     series = (
         ("baseline", "collapse checkpoints", BASELINE_COLOR, "o"),
         ("extrapolation", f"{payload.get('method', 'logit')} surrogate", SURROGATE_COLOR, "s"),
@@ -567,7 +794,8 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
         )
 
     axis.set_yscale("log")
-    axis.set_xlabel("collapse generation")
+    if lower is None:
+        axis.set_xlabel("collapse generation")
     axis.set_ylabel("test perplexity (median)")
     axis.set_xticks([int(row["label"].split()[-1]) for row in (payload.get("baseline") or [])])
     axis.set_title(
@@ -577,6 +805,79 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
     axis.legend(loc="upper left")
     for spine in axis.spines.values():
         spine.set_color("black")
+
+    if middle is not None:
+        real = {int(row["label"].split()[-1]): row["median"] for row in (payload["baseline"] or [])}
+        scaled_ppl = {int(k): v for k, v in scaled.items()}
+        generations = sorted(scaled_ppl)
+        middle.plot(
+            generations, [real[g] for g in generations],
+            marker="o", markersize=9, linewidth=2, color=BASELINE_COLOR,
+            label="collapse checkpoints",
+        )
+        middle.plot(
+            generations, [scaled_ppl[g] for g in generations],
+            marker="s", markersize=9, linewidth=2, color=SURROGATE_COLOR,
+            label="logit surrogate at the fitted factor",
+        )
+        # linear, not log: at the fitted factor both curves live in one decade, and the residual
+        # between them is the whole point of this panel — a log axis would hide it
+        worst = calibration.get("law_worst_perplexity_error")
+        middle.set_ylabel("test perplexity\n(median, scaled)")
+        middle.legend(loc="upper left")
+        if worst is not None:
+            # inside the axes: as a title it sits between the two panels and reads like a caption
+            # for the one above
+            median_error = calibration.get("law_median_perplexity_error")
+            note = (
+                f"deviation from the real curve: {median_error:.0%} median, {worst:.0%} worst"
+                if not usetex else
+                f"deviation from the real curve: {median_error * 100:.0f}\\% median, "
+                f"{worst * 100:.0f}\\% worst"
+            )
+            middle.annotate(
+                note, xy=(0.98, 0.06), xycoords="axes fraction", ha="right", fontsize=14
+            )
+        for spine in middle.spines.values():
+            spine.set_color("black")
+
+    if lower is not None:
+        fitted = {int(k): v for k, v in calibration["factors"].items()}
+        generations = sorted(fitted)
+        lower.plot(
+            generations,
+            [fitted[g] for g in generations],
+            marker="D",
+            markersize=8,
+            linewidth=2,
+            color=SURROGATE_COLOR,
+            label="fitted to the real perplexity",
+        )
+        scale = calibration.get("scale")
+        if scale:
+            lower.plot(
+                generations,
+                [1 + scale * math.log1p(g) for g in generations],
+                linestyle=":",
+                linewidth=2,
+                color=SURROGATE_COLOR,
+                label=f"$n = 1 + {scale:.2f}\\,\\ln(1+g)$" if usetex
+                else f"n = 1 + {scale:.2f} ln(1+g)",
+            )
+        lower.plot(
+            generations,
+            [g + 1 for g in generations],
+            linestyle="--",
+            linewidth=2,
+            color=ANCHOR_COLOR,
+            label="$n = g + 1$ (assumed)" if usetex else "n = g + 1 (assumed)",
+        )
+        lower.set_xlabel("collapse generation")
+        lower.set_ylabel("extrapolation\nfactor $n$" if usetex else "extrapolation\nfactor n")
+        lower.set_xticks(generations)
+        lower.legend(loc="upper left", ncol=1)
+        for spine in lower.spines.values():
+            spine.set_color("black")
 
     figure.tight_layout()
     os.makedirs(os.path.dirname(plot_stem) or ".", exist_ok=True)
@@ -593,6 +894,9 @@ def main(
     perplexity_batch_size: int = 16,
     method: str = "logit",
     surrogate_tokens_per_forward: int = SURROGATE_TOKENS_PER_FORWARD,
+    calibrate: bool = False,
+    calibration_rows: int = 128,
+    calibration_steps: int = 6,
     real_data_fraction: float = 0.0,
     model_size: str = "",
     model_specifier: str = "",
@@ -613,6 +917,12 @@ def main(
         method (str): which stage 2 surrogate to score alongside, "logit" or "lora"
         surrogate_tokens_per_forward (int): padded tokens per forward pass for the tilt, halved
             automatically on an out-of-memory error
+        calibrate (bool): after measuring both lineages, search for the factor that makes the
+            surrogate match each real checkpoint's perplexity, and fit a scaling law through the
+            result. Writes a calibration other stages can read
+        calibration_rows (int): test rows used inside the search, a subsample so that a bisection
+            step costs a fraction of a full pass
+        calibration_steps (int): bisection steps per generation
         real_data_fraction (float): the mixture the run used, part of the checkpoint names
         model_size (str): parameter count off the Qwen2.5-Coder ladder
         model_specifier (str): the base model the run collapsed
@@ -703,6 +1013,40 @@ def main(
         prompts_for, perplexity_batch_size, load_in_4bit, surrogate_tokens_per_forward,
     )
 
+    calibration = {}
+    if calibrate and method == "logit":
+        print(
+            f"\n## {TColors.OKBLUE}{TColors.BOLD}Calibrating the extrapolation factor"
+            f"{TColors.ENDC} — which n reproduces each checkpoint's perplexity"
+        )
+        calibration = calibrate_factors(
+            baseline, block_size, name, specifier, prompts_for, perplexity_batch_size,
+            load_in_4bit, surrogate_tokens_per_forward, calibration_rows, calibration_steps,
+            num_generations,
+        )
+        calibration.update(
+            {
+                "model": name,
+                "block_size": block_size,
+                "real_data_fraction": real_data_fraction,
+                "test_set": description,
+                "calibration_rows": min(calibration_rows, len(test_set)),
+            }
+        )
+        with open(
+            factor_calibration_file(DATASET_PATH, block_size, name, tag), "w", encoding="utf-8"
+        ) as handle:
+            json.dump(calibration, handle, indent=2)
+        print(
+            f"##   {TColors.OKGREEN}saved{TColors.ENDC} "
+            f"{factor_calibration_file(DATASET_PATH, block_size, name, tag)}"
+        )
+    elif calibrate:
+        print(
+            f"\n## {TColors.WARNING}--calibrate applies to the logit surrogate only, skipped for "
+            f"--method {method}{TColors.ENDC}"
+        )
+
     payload = {
         "model": name,
         "model_specifier": specifier,
@@ -719,6 +1063,7 @@ def main(
         "base_model": anchor.__dict__,
         "baseline": [row.__dict__ for row in baseline],
         "extrapolation": [row.__dict__ for row in surrogates],
+        "calibration": calibration or None,
     }
     os.makedirs(DATASET_PATH, exist_ok=True)
     with open(cache_file(block_size, name, tag), "w", encoding="utf-8") as handle:
@@ -772,6 +1117,16 @@ if __name__ == "__main__":
                         help=f"padded tokens per forward pass when scoring the tilt, which runs "
                         f"two models at once. Halved automatically on an out-of-memory error "
                         f"(default: {SURROGATE_TOKENS_PER_FORWARD})")
+    parser.add_argument("--calibrate", "-c", action="store_true",
+                        help="fit the extrapolation factor to the real checkpoints: search the n "
+                        "whose surrogate matches each generation's perplexity, fit "
+                        "n = 1 + scale * ln(1 + g) through the result, and write it where the "
+                        "other stages can read it (run_attack.py -sf calibrated)")
+    parser.add_argument("--calibration_rows", "-cr", type=int, default=128,
+                        help="test rows used inside the factor search, a subsample so a bisection "
+                        "step costs a fraction of a full pass (default: 128)")
+    parser.add_argument("--calibration_steps", "-cs", type=int, default=6,
+                        help="bisection steps per generation (default: 6)")
     parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0,
                         help="the mixture the collapse run used; part of the checkpoint names "
                         "from generation 1 on (default: 0.0)")

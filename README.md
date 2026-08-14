@@ -194,6 +194,9 @@ python -m utils.evaluate_perplexity -p ./runs/x -ng 10 --plot_only          # re
 | `--perplexity_batch_size` | `-pbs` | int | `16` | Prompts per scoring batch. |
 | `--method` | `-m` | str | `logit` | Which stage-2 surrogate to score alongside. `data` is rejected with an explanation. |
 | `--surrogate_tokens_per_forward` | `-stf` | int | `8192` | Padded tokens per forward pass for the tilt; halved automatically on an out-of-memory error. |
+| `--calibrate` | `-c` | flag | off | Fit the extrapolation factor to the real checkpoints, see below. |
+| `--calibration_rows` | `-cr` | int | `128` | Test rows used inside the factor search. |
+| `--calibration_steps` | `-cs` | int | `6` | Search steps per generation. |
 | `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
 | `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
 | `--plot_only` | `-po` | flag | off | Replot from the cached measurements without loading a model. |
@@ -206,6 +209,37 @@ the approximation has drifted from the collapse it approximates. **Generation 0 
 alignment for free**: at `n = 1` the surrogate *is* `model_0`, so the curves must meet there and the
 script warns above a 1% gap. `-m data` is rejected for the reason `run_attack.py` rejects it as an
 attack surrogate — narrowed *sampling* support cannot show up in a teacher-forced score.
+
+#### Calibrating the extrapolation factor
+
+`n = g + 1` is an *indexing* convention — one fine-tuning step from base to `model_0`, extended
+`g + 1` times — and the measurements above show it is not a calibration: on this repo's 0.5b run the
+tilt's test perplexity rises about tenfold per unit of `n` while the real collapse rises 4.2× in
+total, so the two diverge by nine orders of magnitude by generation 9.
+
+`--calibrate` searches instead for the factor that reproduces each checkpoint's perplexity, by false
+position in log-perplexity (the tilt's perplexity is monotone in `n`, which is all the search needs),
+and fits a one-parameter law through the result:
+
+```
+n = 1 + scale · ln(1 + g)
+```
+
+A logarithm, because that is the shape the fitted factors have — a steep rise from generation 0 to
+1, then a flattening — which neither `g + 1` nor any constant multiple of it can follow.
+
+The fit needs the real checkpoints, which an attacker does not have, and that is exactly why the
+*law* is fitted rather than only the points: `calibrated_factor` returns a measured factor for a
+generation the calibration covers and the law's prediction otherwise, so the factor for the
+generation nobody has a checkpoint of is predicted from the ones that could be measured. The result
+goes to `generated_datasets/surrogate_factor_bs{bs}_{model}{mix}.json`, and
+`run_attack.py -sf calibrated` reads it.
+
+`-sf` now takes three kinds of value, answering different questions: a number pins it, `auto` asks
+*can the surrogate still write code* (the capability probe), and `calibrated` asks *does it sit
+where generation g sits*. They can disagree — matching perplexity does not imply matching
+behaviour, as the correctness figure shows — and when they do, that gap is a finding rather than a
+bug.
 
 Scoring the tilt runs two models per forward pass. It used to exhaust a 48GB card, because
 `extrapolate_logits` built the whole `batch x sequence x 152k` combination in float32 on top of both
@@ -263,11 +297,19 @@ than what they could do under a better prompt. Extraction and execution are
 selective hit with, so "the code works" means one thing across the repo. Candidates run under
 `python -I` with a timeout: a containment boundary for accidents, not a sandbox.
 
-The console prints the status breakdown per generation (`{'pass': 9, 'fail': 2,
-'fail_exception': 1}`), which separates *wrong answers* from *output that is not runnable code at
-all* — the two failure modes look identical in the pass rate and mean quite different things about
-how far the model has collapsed. Writes `plots/test_correctness_bs{bs}_{model}{mix}.<png,pdf>` and
-a `generated_datasets/test_correctness_bs{bs}_{model}{mix}.json` cache holding every per-problem
+The figure is a **stacked composition per generation**, not a pass rate: pass / wrong answer /
+timeout / no runnable code, as shares of the benchmark. A pass@1 curve answers "how many did it
+solve" and stops there; the stack answers the follow-up that decides what the number means — of the
+ones it failed, how many were *wrong answers* and how many were *not code at all*. Those degrade at
+different times, and a single rate hides the transition. The base model gets its own bar, set apart
+from the generations by a gap.
+
+`fail` and `fail_exception` are merged into "wrong answer" in the figure only: both mean the code
+ran and the tests rejected it, and the palette has no two orange steps far enough apart to be told
+apart safely (the pair measures OKLab dE 13.5 at normal vision, against a floor of 15). The console
+table and the JSON keep the raw statuses. Writes
+`plots/test_correctness_bs{bs}_{model}{mix}.<png,pdf>` and a
+`generated_datasets/test_correctness_bs{bs}_{model}{mix}.json` cache holding every per-problem
 verdict.
 
 ## Step 2: Approximating later generations with `run_extrapolation.py`

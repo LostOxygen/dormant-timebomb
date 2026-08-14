@@ -1,6 +1,7 @@
 """shared definitions of the extrapolation methods used by run_extrapolation.py"""
 
 import json
+import math
 import os
 import shutil
 
@@ -40,6 +41,10 @@ METHOD_LABELS: dict[str, str] = {
 
 # file name of the calibration result of the data-space surrogate
 CALIBRATION_FILE: str = "surrogate_top_p_bs{block_size}_{specifier_name}.json"
+# the logit surrogate's counterpart: which factor n actually reproduces generation g, fitted on
+# perplexity by utils/evaluate_perplexity.py --calibrate. Carries the mixture tag because the
+# *targets* are that mixture's checkpoints, even though the surrogate itself does not depend on it
+FACTOR_CALIBRATION_FILE: str = "surrogate_factor_bs{block_size}_{specifier_name}{tag}.json"
 
 
 def extrapolate_logits(
@@ -120,6 +125,57 @@ def calibration_file(dataset_path: str, block_size: int, specifier_name: str) ->
         dataset_path,
         CALIBRATION_FILE.format(block_size=block_size, specifier_name=specifier_name),
     )
+
+
+def factor_calibration_file(
+    dataset_path: str, block_size: int, specifier_name: str, tag: str = ""
+) -> str:
+    """Path of the fitted extrapolation factors, the logit surrogate's calibration.
+
+    Args:
+        dataset_path (str): the generated_datasets/ directory
+        block_size (int): block size the calibration was run with
+        specifier_name (str): short model name the calibration was run with
+        tag (str): the mixture tag of the collapse run the factors were fitted against
+
+    Returns:
+        str: path of the calibration json
+    """
+    return os.path.join(
+        dataset_path,
+        FACTOR_CALIBRATION_FILE.format(
+            block_size=block_size, specifier_name=specifier_name, tag=tag
+        ),
+    )
+
+
+def calibrated_factor(calibration: dict, generation: int) -> float:
+    """The extrapolation factor for one generation, from a calibration file's contents.
+
+    A measured factor is used when the calibration covers that generation, and the fitted law
+    ``n = 1 + scale * ln(1 + g)`` otherwise — which is the point of fitting a law at all: the
+    generation an attacker wants to reach is the one whose checkpoint nobody has, so its factor has
+    to be predicted from the generations that could be measured.
+
+    Args:
+        calibration (dict): parsed contents of factor_calibration_file
+        generation (int): the collapse generation the surrogate should stand in for
+
+    Returns:
+        float: the factor n to build the surrogate with
+
+    Raises:
+        KeyError: the calibration carries neither a factor for this generation nor a fitted scale
+    """
+    measured = {int(k): v for k, v in calibration.get("factors", {}).items()}
+    if generation in measured:
+        return float(measured[generation])
+    scale = calibration.get("scale")
+    if scale is None:
+        raise KeyError(
+            f"the calibration has no factor for generation {generation} and no fitted scale"
+        )
+    return 1.0 + float(scale) * math.log1p(generation)
 
 
 def build_scaled_adapter(adapter_path: str, factor: float, output_path: str) -> str:

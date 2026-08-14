@@ -56,15 +56,27 @@ from utils.execution import extract_code, run_tests
 from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import SCORING_SYSTEM_PROMPT
+from utils.utils import clear_inherited_max_length
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 BENCHMARK: str = "openai/openai_humaneval"
 
-# the curve and its reference line, in the repo's colorblind-safe palette. The same blue as the
-# perplexity figure on purpose: same models, same run, two views of them
-BASELINE_COLOR: str = "#006BA4"
-ANCHOR_COLOR: str = "#595959"
+# The figure is a composition, not a curve: what a generation *did* with each problem, stacked.
+# Four outcomes, ordered from best to worst so the stack reads top-down as degradation, and the
+# question the split answers is whether a failure is a wrong answer or no answer at all.
+#
+# The raw statuses are five (utils.execution). "fail" and "fail_exception" are grouped here: both
+# mean the code ran and the tests rejected it, they differ only in how the test suite gave up, and
+# two orange steps far enough apart to be distinguished do not exist in this palette — the pair
+# measured OKLab dE 13.5 at normal vision against a floor of 15. The console table and the JSON
+# keep them apart; only the figure groups them
+OUTCOMES: tuple = (
+    ("pass", "pass", ("pass",), "#006BA4"),
+    ("wrong", "wrong answer", ("fail", "fail_exception"), "#FF800E"),
+    ("timeout", "timeout", ("timeout",), "#ABABAB"),
+    ("broken", "no runnable code", ("error", "crash"), "#A9373B"),
+)
 
 
 @dataclass
@@ -244,6 +256,9 @@ def load_model(path: str, block_size: int, load_in_4bit: bool):
         load_in_4bit=load_in_4bit,
     )
     FastLanguageModel.for_inference(model)
+    # generate() below always passes max_new_tokens, so the max_length the checkpoint ships in its
+    # generation_config only buys a warning line per batch. See clear_inherited_max_length
+    clear_inherited_max_length(model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -255,11 +270,33 @@ def cache_file(block_size: int, name: str, tag: str) -> str:
     return os.path.join(DATASET_PATH, f"test_correctness_bs{block_size}_{name}{tag}.json")
 
 
-def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
-    """Draws pass@1 against generation, with the base model as a dashed reference.
+def outcome_shares(statuses: dict) -> dict:
+    """Groups one model's per-problem statuses into the figure's four outcomes, as fractions.
 
-    Linear y from 0 to 1, unlike the perplexity figure's log axis: a pass rate is a bounded
-    fraction, and the interesting part of this curve is where it reaches zero.
+    Args:
+        statuses (dict): task_id -> status, as utils.execution.run_tests reported it
+
+    Returns:
+        dict: outcome key -> share of the problems, summing to 1
+    """
+    total = max(len(statuses), 1)
+    shares = {}
+    for key, _, raw_statuses, _ in OUTCOMES:
+        shares[key] = sum(1 for s in statuses.values() if s in raw_statuses) / total
+    return shares
+
+
+def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
+    """Draws what every model did with the benchmark, as a stacked composition per generation.
+
+    A pass@1 line would answer "how many did it solve" and stop there. The stack answers the
+    follow-up that decides what the number *means*: of the ones it did not solve, how many were
+    wrong answers and how many were not code at all. Those two degrade at different times — wrong
+    answers dominate early, unusable output takes over as the collapse deepens — and a single rate
+    hides the transition completely.
+
+    The base model gets its own bar, set apart from the generations by a gap rather than drawn as
+    a reference line: a horizontal line through a stacked bar cannot be read against anything.
 
     Args:
         payload (dict): the verdict cache
@@ -280,53 +317,61 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
             "axes.labelweight": "bold",
             "axes.titlesize": 18,
             "axes.titleweight": "bold",
-            "legend.fontsize": 14,
+            "legend.fontsize": 13,
             "xtick.labelsize": 15,
             "ytick.labelsize": 15,
             "xtick.major.width": 2,
             "ytick.major.width": 2,
             "axes.grid": True,
+            "axes.axisbelow": True,
             "grid.alpha": 0.3,
             "pdf.compression": 9,
         }
     )
     percent = r"\%" if usetex else "%"
 
-    figure, axis = plt.subplots(figsize=(10, 6))
     rows = payload.get("baseline") or []
-    if rows:
-        generations = [int(row["label"].split()[-1]) for row in rows]
-        axis.plot(
-            generations,
-            [row["pass_rate"] for row in rows],
-            marker="o",
-            markersize=9,
-            linewidth=2,
-            color=BASELINE_COLOR,
-            label="collapse checkpoints",
-        )
-        axis.set_xticks(generations)
-
     anchor = payload.get("base_model")
-    if anchor:
-        axis.axhline(
-            anchor["pass_rate"],
-            color=ANCHOR_COLOR,
-            linestyle="--",
-            linewidth=2,
-            label="base model, before fine-tuning",
-        )
 
-    axis.set_ylim(-0.02, 1.0)
-    axis.set_yticks([0, 0.1, 0.2, 0.3, 0.4, 0.5])
-    axis.set_yticklabels(["0"] + [f"{int(v * 100)}{percent}" for v in (0.1, 0.2, 0.3, 0.4, 0.5)])
+    # the base model sits at x = -1.5, leaving a visible gap before generation 0: it is not part of
+    # the collapse sequence and should not read as its first step
+    entries = ([(-1.5, "base", anchor)] if anchor else []) + [
+        (int(row["label"].split()[-1]), row["label"].split()[-1], row) for row in rows
+    ]
+
+    figure, axis = plt.subplots(figsize=(11, 6))
+    bottoms = [0.0] * len(entries)
+    for key, label, _, color in OUTCOMES:
+        heights = [outcome_shares(entry[2]["statuses"])[key] for entry in entries]
+        axis.bar(
+            [entry[0] for entry in entries],
+            heights,
+            bottom=bottoms,
+            width=0.7,
+            color=color,
+            label=label,
+            # a hairline of surface between the segments, so the boundaries stay readable where a
+            # slice is thin instead of merging with its neighbour
+            edgecolor="white",
+            linewidth=1.2,
+        )
+        bottoms = [carry + height for carry, height in zip(bottoms, heights)]
+
+    axis.set_ylim(0, 1)
+    axis.set_yticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
+    axis.set_yticklabels(["0"] + [f"{int(v * 100)}{percent}" for v in (0.2, 0.4, 0.6, 0.8, 1.0)])
+    axis.set_xticks([entry[0] for entry in entries])
+    axis.set_xticklabels([entry[1] for entry in entries])
     axis.set_xlabel("collapse generation")
-    axis.set_ylabel(f"pass@1 on {payload['n_problems']} problems")
+    axis.set_ylabel(f"share of {payload['n_problems']} problems")
     axis.set_title(
-        f"Correctness of the produced code\n({payload['model'].replace('_', ' ')}, "
+        f"What the produced code does\n({payload['model'].replace('_', ' ')}, "
         f"{payload['mixture_label']})"
     )
-    axis.legend(loc="upper right")
+    # outside the axes: every bar is full height, so any in-figure legend would cover data
+    axis.legend(
+        loc="upper left", bbox_to_anchor=(1.01, 1.0), frameon=False, title="outcome"
+    )
     for spine in axis.spines.values():
         spine.set_color("black")
 
