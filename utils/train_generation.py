@@ -116,6 +116,7 @@ prev_suffix = mixture_suffix(real_data_fraction, generation - 1)
 # torchrun sets these; running the script bare is a world size of 1
 world_size = int(os.environ.get("WORLD_SIZE", "1"))
 rank = int(os.environ.get("RANK", "0"))
+local_rank = int(os.environ.get("LOCAL_RANK", rank))
 is_main = rank == 0
 
 # keep the effective batch invariant to the number of GPUs, see the module docstring. Dividing
@@ -175,6 +176,25 @@ else:
 # subspace and leaves the embeddings, norms and head untouched — so the knobs below (rank, alpha,
 # which modules are targeted, the learning rate) are what controls how far one generation can
 # drift from the last one.
+#
+# Every rank must place the whole model on its *own* device. Unsloth's default `device_map` is
+# "sequential", and it only replaces that with a per-rank map when the load is quantized
+# (`prepare_device_map` in unsloth/models/loader_utils.py, called under `if is_quantized`). Every
+# rank sees every GPU under torchrun, and accelerate sizes a "sequential" map against each device's
+# *free* memory at load time, so with a model small enough that several copies fit on GPU 0 the map
+# is a single device for all of them and Trainer then moves the model to the rank's own device —
+# which is why 0.5B never showed this. At 7B in bf16 the ranks loading later find GPU 0 full, spill
+# onto GPU 1+, and arrive at training with a multi-device `hf_device_map`, which accelerate refuses
+# in any distributed mode:
+#
+#     ValueError: You can't train a model that has been loaded with `device_map='auto'` in any
+#     distributed mode.
+#
+# It surfaces on whichever rank happened to lose the race (rank 3 here), not deterministically.
+# A world size of 1 keeps "sequential" — that is the escape hatch for a model too large for one
+# card, where naive model parallelism across the visible GPUs is the only way to train it at all
+if world_size > 1:
+    torch.cuda.set_device(local_rank)
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=checkpoint,
     max_seq_length=block_size,
@@ -183,6 +203,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     # backward pass: a 0.5B model is ~1GB in bf16 on a 48GB card. It is left as a flag for larger
     # --model_specifier values, where it is the difference between fitting and not fitting
     load_in_4bit=load_in_4bit,
+    device_map={"": f"cuda:{local_rank}"} if world_size > 1 else "sequential",
 )
 
 # add LoRA adapters
