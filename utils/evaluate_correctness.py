@@ -53,7 +53,7 @@ from tqdm import tqdm
 
 from utils.colors import TColors
 from utils.execution import extract_code, run_tests
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import SCORING_SYSTEM_PROMPT
 from utils.utils import clear_inherited_max_length
@@ -427,6 +427,9 @@ def main(
 
     specifier = resolve_model_specifier(model_size, model_specifier)
     name = specifier.split("/")[-1]
+    # the ladder rung, read back off the *resolved* id rather than off --model_size, so the line
+    # says the same thing whichever of the two flags named the model
+    size_label = model_size_label(specifier) or "off the ladder"
     tag = mixture_tag(real_data_fraction)
     stem = f"plots/test_correctness_bs{block_size}_{name}{tag}"
 
@@ -450,7 +453,10 @@ def main(
     if limit > 0:
         problems = problems.select(range(min(limit, len(problems))))
     print(f"##   benchmark: {BENCHMARK}, {len(problems)} problems, greedy pass@1")
-    print(f"##   model:     {specifier}{tag and '  (mixture ' + tag[1:] + ')'}")
+    print(
+        f"##   model:     {specifier} ({size_label})"
+        f"{tag and '  (mixture ' + tag[1:] + ')'}"
+    )
 
     def evaluate(checkpoint: str, label: str) -> Result:
         model, tokenizer = load_model(checkpoint, block_size, load_in_4bit)

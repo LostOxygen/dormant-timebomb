@@ -54,7 +54,7 @@ from datasets import Dataset, load_dataset
 
 from utils.colors import TColors
 from utils.extrapolation import extrapolate_logits, factor_calibration_file
-from utils.models import add_model_arguments, resolve_model_specifier
+from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import (
     CE_CHUNK_POSITIONS,
@@ -952,6 +952,9 @@ def main(
 
     specifier = resolve_model_specifier(model_size, model_specifier)
     name = specifier.split("/")[-1]
+    # the ladder rung, read back off the *resolved* id rather than off --model_size, so the line
+    # says the same thing whichever of the two flags named the model
+    size_label = model_size_label(specifier) or "off the ladder"
     tag = mixture_tag(real_data_fraction)
     generations = range(num_generations)
     stem = f"plots/test_perplexity_bs{block_size}_{name}{tag}"
@@ -980,7 +983,10 @@ def main(
             f"rows from the whole corpus, so part of this slice may have re-entered training in "
             f"later generations{TColors.ENDC}"
         )
-    print(f"##   model:    {specifier}{tag and '  (mixture ' + tag[1:] + ')'}")
+    print(
+        f"##   model:    {specifier} ({size_label})"
+        f"{tag and '  (mixture ' + tag[1:] + ')'}"
+    )
 
     def prompts_for(tokenizer) -> list:
         return format_scoring_prompts(
