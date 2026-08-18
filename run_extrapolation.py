@@ -32,14 +32,11 @@ import psutil
 import pytz
 
 import torch
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import seaborn as sns
 from transformers import AutoTokenizer
 from datasets import load_dataset, Dataset, concatenate_datasets
 
 from utils.colors import TColors
-from utils.plotting import visible_perplexity_range
+from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
@@ -57,9 +54,6 @@ DATASET_PATH: str = "./generated_datasets/"
 EOS_TOKEN: str = None  # will be overwritten by the tokenizer
 MAX_TOKEN_LENGTH: Final[int] = None  # will be overwritten
 TOKENIZER = None  # will be overwritten
-# lower y-limit of the perplexity histogram. Everything below is invisible, so this is also
-# used as the threshold to determine the plot's x-range
-Y_LIMIT_LOWER: Final[float] = 1e-5
 
 
 def format_prompt(examples: dict) -> dict:
@@ -727,113 +721,35 @@ def main(
         )
 
     # ────────────────── plot the perplexity histogram ─────────────────────────
+    # same figure as stage 1's and as utils/evaluate_perplexity.py's, drawn by utils/plotting.py:
+    # the histograms on top, the median per generation below them. This stage only decides what
+    # goes into it — the corpora its surrogate generated — and what the title says
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Plotting Perplexity Histogram{TColors.ENDC}"
     )
 
-    # scale the x-axis to the range which actually contains visible data. The tails are so
-    # heavy that even a 99.9% quantile still reaches 1e10, but those bins are drawn below the
-    # lower y-limit and only leave the right side of the plot empty
-    lower_limit, upper_limit, num_clipped, num_total = visible_perplexity_range(
-        perplexity_dict, Y_LIMIT_LOWER
-    )
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Plot range{TColors.ENDC}: "
-        f"[{lower_limit:.0e}, {upper_limit:.0e}] (clipping {num_clipped} of {num_total} "
-        f"perplexities, {100 * num_clipped / num_total:.2f}%, which are all below a density "
-        f"of {Y_LIMIT_LOWER:.0e})"
-    )
+    # plots/ sits outside --path, so this file name is the only thing keeping the figures of two
+    # differently filed runs apart even when they used separate --path directories
+    plot_stem = f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}"
 
-    bins = torch.logspace(
-        torch.log10(torch.tensor(lower_limit)),
-        torch.log10(torch.tensor(upper_limit)),
-        steps=401,
-    )
-
-    custom_colors = [
-        "#2369BD",  # darker blue
-        "#006BA4",  # dark blue
-        "#5F9ED1",  # light blue
-        "#A2C8EC",  # very light blue
-        "#ABABAB",  # gray
-        "#898989",  # dark gray
-        "#898989",  # darker gray
-        "#FFBC79",  # light orange
-        "#FF800E",  # orange
-        "#C85200",  # dark orange
-        "#A9373B",  # dark red
-    ]
-
-    cb_palette = sns.color_palette(custom_colors, n_colors=10, as_cmap=True)
-    sns.set_palette(cb_palette)
-    sns.set_style("whitegrid")
-
-    mpl.rcParams.update(
-        {
-            "text.usetex": True,
-            "text.latex.preamble": r"\usepackage{bm}",
-            "font.family": "serif",
-            "font.serif": ["Times"],
-            "font.size": 22,
-            "font.weight": "bold",  # <--- Make default font bold
-            "axes.labelsize": 22,
-            "axes.labelweight": "bold",  # <--- Bold axis labels
-            "axes.titlesize": 20,
-            "axes.titleweight": "bold",  # <--- Bold title
-            "legend.fontsize": 17,
-            "xtick.labelsize": 20,
-            "ytick.labelsize": 20,
-            "xtick.major.width": 2,  # Optional: thicker ticks
-            "ytick.major.width": 2,
-            "pdf.compression": 9,
-        }
-    )
-
-    plt.figure(figsize=(10, 6))
-    for name, perplexities in perplexity_dict.items():
-        sns.histplot(
-            perplexities,
-            bins=bins,
-            stat="density",
-            label=name,
-            element="step",
-            alpha=0.4,
-        )
-
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.xlim(lower_limit, upper_limit)
-    plt.ylim(Y_LIMIT_LOWER, 1)
-
-    plt.xlabel("Perplexity", fontweight="bold")
-    plt.ylabel("Probability", fontweight="bold")
     # the fraction goes on its own second line, and only when it is set, so the figure of a plain
     # run is unchanged. No underscores or backslashes: usetex renders the title
     title = f"Perplexity with {METHOD_LABELS[method]}"
     if real_data_fraction > 0:
         title += f"\n(filed against real data fraction {real_data_fraction:g})"
-    plt.title(title, fontweight="bold")
-    plt.legend(loc="upper right")
 
-    for spine in plt.gca().spines.values():
-        spine.set_color("black")
-
-    plt.tight_layout()
-
-    # check if plots/ is a directory
-    if not os.path.exists("plots/"):
-        os.makedirs("plots/")
-
-    # plots/ sits outside --path, so this file name is the only thing keeping the figures of two
-    # differently filed runs apart even when they used separate --path directories
-    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}.pdf")
-    plt.savefig(f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}.png")
-    plt.show()
+    plot_perplexity_figure(
+        perplexity_dict,
+        plot_stem,
+        title=title,
+        primary_label="generated corpora",
+        median_ylabel="corpus perplexity\n(median)",
+        show=True,
+    )
 
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
-        f"{TColors.HEADER}plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}"
-        f".<png,pdf>{TColors.ENDC}"
+        f"{TColors.HEADER}{plot_stem}.<png,pdf>{TColors.ENDC}"
     )
 
     # ────────────────── print the elapsed time ─────────────────────────

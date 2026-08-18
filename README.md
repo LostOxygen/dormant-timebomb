@@ -71,14 +71,16 @@ measured. The attack's verification decodes greedily, since a verdict has to be 
    just-trained model, then merges the shards into ```generated_dataset_<gen>_...```.
 
 Afterwards the perplexity of every generation's dataset is measured with the *pristine* base
-model and plotted as a log-log histogram.
+model and plotted by `utils.plotting`: the log-log histogram of every generation on top, the median
+per generation below it. `utils/evaluate_perplexity.py` draws the same figure of the human data, so
+the two are read side by side.
 
 ### Usage
 
 ```
 python run_baseline.py [-dx DEVICE] [-te TRAINING_EPOCHS] [-dbs DATASET_BATCH_SIZE]
                        [-tbs TRAINING_BATCH_SIZE] [-st] [-ng NUM_GENERATIONS]
-                       [-bs BLOCK_SIZE] [-ho] [-heo] [-msz MODEL_SIZE]
+                       [-bs BLOCK_SIZE] [-ho] [-msz MODEL_SIZE]
                        [-ms MODEL_SPECIFIER]
                        [-cfg CONTINUE_FROM_GENERATION] [-dsz DATASET_SIZE]
                        [-lr LEARNING_RATE] [-lr_r LORA_RANK] [-lr_a LORA_ALPHA] [-p PATH]
@@ -94,7 +96,6 @@ python run_baseline.py [-dx DEVICE] [-te TRAINING_EPOCHS] [-dbs DATASET_BATCH_SI
 | `--num_generations` | `-ng` | int | `10` | How many collapse generations to train (and how many generations to evaluate). |
 | `--block_size` | `-bs` | int | `512` | Max sequence length, and the `max_new_tokens` cap of the generation. Exactly the value you pass — it is *not* raised to the dataset's longest response — and it appears in every output filename, so all stages have to be given the same one. Responses longer than it are not discarded; `"wrapped"` packing splits them across blocks. |
 | `--histogram_only` | `-ho` | flag | off | Skip the perplexity computation and re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt`. |
-| `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder: `0.5b`, `1.5b`, `3b`, `7b`, `14b`, `32b`. Shorthand for the matching `--model_specifier`, so every stage of a run resolves the same repo id — and therefore the same artifact names — from one token. Mutually exclusive with `--model_specifier`: passing both raises unless they agree. The larger sizes do not fit a single 48GB card at the defaults, see `-q4`, `-gc`, `-tg` and the batch sizes. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Hugging Face id of the base model, for anything outside the `--model_size` ladder. The trailing name is part of every output path. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Resume: generations below this index are skipped, so training continues from an existing checkpoint. |
@@ -160,7 +161,7 @@ python run_baseline.py --device cuda --num_generations 10 --skip_training \
 * ```<path>/generated_datasets/generated_dataset_<gen>_bs<block_size>_<model_name>/``` — synthetic dataset of generation `<gen>`
 * ```<path>/generated_datasets/chunked_dataset_bs<block_size>_<model_name>/``` — formatted original dataset
 * ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name>.pt``` and ```all_perplexities_bs<block_size>_<model_name>.pt```
-* ```plots/perplexity_histogram_bs<block_size>_<model_name>.{png,pdf}```
+* ```plots/perplexity_histogram_bs<block_size>_<model_name>.{png,pdf}``` — histograms on top, median per generation below
 
 ### Utility of the collapsed models: perplexity and correctness
 
@@ -175,27 +176,36 @@ emitting runnable code, so the two are worth reading side by side.
 
 The histograms of both stages measure the **corpora** — a fixed scorer (the pristine base model)
 reads what each generation wrote. This one measures the other direction: each collapse checkpoint
-reads a fixed, held-out slice of the *original* human dataset. Same rows and same statistic for
-every generation (`utils.perplexity.sample_perplexities`, the one the histograms plot), so the
-curve is comparable across it:
+reads fixed slices of the *original* human dataset. Same rows and same statistic for every
+generation (`utils.perplexity.sample_perplexities`, the one the histograms plot), so the curves are
+comparable across it:
 
 ```bash
 python -m utils.evaluate_perplexity -p ./runs/x -ng 10 -bs 512
 python -m utils.evaluate_perplexity -p ./runs/x -ng 10 -rdf 0.1
+python -m utils.evaluate_perplexity -p ./runs/x -ng 10 -ts 512 -trs 512     # rows per slice
 python -m utils.evaluate_perplexity -p ./runs/x -ng 10 --plot_only          # replot, no GPU
 ```
+
+**Two slices, one pass.** `train` is the 90% of the dataset `make_splits` fine tuned generation 0
+on, `test` is the validation data it held out — so one figure is about rows the lineage has seen and
+the other about rows no generation ever has, and the distance between them separates memorisation
+from generalisation. At `-rdf > 0`, where part of the train slice re-enters training in every
+generation, they are expected to come apart. Both are scored while each checkpoint is loaded, so the
+second slice costs another scoring pass and not a second sweep over the generations.
 
 | flag | short | type | default | description |
 |---|---|---|---|---|
 | `--num_generations` | `-ng` | int | `10` | Generations the run produced. |
 | `--block_size` | `-bs` | int | `512` | The run's block size, part of every artifact name. |
 | `--dataset_size` | `-ds` | int | `0` | The `--dataset_size` the collapse runs were given — decides which rows are untouched, see below. |
+| `--train_size` | `-trs` | int | `512` | Rows of the trained-on slice to score, `0` for all. |
 | `--test_size` | `-ts` | int | `512` | Held-out rows to score, `0` for all. |
 | `--perplexity_batch_size` | `-pbs` | int | `16` | Prompts per scoring batch. |
 | `--method` | `-m` | str | `logit` | Which stage-2 surrogate to score alongside. `data` is rejected with an explanation. |
 | `--surrogate_tokens_per_forward` | `-stf` | int | `8192` | Padded tokens per forward pass for the tilt; halved automatically on an out-of-memory error. |
 | `--calibrate` | `-c` | flag | off | Fit the extrapolation factor to the real checkpoints, see below. |
-| `--calibration_rows` | `-cr` | int | `128` | Test rows used inside the factor search. |
+| `--calibration_rows` | `-cr` | int | `128` | Validation rows used inside the factor search. |
 | `--calibration_steps` | `-cs` | int | `6` | Search steps per generation. |
 | `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
 | `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
@@ -256,13 +266,29 @@ training in every generation. That is fair for a pure self-training run, but at 
 `mix_real_data` draws its real rows from the whole corpus, so part of the slice can re-enter
 training; the script says so rather than reporting a leaky split silently.
 
-Reading the figure: **lower is better**, and the dashed line is the *un-fine-tuned* base model, not
-a quality ceiling — generation 0 sits below it because it is fine tuned on this dataset's own
+**The figures.** One per slice, both drawn by `utils.plotting` — the same module the two
+orchestrators draw their corpus histograms with, so all of them share one layout: every generation's
+per-sample **histogram on top**, the **median per generation below it**. Two views of the same
+numbers, which is the point of putting them in one figure — a median that barely moves while the
+tail explodes, and a tail that looks alarming while the bulk has not moved, are both misreadings a
+single panel invites.
+
+Reading them: **lower is better**, and the dashed line is the *un-fine-tuned* base model, not a
+quality ceiling — generation 0 sits below it because it is fine tuned on this dataset's own
 distribution. The collapse is the rise from generation 0 upward. Median with an interquartile band,
 log y: the perplexity distribution is heavy tailed, and a handful of responses a collapsed model
-finds impossible would otherwise drive the mean on their own. Writes
-`plots/test_perplexity_bs{bs}_{model}{mix}.<png,pdf>` and a
-`generated_datasets/test_perplexity_bs{bs}_{model}{mix}.json` cache that `--plot_only` replots from.
+finds impossible would otherwise drive the mean on their own.
+
+Written:
+
+* `plots/train_perplexity_bs{bs}_{model}{mix}.<png,pdf>` and
+  `plots/test_perplexity_bs{bs}_{model}{mix}.<png,pdf>` — one figure per slice
+* `plots/surrogate_fit_bs{bs}_{model}{mix}.<png,pdf>` — only with `--calibrate`: the fitted factors
+  and the law, on their own figure because they describe the *approximation* rather than the models
+* `generated_datasets/test_perplexity_bs{bs}_{model}{mix}.json` — the cache `--plot_only` replots
+  from. It holds both slices *and* every model's per-sample perplexities, since the histogram panel
+  needs the distribution and not its summary. A cache written before the split is rejected with a
+  message rather than replotted half way.
 
 #### `utils/evaluate_correctness.py`
 
@@ -442,7 +468,7 @@ baseline's ```chunked_dataset_bs<block_size>_<model_name>``` for the generation-
 
 ```
 python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENERATIONS]
-                            [-bs BLOCK_SIZE] [-ho] [-heo] [-msz MODEL_SIZE]
+                            [-bs BLOCK_SIZE] [-ho] [-msz MODEL_SIZE]
                        [-ms MODEL_SPECIFIER]
                             [-cfg CONTINUE_FROM_GENERATION] [-m METHOD]
                             [-stp SURROGATE_TOP_P] [-dsz DATASET_SIZE]
@@ -458,7 +484,6 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--num_generations` | `-ng` | int | `10` | Number of generations. Generation `g` uses the factor `g + 1`, so the largest factor is `num_generations`. |
 | `--block_size` | `-bs` | int | `512` | Max sequence length and `max_new_tokens` for generation. Exactly the value you pass, like in step 1. Must match the value used by `run_baseline.py`. |
 | `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt` of the selected method. |
-| `--human_eval_only` | `-heo` | flag | off | Skip perplexity evaluation and plotting entirely. |
 | `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder (`0.5b` … `32b`), shorthand for `--model_specifier`; must resolve to the model of step 1, whose `model_0` this step reads. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
@@ -542,7 +567,7 @@ With `<sfx>` being `_ex` for `--method logit`, `_ex_lora` for `lora` and `_ex_da
 
 * ```<path>/generated_datasets/generated_dataset_<gen>_bs<block_size>_<model_name><sfx>/``` — dataset of generation `<gen>`
 * ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name><sfx>.pt``` and ```all_perplexities_bs<block_size>_<model_name><sfx>.pt```
-* ```plots/perplexity_histogram_bs<block_size>_<model_name><sfx>.{png,pdf}```
+* ```plots/perplexity_histogram_bs<block_size>_<model_name><sfx>.{png,pdf}``` — same two panels as stage 1's
 * ```<path>/generated_datasets/surrogate_top_p_bs<block_size>_<model_name>.json``` — the fitted `p_1` and the full grid (`calibrate_surrogate.py`)
 * ```<path>/model_outputs/model_scaled_n<n>_bs<block_size>_<model_name>/``` — the alpha-scaled adapters (`--method lora` only). These *are* loadable models, so ```run_attack.py``` can be pointed at them directly
 

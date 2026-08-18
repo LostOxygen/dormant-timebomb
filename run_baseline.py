@@ -14,9 +14,6 @@ from typing import Final
 
 import psutil
 import torch
-import matplotlib.pyplot as plt
-import matplotlib as mpl
-import seaborn as sns
 from transformers import AutoTokenizer
 from datasets import load_dataset, Dataset, concatenate_datasets
 
@@ -24,7 +21,7 @@ from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
-from utils.plotting import visible_perplexity_range
+from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 
 # this orchestrator deliberately does not import unsloth: every stage that touches a model is a
@@ -40,9 +37,6 @@ DATASET_PATH: str = "./generated_datasets/"
 EOS_TOKEN: str = None  # will be overwritten by the tokenizer
 MAX_TOKEN_LENGTH: Final[int] = None  # will be overwritten
 TOKENIZER = None  # will be overwritten
-# lower y-limit of the perplexity histogram. Everything below is invisible, so this is also
-# used as the threshold to determine the plot's x-range
-Y_LIMIT_LOWER: Final[float] = 1e-5
 
 
 def format_prompt(examples: dict) -> dict:
@@ -146,7 +140,6 @@ def main(
     num_generations: int = 5,
     block_size: int = 512,
     histogram_only: bool = False,
-    human_eval_only: bool = False,
     path: str = "",
     model_specifier: str = "",
     model_size: str = "",
@@ -183,7 +176,6 @@ def main(
         num_generations (int): number of generations to run (default: 5)
         block_size (int): size of the blocks to split the dataset into (default: 64)
         histogram_only (bool): if True, only generate the histogram and skip the rest
-        human_eval_only (bool): if True, only generate human eval samples and skip the rest
         path (str): path to save the generated datasets and models
         model_specifier (str): model specifier to use for the training
         model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
@@ -688,274 +680,192 @@ def main(
     # iterate over every model and the generated dataset and calculate the perplexity
     # for the perplexity, every datapoint i.e., the generated answer for every question
     # is evaluated to get the probability for a given perplexity over the whole dataset
-    if not human_eval_only:
-        if not histogram_only:
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Calculate Perplexity{TColors.ENDC}"
-            )
-            perplexity_dict = {}
-            all_perplexities = []
+    if not histogram_only:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Calculate Perplexity{TColors.ENDC}"
+        )
+        perplexity_dict = {}
+        all_perplexities = []
 
-            # the datasets are split into one shard per GPU and every shard is processed by
-            # its own subprocess. Each subprocess handles all generations of its shard, so
-            # the model only has to be loaded once per GPU. Afterwards the per-shard results
-            # are merged
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Using {len(devices)} GPU(s) for the "
-                f"perplexity calculation{TColors.ENDC}"
-            )
+        # the datasets are split into one shard per GPU and every shard is processed by
+        # its own subprocess. Each subprocess handles all generations of its shard, so
+        # the model only has to be loaded once per GPU. Afterwards the per-shard results
+        # are merged
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Using {len(devices)} GPU(s) for the "
+            f"perplexity calculation{TColors.ENDC}"
+        )
 
-            # the run-level tag, not a per-generation one: each of these spans every generation.
-            # They are transient, but tagging them keeps two mixtures sharing one --path from
-            # reading each other's half-written shards
-            shard_files = [
-                DATASET_PATH
-                + f"perplexity_dict_bs{block_size}_{specifier_name}{data_suffix}"
-                + f"_shard{shard_id}.pt"
-                for shard_id in range(len(devices))
-            ]
-            # remove stale shard files so results of a previous run can't be picked up
-            for shard_file in shard_files:
-                if os.path.exists(shard_file):
-                    os.remove(shard_file)
-
-            process_list = []
-            for shard_id, d_id in enumerate(devices):
-                process = subprocess.Popen(
-                    [
-                        "env",
-                        f"CUDA_VISIBLE_DEVICES={d_id}",
-                        "python",
-                        "-m",
-                        "utils.calculate_perplexity",
-                        "--block_size",
-                        str(block_size),
-                        "--specifier_name",
-                        specifier_name,
-                        "--model_specifier",
-                        model_specifier,
-                        "--perplexity_batch_size",
-                        str(perplexity_batch_size),
-                        "--num_generations",
-                        str(num_generations),
-                        "--shard_id",
-                        str(shard_id),
-                        "--num_shards",
-                        str(len(devices)),
-                        "--path",
-                        str(path),
-                        # it reads generated_dataset_{i-1} for every generation i, so it needs the
-                        # fraction to name each one
-                        "--real_data_fraction",
-                        str(real_data_fraction),
-                    ]
-                    + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
-                )
-                process_list.append(process)
-
-            # wait for all processes to finish
-            for process in process_list:
-                process.wait()
-
-            # every shard has to be there, otherwise the merged perplexities would be
-            # incomplete
-            failed_shards = [
-                shard_id
-                for shard_id, process in enumerate(process_list)
-                if process.returncode != 0
-            ]
-            if failed_shards:
-                raise RuntimeError(
-                    f"The perplexity calculation failed for shard(s) {failed_shards}. "
-                    "See the subprocess output above for the actual error."
-                )
-
-            # merge the per-shard perplexities back together. The shards are contiguous, so
-            # concatenating them in shard order restores the original dataset order
-            shard_dicts = [torch.load(shard_file) for shard_file in shard_files]
-            for i in range(num_generations):
-                perplexity_dict[f"Generation {i}"] = [
-                    perplexity
-                    for shard_dict in shard_dicts
-                    for perplexity in shard_dict[f"Generation {i}"]
-                ]
-
-            # clean up the temporary shard files
-            for shard_file in shard_files:
+        # the run-level tag, not a per-generation one: each of these spans every generation.
+        # They are transient, but tagging them keeps two mixtures sharing one --path from
+        # reading each other's half-written shards
+        shard_files = [
+            DATASET_PATH
+            + f"perplexity_dict_bs{block_size}_{specifier_name}{data_suffix}"
+            + f"_shard{shard_id}.pt"
+            for shard_id in range(len(devices))
+        ]
+        # remove stale shard files so results of a previous run can't be picked up
+        for shard_file in shard_files:
+            if os.path.exists(shard_file):
                 os.remove(shard_file)
 
-            # get all single values from the dict and flatten them into a list
-            all_perplexities = [
+        process_list = []
+        for shard_id, d_id in enumerate(devices):
+            process = subprocess.Popen(
+                [
+                    "env",
+                    f"CUDA_VISIBLE_DEVICES={d_id}",
+                    "python",
+                    "-m",
+                    "utils.calculate_perplexity",
+                    "--block_size",
+                    str(block_size),
+                    "--specifier_name",
+                    specifier_name,
+                    "--model_specifier",
+                    model_specifier,
+                    "--perplexity_batch_size",
+                    str(perplexity_batch_size),
+                    "--num_generations",
+                    str(num_generations),
+                    "--shard_id",
+                    str(shard_id),
+                    "--num_shards",
+                    str(len(devices)),
+                    "--path",
+                    str(path),
+                    # it reads generated_dataset_{i-1} for every generation i, so it needs the
+                    # fraction to name each one
+                    "--real_data_fraction",
+                    str(real_data_fraction),
+                ]
+                + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
+            )
+            process_list.append(process)
+
+        # wait for all processes to finish
+        for process in process_list:
+            process.wait()
+
+        # every shard has to be there, otherwise the merged perplexities would be
+        # incomplete
+        failed_shards = [
+            shard_id
+            for shard_id, process in enumerate(process_list)
+            if process.returncode != 0
+        ]
+        if failed_shards:
+            raise RuntimeError(
+                f"The perplexity calculation failed for shard(s) {failed_shards}. "
+                "See the subprocess output above for the actual error."
+            )
+
+        # merge the per-shard perplexities back together. The shards are contiguous, so
+        # concatenating them in shard order restores the original dataset order
+        shard_dicts = [torch.load(shard_file) for shard_file in shard_files]
+        for i in range(num_generations):
+            perplexity_dict[f"Generation {i}"] = [
                 perplexity
-                for values in perplexity_dict.values()
-                for perplexity in values
+                for shard_dict in shard_dicts
+                for perplexity in shard_dict[f"Generation {i}"]
             ]
 
-            # save the perplexity dict to a file. The run_suffix keeps the weight lineages and
-            # data mixtures from overwriting each other's cache, so each can be replotted with -ho
-            # and the -ho of one configuration can never silently replot another's numbers
-            torch.save(
-                perplexity_dict,
-                DATASET_PATH
-                + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt",
-            )  # save the dict to a file
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
-                f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}"
-                f"{run_suffix}.pt{TColors.ENDC}"
-            )
-            # save the all_perplexities list to a file
-            torch.save(
-                all_perplexities,
-                DATASET_PATH
-                + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt",
-            )  # save the list to a file
-            print(
-                f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
-                f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}"
-                f"{run_suffix}.pt{TColors.ENDC}"
-            )
-        else:
-            # load the perplexity dict and all_perplexities list from the files. -ho therefore
-            # needs the same --fresh_init and --real_data_fraction the run was produced with, and
-            # says so rather than replotting whichever configuration happens to be cached
-            cached_dict = (
-                DATASET_PATH
-                + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt"
-            )
-            if not os.path.exists(cached_dict):
-                raise FileNotFoundError(
-                    f"{cached_dict} does not exist. --histogram_only replots the cache of a run "
-                    f"with the same --block_size, --model_specifier, --fresh_init "
-                    f"({'set' if fresh_init else 'not set'} here) and --real_data_fraction "
-                    f"({real_data_fraction:g} here)"
-                )
-            perplexity_dict = torch.load(cached_dict)
-            all_perplexities = torch.load(
-                DATASET_PATH
-                + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt"
-            )
+        # clean up the temporary shard files
+        for shard_file in shard_files:
+            os.remove(shard_file)
 
-        # ────────────────── plot the perplexity histogram ─────────────────────────
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Plotting Perplexity Histogram{TColors.ENDC}"
-        )
-
-        # scale the x-axis to the range which actually contains visible data. The tails are so
-        # heavy that even a 99.9% quantile still reaches 1e10, but those bins are drawn below
-        # the lower y-limit and only leave the right side of the plot empty
-        lower_limit, upper_limit, num_clipped, num_total = visible_perplexity_range(
-            perplexity_dict, Y_LIMIT_LOWER
-        )
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Plot range{TColors.ENDC}: "
-            f"[{lower_limit:.0e}, {upper_limit:.0e}] (clipping {num_clipped} of {num_total} "
-            f"perplexities, {100 * num_clipped / num_total:.2f}%, which are all below a "
-            f"density of {Y_LIMIT_LOWER:.0e})"
-        )
-
-        bins = torch.logspace(
-            torch.log10(torch.tensor(lower_limit)),
-            torch.log10(torch.tensor(upper_limit)),
-            steps=401,
-        )
-
-        custom_colors = [
-            "#2369BD",  # darker blue
-            "#006BA4",  # dark blue
-            "#5F9ED1",  # light blue
-            "#A2C8EC",  # very light blue
-            "#ABABAB",  # gray
-            "#898989",  # dark gray
-            "#898989",  # darker gray
-            "#FFBC79",  # light orange
-            "#FF800E",  # orange
-            "#C85200",  # dark orange
-            "#A9373B",  # dark red
+        # get all single values from the dict and flatten them into a list
+        all_perplexities = [
+            perplexity
+            for values in perplexity_dict.values()
+            for perplexity in values
         ]
 
-        cb_palette = sns.color_palette(custom_colors, n_colors=10, as_cmap=True)
-        sns.set_palette(cb_palette)
-        sns.set_style("whitegrid")
-
-        mpl.rcParams.update(
-            {
-                "text.usetex": True,
-                "text.latex.preamble": r"\usepackage{bm}",
-                "font.family": "serif",
-                "font.serif": ["Times"],
-                "font.size": 22,
-                "font.weight": "bold",  # <--- Make default font bold
-                "axes.labelsize": 22,
-                "axes.labelweight": "bold",  # <--- Bold axis labels
-                "axes.titlesize": 20,
-                "axes.titleweight": "bold",  # <--- Bold title
-                "legend.fontsize": 17,
-                "xtick.labelsize": 20,
-                "ytick.labelsize": 20,
-                "xtick.major.width": 2,  # Optional: thicker ticks
-                "ytick.major.width": 2,
-                "pdf.compression": 9,
-            }
-        )
-
-        plt.figure(figsize=(10, 6))
-        for name, perplexities in perplexity_dict.items():
-            sns.histplot(
-                perplexities,
-                bins=bins,
-                stat="density",
-                label=name,
-                element="step",
-                alpha=0.4,
-            )
-
-        plt.xscale("log")
-        plt.yscale("log")
-        plt.xlim(lower_limit, upper_limit)
-        plt.ylim(Y_LIMIT_LOWER, 1)
-
-        plt.xlabel("Perplexity", fontweight="bold")
-        plt.ylabel("Probability", fontweight="bold")
-        # the weight lineage and the real-data fraction go in the title, because both change the
-        # collapse curve for the same input data and a figure that does not say which it is cannot
-        # be compared against the other. No underscores or backslashes in here — usetex is on, so
-        # the title is rendered by LaTeX.
-        #
-        # The run_label sits on its own second line rather than in one long title: at figsize
-        # (10, 6) with font.size 22 the single-line version measured 1081px against a 1000px
-        # figure, so LaTeX rendered it clipped — and since the label is the tail of the string, the
-        # part that silently disappeared was exactly the fraction this is here to record. Two lines
-        # take the worst case (fresh weights, three-digit fraction) to 64% of the figure width
-        plt.title(
-            f"Perplexity without extrapolation\n({run_label})", fontweight="bold"
-        )
-        plt.legend(loc="upper right")
-
-        for spine in plt.gca().spines.values():
-            spine.set_color("black")
-
-        plt.tight_layout()
-
-        # check if plots/ is a directory
-        if not os.path.exists("plots/"):
-            os.makedirs("plots/")
-
-        # plots/ deliberately sits outside --path, so the file name is the only thing separating
-        # two runs' figures. Without the run_suffix a fresh-init run, or a run with a different
-        # --real_data_fraction, silently overwrites the other's figure even when the two used
-        # different --path directories
-        plot_stem = (
-            f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}"
-        )
-        plt.savefig(f"{plot_stem}.pdf")
-        plt.savefig(f"{plot_stem}.png")
-        plt.show()
-
+        # save the perplexity dict to a file. The run_suffix keeps the weight lineages and
+        # data mixtures from overwriting each other's cache, so each can be replotted with -ho
+        # and the -ho of one configuration can never silently replot another's numbers
+        torch.save(
+            perplexity_dict,
+            DATASET_PATH
+            + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt",
+        )  # save the dict to a file
         print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
-            f"{TColors.HEADER}{plot_stem}.<png,pdf>{TColors.ENDC}"
+            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the perplexity dict under: "
+            f"{TColors.HEADER}{DATASET_PATH}perplexity_dict_bs{block_size}_{specifier_name}"
+            f"{run_suffix}.pt{TColors.ENDC}"
         )
+        # save the all_perplexities list to a file
+        torch.save(
+            all_perplexities,
+            DATASET_PATH
+            + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt",
+        )  # save the list to a file
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the all_perplexities list under: "
+            f"{TColors.HEADER}{DATASET_PATH}all_perplexities_bs{block_size}_{specifier_name}"
+            f"{run_suffix}.pt{TColors.ENDC}"
+        )
+    else:
+        # load the perplexity dict and all_perplexities list from the files. -ho therefore
+        # needs the same --fresh_init and --real_data_fraction the run was produced with, and
+        # says so rather than replotting whichever configuration happens to be cached
+        cached_dict = (
+            DATASET_PATH
+            + f"perplexity_dict_bs{block_size}_{specifier_name}{run_suffix}.pt"
+        )
+        if not os.path.exists(cached_dict):
+            raise FileNotFoundError(
+                f"{cached_dict} does not exist. --histogram_only replots the cache of a run "
+                f"with the same --block_size, --model_specifier, --fresh_init "
+                f"({'set' if fresh_init else 'not set'} here) and --real_data_fraction "
+                f"({real_data_fraction:g} here)"
+            )
+        perplexity_dict = torch.load(cached_dict)
+        all_perplexities = torch.load(
+            DATASET_PATH
+            + f"all_perplexities_bs{block_size}_{specifier_name}{run_suffix}.pt"
+        )
+
+    # ────────────────── plot the perplexity histogram ─────────────────────────
+    # the figure itself is utils/plotting.py's, and so is the one
+    # utils/evaluate_perplexity.py draws of the human data: histograms on top, the median per
+    # generation below them. This stage only decides *what* is plotted — the corpora its
+    # generations trained on, scored by the pristine base model — and what the title says
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Plotting Perplexity Histogram{TColors.ENDC}"
+    )
+
+    # plots/ deliberately sits outside --path, so the file name is the only thing separating
+    # two runs' figures. Without the run_suffix a fresh-init run, or a run with a different
+    # --real_data_fraction, silently overwrites the other's figure even when the two used
+    # different --path directories
+    plot_stem = (
+        f"plots/perplexity_histogram_bs{block_size}_{specifier_name}{run_suffix}"
+    )
+    plot_perplexity_figure(
+        perplexity_dict,
+        plot_stem,
+        # the weight lineage and the real-data fraction go in the title, because both change
+        # the collapse curve for the same input data and a figure that does not say which it is
+        # cannot be compared against the other. No underscores or backslashes in here — usetex
+        # is on, so the title is rendered by LaTeX.
+        #
+        # The run_label sits on its own second line rather than in one long title: the
+        # single-line version was wider than the figure, so LaTeX rendered it clipped — and
+        # since the label is the tail of the string, the part that silently disappeared was
+        # exactly the fraction this is here to record. Two lines keep the worst case (fresh
+        # weights, three-digit fraction) at well under the figure width
+        title=f"Perplexity without extrapolation\n({run_label})",
+        primary_label="generated corpora",
+        median_ylabel="corpus perplexity\n(median)",
+        show=True,
+    )
+
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Saved the histogram under: "
+        f"{TColors.HEADER}{plot_stem}.<png,pdf>{TColors.ENDC}"
+    )
 
     # ────────────────── print the elapsed time ─────────────────────────
     # End the timer
@@ -1041,12 +951,6 @@ if __name__ == "__main__":
         "-ho",
         action="store_true",
         help="if set, only generate the histogram and skip the rest",
-    )
-    parser.add_argument(
-        "--human_eval_only",
-        "-heo",
-        action="store_true",
-        help="if set, only generate human eval samples and skip the rest",
     )
     add_model_arguments(parser)
     parser.add_argument(

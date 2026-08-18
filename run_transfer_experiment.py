@@ -130,7 +130,6 @@ def baseline_command(
     block_size: int,
     dataset_size: int,
     engine: str,
-    with_eval: bool,
     extra: str,
     real_data_fraction: float = 0.0,
 ) -> list:
@@ -162,13 +161,6 @@ def baseline_command(
         "--path",
         path,
     ]
-    if not with_eval:
-        # -heo skips the perplexity evaluation and the histogram; the training and generation loop
-        # above it still runs in full. Two reasons to skip it by default: this experiment reads
-        # none of those numbers, and the plotting step needs a LaTeX install
-        # (mpl.rcParams["text.usetex"] = True), which would abort the run *after* the models were
-        # already trained
-        command.append("--human_eval_only")
     if extra:
         command.extend(extra.split())
     return command
@@ -606,7 +598,6 @@ def main(
     stop_on_success: bool = False,
     attack_seed: int = 1337,
     min_usable_tasks: int = 1,
-    with_eval: bool = False,
     force: bool = False,
     baseline_extra: str = "",
     attack_extra: str = "",
@@ -641,7 +632,6 @@ def main(
         min_usable_tasks (int): how many tasks *run A* must still solve unaided for a generation to
             be chosen by the probe. Run B is not consulted, see choose_generation. Only read when
             --collapsed_generation is -1
-        with_eval (bool): also run the perplexity evaluation and the histogram of both runs
         force (bool): rerun every stage even when its artifact exists
         baseline_extra (str): extra arguments appended to both run_baseline.py invocations
         attack_extra (str): extra arguments appended to the run_attack.py invocation
@@ -731,8 +721,8 @@ def main(
         else:
             run_stage(
                 baseline_command(
-                    path, seed, model_specifier, num_generations, block_size, dataset_size, engine,
-                    with_eval, baseline_extra, real_data_fraction,
+                    path, seed, model_specifier, num_generations, block_size, dataset_size,
+                    engine, baseline_extra, real_data_fraction,
                 ),
                 f"collapse run {label}",
             )
@@ -1080,13 +1070,6 @@ if __name__ == "__main__":
         "probe. Run B is held out and never consulted, so it may be incapable at the chosen "
         "generation — that is reported as inconclusive. Only read when --collapsed_generation "
         "is -1 (default: 1)",
-    )
-    parser.add_argument(
-        "--with_eval",
-        "-we",
-        action="store_true",
-        help="also run each collapse run's perplexity evaluation and histogram. Off by default: "
-        "this experiment reads none of it, and the plotting step needs a LaTeX install",
     )
     parser.add_argument(
         "--force",
