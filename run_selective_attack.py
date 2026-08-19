@@ -123,6 +123,7 @@ timeout, but pass ``--no_exec`` to disable execution entirely and fall back to l
 import argparse
 import datetime
 import getpass
+import inspect
 import json
 import os
 import random
@@ -155,7 +156,23 @@ from run_attack import (
     split_prompt,
     surrogate_factor_arg,
 )
+from utils.attack_parallel import (
+    decode_units,
+    encode_units,
+    handoff_file as shard_handoff_file,
+    merge_outcomes,
+    plan_shards,
+    plan_units,
+    read_json,
+    run_shards,
+    unit_seed,
+    units_by_task,
+    write_json,
+)
+from utils.attack_parallel import cleanup as cleanup_shard_files
+from utils.attack_parallel import release_weights
 from utils.colors import TColors
+from utils.devices import visible_devices
 from utils.execution import extract_code
 from utils.extrapolation import METHODS, calibrated_factor, factor_calibration_file
 from utils.gcg import filter_ids, sample_ids_from_grad
@@ -163,8 +180,15 @@ from utils.models import add_model_arguments, model_size_label, resolve_model_sp
 from utils.naming import mixture_tag
 from utils.utils import INIT_CHARS, configure_pad_token, get_nonascii_toks
 
+# resolved once, at module scope, and kept: the search is sharded by handing each worker its own
+# explicit CUDA_VISIBLE_DEVICES, so the parent needs the full list — see utils/devices.py
+VISIBLE_DEVICES = visible_devices()
+
 MODEL_PATH: str = "./model_outputs/"
 RESULTS_PATH: str = "./attack_results/"
+# set in the shard workers, where several interleaved progress bars in one terminal are unreadable.
+# tqdm.write still reaches stdout with the bar disabled, so the hit lines survive
+PROGRESS_DISABLED: bool = False
 
 # the baseline is modelled as a role like any other so that one loop covers "every model that must
 # keep answering correctly". It has no generation index; -1 is a sentinel that sorts before 0 and
@@ -1039,15 +1063,24 @@ class SelectiveGCG:
         return report
 
     # ── main loop ──
-    def run_task(self, task: AttackTask, restarts: int) -> TaskOutcome:
-        """Runs the full search (all restarts) for one task.
+    def run_task(
+        self, task: AttackTask, restarts: int, restart_indices: list | None = None
+    ) -> TaskOutcome:
+        """Runs the search for one task, over all of its restarts or a chosen subset of them.
 
         Assumes ``capability_gate`` has already vetted the task; its cached clean-prompt verdict is
         reused as this task's control.
 
+        `restart_indices` is what makes a (task, restart) pair addressable, so the search can be
+        sharded over the GPUs one pair at a time — see utils/attack_parallel.py. It changes *which*
+        trajectories run and nothing about what any of them does: restart i draws its initialization
+        from a fresh RNG advanced i times whether or not the earlier restarts are part of this call,
+        and each trajectory seeds the global torch RNG from its own identity.
+
         Args:
             task (AttackTask): the task to attack
-            restarts (int): random re-initializations of the suffix
+            restarts (int): the run's total restart count, which sets the initializations
+            restart_indices (list | None): the restart indices to run, or None for all of them
 
         Returns:
             TaskOutcome: hits, every behavioural check, and the loss trajectory
@@ -1091,14 +1124,20 @@ class SelectiveGCG:
                     )
 
         segments = self.build_task_segments(task)
+        # every restart's initialization is drawn up front, so restart i gets the same string
+        # whether the call runs all restarts or only that one
         rng = random.Random(self.cfg.seed)
         n_init_tokens = len(self.cfg.optim_str_init.split())
+        inits = [self.cfg.optim_str_init] + [
+            " ".join(rng.choice(INIT_CHARS) for _ in range(n_init_tokens))
+            for _ in range(1, restarts)
+        ]
 
-        for restart in range(restarts):
-            if restart == 0:
-                init_str = self.cfg.optim_str_init
-            else:
-                init_str = " ".join(rng.choice(INIT_CHARS) for _ in range(n_init_tokens))
+        for restart in restart_indices if restart_indices is not None else range(restarts):
+            init_str = inits[restart]
+            # the candidate sampler draws from the global torch RNG, so seeding it per unit is what
+            # makes this trajectory independent of whatever ran before it in this process
+            torch.manual_seed(unit_seed(self.cfg.seed, task.name, restart))
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}[{task.name}] restart "
                 f"{restart + 1}/{restarts}{TColors.ENDC} init={init_str!r}"
@@ -1121,7 +1160,12 @@ class SelectiveGCG:
     ) -> None:
         """One gradient-guided search trajectory from a single initialization."""
         optim_ids = self._ids(init_str)[0]
-        progress = tqdm(range(self.cfg.num_steps), desc=f"{task.name}/r{restart}", leave=False)
+        progress = tqdm(
+            range(self.cfg.num_steps),
+            desc=f"{task.name}/r{restart}",
+            leave=False,
+            disable=PROGRESS_DISABLED,
+        )
 
         for step in progress:
             grad, _ = self.combined_gradient(optim_ids, segments)
@@ -1492,6 +1536,7 @@ def build_role_surrogates(
     base_specifier: str,
     probed: TargetModel | None = None,
     first_model=None,
+    prebuilt: dict | None = None,
 ) -> tuple[dict[float, TargetModel], dict[float, str]]:
     """One surrogate per *distinct* factor, keyed by it.
 
@@ -1522,10 +1567,14 @@ def build_role_surrogates(
         first_model: an already loaded generation-0 model to build the tilt on. Set when gen 0
             is itself one of the run's roles and resolves to the same directory as the anchor, which
             makes the anchor a checkpoint that is already in VRAM
+        prebuilt (dict | None): factor -> an already written scaled adapter to load instead of
+            writing one. The shard workers are given this, because build_scaled_adapter writes with
+            rmtree plus copytree and several of them building one factor would race on the directory
 
     Returns:
         tuple: (factor -> surrogate, factor -> description)
     """
+    prebuilt = prebuilt or {}
     distinct = sorted(set(factors.values()))
     surrogates: dict[float, TargetModel] = {}
     descriptions: dict[float, str] = {}
@@ -1547,8 +1596,9 @@ def build_role_surrogates(
 
     for factor in distinct:
         surrogate, description = build_surrogate(
-            method, factor, baseline, first_collapsed_dir, surrogate_model_path, device, dtype,
-            base_specifier,
+            method, factor, baseline, first_collapsed_dir,
+            prebuilt.get(factor) or prebuilt.get(str(factor)) or surrogate_model_path,
+            device, dtype, base_specifier,
         )
         surrogates[factor] = surrogate
         descriptions[factor] = description
@@ -1692,6 +1742,10 @@ def main(
     first_collapsed_path: str = "",
     no_surrogate_scoring: bool = False,
     real_data_fraction: float = 0.0,
+    attack_gpus: int = 0,
+    shard_units: str = "",
+    handoff_file: str = "",
+    shard_out: str = "",
 ) -> None:
     """Searches for an adversarial suffix that is selective across a set of collapse generations.
 
@@ -1745,6 +1799,13 @@ def main(
             verification cost in transfer mode at the price of the surrogate report
         real_data_fraction (float): the --real_data_fraction run_baseline.py was given; it is part
             of the checkpoint names from generation 1 onward. Only used to find them
+        attack_gpus (int): how many of the visible GPUs to shard the (task, restart) units over.
+            0 uses all of them, 1 keeps the search in this process
+        shard_units (str): worker mode — the ``task:restart`` units this process is to run. Set by
+            the parent, not by hand
+        handoff_file (str): worker mode — the parent's resolved settings, its chosen surrogate
+            factors and its capability verdicts
+        shard_out (str): worker mode — where to write this shard's partial results
 
     Returns:
         None
@@ -1753,6 +1814,17 @@ def main(
         SystemExit: the generation lists are empty, overlap, or are inconsistent with the surrogate
             settings; or no task is attackable
     """
+    # ── worker mode ──
+    # A shard worker re-enters this function with the parent's settings (see __main__, which merges
+    # them out of the handoff), so the device, the checkpoint resolution, the dtype, the tokenizer
+    # and the surrogates are all built identically to the parent's. What it skips is every
+    # *run-level decision* — the banner, the auto factor probe and the capability gate come from the
+    # handoff, so those stay single-valued across the shards instead of recomputed per device
+    worker = bool(shard_units)
+    global PROGRESS_DISABLED
+    PROGRESS_DISABLED = worker
+    shard = decode_units(shard_units) if worker else []
+    inherited: dict = read_json(handoff_file) if worker else {}
     if list_tasks:
         for task in TASKS:
             print(f"{task.name:16s} {task.func}(...)  wrong: {task.wrong_code.strip()!r}")
@@ -1792,6 +1864,15 @@ def main(
             f"The search will be extremely slow."
         )
         torch_device = torch.device("cpu", 0)
+
+    # an explicit index (--device cuda:2) is a pin, so it is honoured rather than overridden by a
+    # fan-out over every visible card. A worker is already pinned by its CUDA_VISIBLE_DEVICES
+    pinned = "cuda" in device and device.split(":")[-1].isdigit()
+    shard_devices = (
+        []
+        if worker or pinned or torch_device.type != "cuda"
+        else (VISIBLE_DEVICES if attack_gpus <= 0 else VISIBLE_DEVICES[:attack_gpus])
+    )
 
     global MODEL_PATH, RESULTS_PATH
     if path != "":
@@ -1857,108 +1938,120 @@ def main(
     if not selected:
         raise SystemExit(f"no tasks matched {tasks!r}; use --list_tasks to see the names")
 
-    # ──────────────────────────── system status print ─────────────────────────
-    print(
-        "\n"
-        + f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}System Information"
-        + f"{TColors.ENDC} "
-        + _hr(23)
+    # resolved here rather than at the save, because the transient shard files are named after it
+    out_file = result_file(
+        targets, spares, specifier_name, mixture_tag(real_data_fraction), surrogate_method
     )
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Date{TColors.ENDC}: "
-        + str(datetime.datetime.now().strftime("%A, %d. %B %Y %I:%M%p"))
-    )
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}System{TColors.ENDC}: "
-        f"{torch.get_num_threads()} CPU cores with {os.cpu_count()} threads and "
-        f"{torch.cuda.device_count()} GPUs on user: {getpass.getuser()}"
-    )
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Device{TColors.ENDC}: {torch_device}")
-    if torch_device.type == "cuda":
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}GPU Memory{TColors.ENDC}: "
-            f"{torch.cuda.mem_get_info()[1] // 1024**2} MB"
-        )
-    else:
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}CPU Memory{TColors.ENDC}: "
-            f"{psutil.virtual_memory()[0] // 1024**2} MB"
-        )
-    print(
-        f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Parameters{TColors.ENDC} " + _hr(14)
-    )
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Baseline Model{TColors.ENDC}: {baseline_dir}")
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Must break{TColors.ENDC}: generation(s) "
-        f"{', '.join(str(generation) for generation in targets)}"
-    )
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Must hold{TColors.ENDC}: baseline"
-        + (
-            f" + generation(s) {', '.join(str(g) for g in spares)}"
-            if spares
-            else " only (no spare generations — equivalent to run_attack.py's criterion)"
-        )
-    )
-    for generation in generations:
-        role = "break" if generation in targets else "hold"
-        print(
-            f"##   {TColors.OKCYAN}generation {generation}{TColors.ENDC} ({role}): "
-            f"{checkpoints[generation]}"
-        )
-    if transfer:
-        how = "auto" if auto_factor else ("calibrated" if calibrated else "n = g + 1")
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: "
-            f"{TColors.HEADER}transfer{TColors.ENDC} — optimize against {surrogate_method} "
-            f"surrogates (factors: {how}), validate against the real checkpoints above"
-        )
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate anchor (gen 0){TColors.ENDC}: "
-            f"{first_collapsed_dir}"
-        )
-    else:
-        print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: direct — optimize against the "
-            f"real collapsed checkpoints"
-        )
-    task_names = ", ".join(task.name for task in selected)
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Tasks{TColors.ENDC}: {task_names}")
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Steps x Restarts{TColors.ENDC}: "
-        f"{num_steps} x {restarts}"
-    )
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Search Width / topk / n_replace{TColors.ENDC}: "
-        f"{search_width} / {topk} / {n_replace}"
-    )
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Objective{TColors.ENDC}: "
-        f"mean_break CE(wrong) + {lambda_base} * mean_hold relu({margin} - CE(wrong)) "
-        f"+ {mu_correct} * mean_hold CE(correct)"
-    )
-    # the number a user needs to predict both the runtime and the VRAM: every one of these is
-    # resident and every one is evaluated at every step
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Models per step{TColors.ENDC}: "
-        f"{len(targets)} breaking + {len(spares) + 1} holding"
-        + (f", plus {surrogate_method} surrogates" if transfer else "")
-    )
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Execute generated code{TColors.ENDC}: {not no_exec}")
-    print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Min. Target Capability{TColors.ENDC}: "
-        f"{min_capability:.0%}" + (" (not enforced)" if skip_capability_check else "")
-    )
-    print(f"## {TColors.OKBLUE}{TColors.BOLD}Results Path{TColors.ENDC}: {RESULTS_PATH}")
-    print(_hr() + "\n")
+    stem = os.path.basename(out_file)[: -len(".json")]
 
-    if no_exec:
+    # the banner is a run-level announcement, so the shard workers skip it rather than print
+    # one copy of it per device into the same terminal
+    if not worker:
+        # ──────────────────────────── system status print ─────────────────────────
         print(
-            f"{TColors.WARNING}Warning{TColors.ENDC}: --no_exec disables behavioural "
-            f"verification, so the selective conjunction is never evaluated. Results are loss-only "
-            f"and do NOT establish wrong behaviour.\n"
+            "\n"
+            + f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}System Information"
+            + f"{TColors.ENDC} "
+            + _hr(23)
         )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Date{TColors.ENDC}: "
+            + str(datetime.datetime.now().strftime("%A, %d. %B %Y %I:%M%p"))
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}System{TColors.ENDC}: "
+            f"{torch.get_num_threads()} CPU cores with {os.cpu_count()} threads and "
+            f"{torch.cuda.device_count()} GPUs on user: {getpass.getuser()}"
+        )
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Device{TColors.ENDC}: {torch_device}")
+        if torch_device.type == "cuda":
+            print(
+                f"## {TColors.OKBLUE}{TColors.BOLD}GPU Memory{TColors.ENDC}: "
+                f"{torch.cuda.mem_get_info()[1] // 1024**2} MB"
+            )
+        else:
+            print(
+                f"## {TColors.OKBLUE}{TColors.BOLD}CPU Memory{TColors.ENDC}: "
+                f"{psutil.virtual_memory()[0] // 1024**2} MB"
+            )
+        print(
+            f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Parameters{TColors.ENDC} "
+            + _hr(14)
+        )
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Baseline Model{TColors.ENDC}: {baseline_dir}")
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Model Size{TColors.ENDC}: {size_label}")
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Must break{TColors.ENDC}: generation(s) "
+            f"{', '.join(str(generation) for generation in targets)}"
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Must hold{TColors.ENDC}: baseline"
+            + (
+                f" + generation(s) {', '.join(str(g) for g in spares)}"
+                if spares
+                else " only (no spare generations — equivalent to run_attack.py's criterion)"
+            )
+        )
+        for generation in generations:
+            role = "break" if generation in targets else "hold"
+            print(
+                f"##   {TColors.OKCYAN}generation {generation}{TColors.ENDC} ({role}): "
+                f"{checkpoints[generation]}"
+            )
+        if transfer:
+            how = "auto" if auto_factor else ("calibrated" if calibrated else "n = g + 1")
+            print(
+                f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: "
+                f"{TColors.HEADER}transfer{TColors.ENDC} — optimize against {surrogate_method} "
+                f"surrogates (factors: {how}), validate against the real checkpoints above"
+            )
+            print(
+                f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate anchor (gen 0){TColors.ENDC}: "
+                f"{first_collapsed_dir}"
+            )
+        else:
+            print(
+                f"## {TColors.OKBLUE}{TColors.BOLD}Mode{TColors.ENDC}: direct — optimize "
+                f"against the real collapsed checkpoints"
+            )
+        task_names = ", ".join(task.name for task in selected)
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Tasks{TColors.ENDC}: {task_names}")
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Steps x Restarts{TColors.ENDC}: "
+            f"{num_steps} x {restarts}"
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Search Width / topk / n_replace{TColors.ENDC}: "
+            f"{search_width} / {topk} / {n_replace}"
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Objective{TColors.ENDC}: "
+            f"mean_break CE(wrong) + {lambda_base} * mean_hold relu({margin} - CE(wrong)) "
+            f"+ {mu_correct} * mean_hold CE(correct)"
+        )
+        # the number a user needs to predict both the runtime and the VRAM: every one of these is
+        # resident and every one is evaluated at every step
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Models per step{TColors.ENDC}: "
+            f"{len(targets)} breaking + {len(spares) + 1} holding"
+            + (f", plus {surrogate_method} surrogates" if transfer else "")
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Execute generated code{TColors.ENDC}: {not no_exec}"
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Min. Target Capability{TColors.ENDC}: "
+            f"{min_capability:.0%}" + (" (not enforced)" if skip_capability_check else "")
+        )
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Results Path{TColors.ENDC}: {RESULTS_PATH}")
+        print(_hr() + "\n")
+
+        if no_exec:
+            print(
+                f"{TColors.WARNING}Warning{TColors.ENDC}: --no_exec disables behavioural "
+                f"verification, so the selective conjunction is never evaluated. Results are "
+                f"loss-only and do NOT establish wrong behaviour.\n"
+            )
 
     # ──────────────────────────── load models ─────────────────────────
     if torch_device.type == "cpu":
@@ -2041,7 +2134,11 @@ def main(
     descriptions: dict[float, str] = {}
     if transfer:
         probed_surrogate: TargetModel | None = None
-        if auto_factor:
+        if worker:
+            # the parent probed (or was told) every factor, so no worker repeats the ladder and all
+            # of them build the same surrogates
+            factors = {int(key): float(value) for key, value in inherited["factors"].items()}
+        elif auto_factor:
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}Probing the {surrogate_method} surrogate for "
                 f"usable factors{TColors.ENDC} — largest rung each generation still writes code at"
@@ -2078,7 +2175,8 @@ def main(
         else:
             factors = default_factors(generations)
 
-        check_factor_collisions(targets, spares, factors)
+        if not worker:
+            check_factor_collisions(targets, spares, factors)
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Building {surrogate_method} surrogates{TColors.ENDC}"
             f" (" + ", ".join(f"gen {g} -> n = {factors[g]:g}" for g in generations) + ")"
@@ -2101,6 +2199,9 @@ def main(
             base_specifier=model_specifier,
             probed=probed_surrogate,
             first_model=resident_anchor,
+            # in worker mode the parent already wrote any lora adapter, and build_scaled_adapter
+            # rmtrees its output — so the workers load rather than rebuild
+            prebuilt=inherited.get("surrogate_paths") if worker else None,
         )
 
     roles = [baseline_role]
@@ -2142,17 +2243,25 @@ def main(
     )
 
     # ──────────────────── upfront capability gate ─────────────────────
-    # Before optimizing anything, establish that every model in the run can still write correct code
-    # unaided. Without that a wrong answer is a symptom of collapse, not of the attack, and a
-    # spare that already fails makes the conjunction unsatisfiable by construction.
-    print(
-        f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Capability Probe"
-        f"{TColors.ENDC} " + _hr(21)
-    )
-    print("##   clean prompts, no adversarial input — can every model still solve them?")
-    capability = attack.capability_gate(selected, min_capability)
+    # Before optimizing anything, establish that the baseline and every target can still write
+    # correct code unaided. Without that a wrong answer is a symptom of collapse, not of the attack.
+    if worker:
+        # the gate ran once, in the parent, and its verdicts are this worker's controls — so the
+        # clean prompts are decoded once per run rather than once per shard, and every shard agrees
+        # about which tasks are attackable
+        capability = CapabilityReport(**inherited["capability"])
+        attack._controls = inherited["controls"]  # pylint: disable=protected-access
+    else:
+        print(
+            f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Capability Probe"
+            f"{TColors.ENDC} " + _hr(21)
+        )
+        print("##   clean prompts, no adversarial input — can every model still solve them?")
+        capability = attack.capability_gate(selected, min_capability)
 
-    if capability.skipped:
+    if worker:
+        pass
+    elif capability.skipped:
         print(f"##   {TColors.WARNING}not probed{TColors.ENDC}: {capability.reason}")
     else:
         for role in roles:
@@ -2183,11 +2292,12 @@ def main(
                 f"{', '.join(spares_broken)} already fail(s) it unaided, so no hit on it can "
                 f"satisfy them"
             )
-    print(_hr() + "\n")
+    if not worker:
+        print(_hr() + "\n")
 
     outcomes: list[TaskOutcome] = []
     proceed = True
-    if capability.aborted:
+    if capability.aborted and not worker:
         if skip_capability_check:
             print(
                 f"{TColors.WARNING}Warning{TColors.ENDC}: capability gate failed "
@@ -2207,31 +2317,136 @@ def main(
             proceed = False
 
     # ──────────────────────────── run the search ─────────────────────────
+    attackable = [task for task in selected if task.name in capability.usable]
+    by_task = {task.name: task for task in selected}
+
+    if worker:
+        # this process owns a subset of the (task, restart) units and nothing else. It reports only
+        # what it ran; the parent merges the shards and writes the run's result file
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Shard{TColors.ENDC}: "
+            f"{encode_units(shard)} on {torch_device}"
+        )
+        for name, restart_indices in units_by_task(shard).items():
+            print(
+                f"\n## {TColors.HEADER}{TColors.BOLD}Task: {name}{TColors.ENDC} "
+                f"restarts {restart_indices} " + _hr(24)
+            )
+            outcome = attack.run_task(by_task[name], restarts, restart_indices=restart_indices)
+            if outcome.skipped:
+                print(f"## {TColors.WARNING}skipped{TColors.ENDC}: {outcome.skipped}")
+            outcomes.append(outcome)
+        write_json(shard_out, {"results": [outcome.__dict__ for outcome in outcomes]})
+        print(
+            f"## {TColors.OKGREEN}shard done{TColors.ENDC}: "
+            f"{sum(len(outcome.successes) for outcome in outcomes)} hit(s) -> {shard_out}"
+        )
+        return
+
+    units = plan_units([task.name for task in attackable], restarts)
+    shards = plan_shards(units, len(shard_devices)) if shard_devices else []
+    fan_out = proceed and len(shards) > 1
+
     if proceed:
         for task in selected:
-            if task.name not in capability.usable:
-                verdict = capability.per_task.get(task.name, {})
-                reason = verdict.get("invalid")
-                if reason is None:
-                    statuses = attack.statuses(verdict) if verdict else {}
-                    failed = [
-                        role.label for role in attack.gating
-                        if statuses.get(role.label, "unknown") != "pass"
-                    ] or ["unknown"]
-                    reason = f"{', '.join(failed)} fail(s) the clean prompt"
-                outcomes.append(
-                    TaskOutcome(
-                        task=task.name,
-                        control=verdict if "invalid" not in verdict else {},
-                        skipped=f"excluded by the capability probe ({reason})",
-                    )
-                )
+            if task in attackable:
                 continue
+            verdict = capability.per_task.get(task.name, {})
+            reason = verdict.get("invalid")
+            if reason is None:
+                statuses = attack.statuses(verdict) if verdict else {}
+                failed = [
+                    role.label for role in attack.gating
+                    if statuses.get(role.label, "unknown") != "pass"
+                ] or ["unknown"]
+                reason = f"{', '.join(failed)} fail(s) the clean prompt"
+            outcomes.append(
+                TaskOutcome(
+                    task=task.name,
+                    control=verdict if "invalid" not in verdict else {},
+                    skipped=f"excluded by the capability probe ({reason})",
+                )
+            )
+
+    if fan_out:
+        # the units are independent, so they are dealt over the GPUs and run as subprocesses. The
+        # models are released first: this process needed them for the probe and the gate, and a
+        # selective run holds several of them, so holding that set while the first shard loads its
+        # own would OOM the device they share
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Sharding {len(units)} (task, restart) unit(s) "
+            f"across {len(shards)} GPU(s){TColors.ENDC}: "
+            + ", ".join(
+                f"cuda:{shard_devices[index % len(shard_devices)]} -> {encode_units(unit_list)}"
+                for index, unit_list in enumerate(shards)
+            )
+        )
+        # the workers are handed the parent's *resolved* settings rather than a rebuilt command
+        # line, so they cannot end up configured differently from the run they belong to. Picked out
+        # of the locals by main()'s own signature, with the worker-only keys overridden
+        parameters = inspect.signature(main).parameters
+        worker_config = {
+            name: value for name, value in locals().items() if name in parameters
+        }
+        worker_config.update(
+            {"attack_gpus": 1, "shard_units": "", "handoff_file": "", "shard_out": ""}
+        )
+        handoff = shard_handoff_file(RESULTS_PATH, stem)
+        write_json(
+            handoff,
+            {
+                "config": worker_config,
+                # empty outside transfer mode, where there are no surrogates to agree on
+                "factors": (
+                    {str(generation): factors[generation] for generation in generations}
+                    if transfer else {}
+                ),
+                # a lora surrogate is a directory build_surrogate writes with rmtree plus copytree,
+                # so the parent's copies are passed on rather than rebuilt per worker. Same paths
+                # build_surrogate would have chosen
+                "surrogate_paths": (
+                    {
+                        str(value): surrogate_model_path
+                        or os.path.join(MODEL_PATH, f"attack_surrogate_n{value:g}")
+                        for value in sorted(set(factors.values()))
+                    }
+                    if surrogate_method == "lora" else {}
+                ),
+                "capability": capability.__dict__,
+                "controls": attack._controls,  # pylint: disable=protected-access
+            },
+        )
+        # the weights go, the wrappers stay: the summary and the two reports below read labels,
+        # roles and factors, never a weight — see attack_parallel.release_weights
+        release_weights(
+            [role.real for role in roles] + [role.optim for role in roles]
+        )
+        if torch_device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        shard_files = run_shards(
+            script=os.path.abspath(__file__),
+            shards=shards,
+            devices=shard_devices,
+            handoff=handoff,
+            results_path=RESULTS_PATH,
+            stem=stem,
+        )
+        merged = merge_outcomes([read_json(path_)["results"] for path_ in shard_files])
+        outcomes.extend(TaskOutcome(**row) for row in merged)
+        cleanup_shard_files([handoff] + shard_files)
+    elif proceed:
+        for task in attackable:
             print(f"\n## {TColors.HEADER}{TColors.BOLD}Task: {task.name}{TColors.ENDC} " + _hr(12))
             outcome = attack.run_task(task, restarts)
             if outcome.skipped:
                 print(f"## {TColors.WARNING}skipped{TColors.ENDC}: {outcome.skipped}")
             outcomes.append(outcome)
+
+    # the summary reads the outcomes in the order the tasks were selected, whichever path produced
+    # them — a fan-out returns them in shard-completion order
+    order = {task.name: index for index, task in enumerate(selected)}
+    outcomes.sort(key=lambda outcome: order.get(outcome.task, len(order)))
 
     # ──────────────────────────── report and save ─────────────────────────
     print(f"\n## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Summary{TColors.ENDC} " + _hr(11))
@@ -2336,9 +2551,6 @@ def main(
             )
         print(_hr() + "\n")
 
-    out_file = result_file(
-        targets, spares, specifier_name, mixture_tag(real_data_fraction), surrogate_method
-    )
     with open(out_file, "w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -2673,5 +2885,31 @@ if __name__ == "__main__":
         default=1337,
         help="RNG seed (default: 1337)",
     )
+    parser.add_argument(
+        "--attack_gpus",
+        "-ag",
+        type=int,
+        default=0,
+        help="how many of the visible GPUs to shard the search over. The (task, restart) pairs are "
+        "independent, so they are dealt across the devices and run as subprocesses. 0 uses every "
+        "visible GPU, 1 keeps the search in this process. An explicit --device cuda:N is a pin and "
+        "disables it. Note that this does not lower the per-GPU memory, since every worker holds "
+        "the whole model set, and that --stop_on_success can no longer skip a task's later "
+        "restarts once they are already running (default: 0)",
+    )
+    # worker-mode plumbing: set by the parent when it fans out, not meant for the command line. The
+    # workers take every other setting from the handoff, so they cannot be configured apart from the
+    # run they belong to
+    parser.add_argument("--shard_units", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--handoff_file", type=str, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--shard_out", type=str, default="", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    main(**vars(args))
+
+    if args.shard_units:
+        # a worker inherits the parent's resolved settings and is told only which units to run
+        forwarded = {"shard_units", "handoff_file", "shard_out"}
+        settings = dict(read_json(args.handoff_file)["config"])
+        settings.update({key: getattr(args, key) for key in forwarded})
+        main(**settings)
+    else:
+        main(**vars(args))

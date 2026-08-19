@@ -790,7 +790,47 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--stop_on_success` | `-sos` | flag | off | Stop a task as soon as a selective hit is verified. |
 | `--min_capability` | `-mcap` | float | `0.6` | Fraction of clean, suffix-free tasks the collapsed model must still solve before the attack is allowed to start. Below this it is treated as no longer capable of generating code and the run is stopped. |
 | `--skip_capability_check` | `-scc` | flag | off | Do not stop the run when the capability probe fails. Per-task exclusion of tasks the collapsed model already gets wrong still applies. |
+| `--attack_gpus` | `-ag` | int | `0` | GPUs to shard the search over. `0` uses every visible one, `1` keeps it in this process. See [Sharding the search](#sharding-the-search-over-the-gpus). |
 | `--seed` | `-s` | int | `1337` | RNG seed. |
+
+### Sharding the search over the GPUs
+
+The search is a loop over **(task, restart) pairs**, and those pairs are independent — each owns its
+suffix, its segments and its outcome, and the models are read-only throughout. So they are dealt
+across the visible GPUs and run as subprocesses, one per device, the same way `run_baseline.py`
+shards its generation and perplexity stages:
+
+```
+## Sharding 15 (task, restart) unit(s) across 4 GPU(s): cuda:0 -> is_even:0,add:2,..., cuda:1 -> ...
+```
+
+`(task, restart)` rather than whole tasks: five tasks on four devices splits 2/1/1/1 and finishes no
+faster than the two-task shard, about 2.5×, while the same work as fifteen units splits 4/4/4/3 —
+close to 3.75× — and it still scales when only one task is selected. Turn it off with `-ag 1`; an
+explicit `--device cuda:N` is a pin and disables it too.
+
+What runs **before** the fan-out, in the parent, because each is a decision about the run as a whole:
+the capability gate (`--min_capability` is a fraction over all tasks and has to be able to stop the
+run before anything is optimized), the `--surrogate_factor auto` probe, and the build of a `lora`
+surrogate — that one is a *directory*, written with `rmtree` followed by `copytree`, so several
+workers building the same factor would delete each other's copy mid-write. The parent then releases
+the model weights and hands the workers its resolved settings, chosen factor, prebuilt adapter path
+and per-task clean verdicts in a transient handoff file, so no shard re-probes and no shard can end
+up configured differently from the run it belongs to. Its partial results are merged back into the
+usual single result file.
+
+Two consequences worth knowing:
+
+* **`--stop_on_success` no longer skips a task's later restarts**, because they are already running.
+  It still stops the restart that found the hit.
+* **the numbers changed once, and are now stable.** `sample_ids_from_grad` draws candidates from the
+  global torch RNG, so the second task's trajectory used to depend on how many draws the first one
+  had consumed. Every unit now seeds that stream from `(seed, task, restart)`, which makes a
+  trajectory a property of its unit: a sharded run and an `-ag 1` run produce **identical** suffixes,
+  and so do two runs that select different subsets of the tasks. Results from before this are not
+  comparable candidate-for-candidate.
+* per-GPU memory is **unchanged** — every worker holds the whole model set — so this makes a run
+  faster, not larger.
 
 ### Examples
 
@@ -1056,6 +1096,11 @@ step 3's cost per step. The banner prints the count, verification (which decodes
 to dominate at a small `-ve`, and an out-of-memory error during loading says which generation it was
 and that shortening the lists is the fix.
 
+The (task, restart) units are sharded over the GPUs by default, same mechanism and same caveats as in
+[step 3](#sharding-the-search-over-the-gpus) — which buys back a factor of the number of devices on
+the wall-clock but **not** on the memory, since each worker holds the whole model set. If the model
+set is what does not fit, shorten the lists; parallelism is the wrong tool for it.
+
 The `logit` surrogates are the cheap part: they are the same two anchor models with a different
 float, so N generations cost one copy of the generation-0 checkpoint whatever N is. `lora`
 surrogates are separate merged weights per distinct factor and a wide generation list will not fit.
@@ -1088,6 +1133,7 @@ form, default and meaning as in [Step 3](#usage-2).
 | `--surrogate_factor` | `-sf` | float, `auto` or `calibrated` | `0.0` | Resolved per generation, see above. An explicit number is only accepted for a single-generation run. |
 | `--no_surrogate_scoring` | `-nss` | flag | off | Do not decode the surrogates during the behavioural check. Roughly halves its cost in transfer mode, at the price of the surrogate report. |
 | `--min_capability` | `-mcap` | float | `0.2` | Fraction of clean tasks every **target** must still solve before the attack starts. Spare generations are not gated on it, and neither are they gated per task — see [the capability gate](#the-capability-gate-1). |
+| `--attack_gpus` | `-ag` | int | `0` | GPUs to shard the (task, restart) units over, exactly as in [step 3](#sharding-the-search-over-the-gpus). `0` uses every visible one, `1` keeps the search in this process. It does not lower the per-GPU memory. |
 
 `--collapsed_generation` / `-cg` does not exist here — the target list replaces it.
 
