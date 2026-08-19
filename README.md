@@ -943,3 +943,208 @@ about how far the model has collapsed. A console summary prints the capability r
 hit counts along with the winning suffix and the wrong code the collapsed model produced; transfer
 runs add a `Surrogate quality` section with the agreement, precision/recall and the baseline-leak
 count.
+
+## Step 3b: Selective across generations with `run_selective_attack.py`
+
+Step 3 asks whether a suffix breaks **one** collapsed generation while the pristine baseline still
+answers correctly. `run_selective_attack.py` asks the same question of a whole *set* of models at
+once, and only counts a hit when every condition holds for the same suffix at the same time:
+
+```bash
+python run_selective_attack.py --device cuda -tg 8,9 -sg 0,1,2 -p ./runs/x
+```
+
+| list | flag | condition |
+|---|---|---|
+| target generations | `-tg` | must emit objectively **wrong** code |
+| spare generations | `-sg` | must keep emitting **correct** code |
+| the pristine baseline | — | must keep emitting correct code, always |
+
+A suffix that breaks generation 9 but also breaks generation 1 is **not** a hit here, even though
+step 3 would have recorded one. The lists are symmetric in that criterion and asymmetric in the
+[capability gate](#the-capability-gate-1), which only the baseline and the targets have to pass. That is the point: step 3 demonstrates the dormant part of a
+timebomb along one axis (inert against the pristine model, active against a collapsed one), while
+this one can express a *window* — an input that arms itself only after the lineage has degraded past
+some point, or that discriminates between one band of generations and another. Everything else is
+step 3's: the same GCG optimizer, the same tasks, the same behavioural verification, the same
+transfer mode and the same result-file conventions.
+
+With one target and no spares the two scripts are the same experiment, term for term, which is the
+way to check that a difference in the results is a difference in the question.
+
+### The objective
+
+Step 3's three terms, each averaged over the group of models it applies to:
+
+```
+L(s) = mean_{g in targets}    CE_g(wrong | prompt+s)
+     + λ * mean_{h in hold}   relu(margin − CE_h(wrong | prompt+s))
+     + μ * mean_{h in hold}   CE_h(correct | prompt+s)
+```
+
+`hold` is the baseline together with every spare generation — the baseline is simply the member that
+is always present and never a surrogate. Means and not sums, so `--margin`, `--lambda_base` and
+`--mu_correct` keep the scale they have in step 3.
+
+### Transfer mode
+
+Same threat model as step 3's: the attacker holds the pristine base model and the *first* collapsed
+model, nothing else. Under `-sm logit` (or `lora`) every generation in **either** list is replaced in
+the objective by a first-order surrogate at its own extrapolation factor, and success is still
+decided by the real checkpoints alone. The surrogates are search tools; they are decoded during
+verification only so they can be scored as predictors of the real outcome, which `-nss` turns off.
+
+Generation 0's surrogate at `n = 1` *is* `model_0`, unextrapolated — so listing generation 0 as a
+spare costs nothing in fidelity (the attacker holds that checkpoint), while listing it as a target
+makes no transfer claim at all and the script says so. A run whose only target is generation 0 is
+rejected, the same case step 3 rejects for `-cg 0`.
+
+`--surrogate_factor` is resolved **per generation**:
+
+* the default derives `n = g + 1` for each, the pipeline's indexing convention
+* `calibrated` reads each generation's factor out of `utils/evaluate_perplexity.py --calibrate`
+* `auto` measures them in **one** descending walk of the factor ladder — capability at a rung does
+  not depend on which generation asked about it, so every generation then takes the largest capable
+  rung at or below its own `g + 1`, and the walk stops as soon as all of them have an answer:
+
+```
+##   ladder: 3, 2.5, 2, 1.75, 1.5, 1.25, 1
+##   n = 3     surrogate solves 1/2 (50%) -> accepted -> generation(s) 2
+##   n = 1     surrogate solves 2/2 (100%) -> accepted -> generation(s) 0
+```
+
+A single explicit number is **rejected** unless the run involves exactly one generation: one factor
+for every generation means one identical surrogate for every generation, and across the target/spare
+divide "must break" and "must not break" cannot both be satisfied. The same collision is checked
+after `auto` and `calibrated` resolve, where two generations can land on the same rung — it stops the
+run rather than optimize against an unsatisfiable loss. Two *targets* sharing a factor is merely
+redundant and warns.
+
+### The capability gate
+
+Step 3's gate, widened to the **baseline and the targets** — and deliberately not to the spares. A
+task is attackable when every gating model solves it on the clean, suffix-free prompt:
+
+```
+##   is_even          baseline=pass  gen2=fail  gen3=pass -> unusable (gen2 cannot solve it)
+##   add              baseline=pass  gen2=pass  gen3=fail -> usable (but gen3 already fail(s) it,
+                                                             so no hit on this task can satisfy them)
+```
+
+The asymmetry is the point. A **target** that already fails a task unaided cannot be shown to have
+been *broken* by the suffix — the failure is collapse, not the attack — so the claim is unavailable
+and the task is dropped, which is step 3's own rule. A **spare** that already fails is a different
+situation: it makes one conjunct unreachable on that task, but it takes nothing away from the claim
+about the targets, and with several spares gating on them would empty the task list before the search
+ever ran. Spares are therefore probed and reported, never excluded — the console names them at the
+probe and again when the search reaches the task, `spare_broken_on_usable` records them in the result
+file, and the `blocked_by` counts in the selectivity report show what it cost:
+
+```
+##   gen3         must hold:   satisfied in 0/1 checks, emitted wrong code in 0, blocked a hit 1 time(s)
+```
+
+`--min_capability` is enforced on the **targets** only, for the same reason: an incapable target makes
+its own hits unattributable, while an incapable spare only makes them harder to come by.
+
+### Cost
+
+Every model in the run is resident and every one is evaluated at every step, so both the wall-clock
+and the VRAM scale with `|targets| + |spares| + 1`; the `logit` surrogate costs two forward passes per
+evaluation rather than one. Three targets and three spares is seven models and roughly seven times
+step 3's cost per step. The banner prints the count, verification (which decodes every model) tends
+to dominate at a small `-ve`, and an out-of-memory error during loading says which generation it was
+and that shortening the lists is the fix.
+
+The `logit` surrogates are the cheap part: they are the same two anchor models with a different
+float, so N generations cost one copy of the generation-0 checkpoint whatever N is. `lora`
+surrogates are separate merged weights per distinct factor and a wide generation list will not fit.
+
+### Usage
+
+```
+python run_selective_attack.py [-dx DEVICE] [-tg TARGET_GENERATIONS] [-sg SPARE_GENERATIONS]
+                               [-bs BLOCK_SIZE] [-msz MODEL_SIZE] [-ms MODEL_SPECIFIER]
+                               [-bmp BASELINE_MODEL_PATH] [-gmp GENERATION_MODEL_PATH]
+                               [-p PATH] [-t TASKS] [-lt] [-r RESTARTS] [-ns NUM_STEPS]
+                               [-sw SEARCH_WIDTH] [-b BATCH_SIZE] [-k TOPK] [-nr N_REPLACE]
+                               [-osi OPTIM_STR_INIT] [-ana] [-lb LAMBDA_BASE] [-m MARGIN]
+                               [-mc MU_CORRECT] [-ve VERIFY_EVERY] [-mnt MAX_NEW_TOKENS]
+                               [-rp REPETITION_PENALTY] [-et EXEC_TIMEOUT] [-ne] [-sos]
+                               [-mcap MIN_CAPABILITY] [-scc] [-s SEED]
+                               [-sm SURROGATE_METHOD] [-sf SURROGATE_FACTOR]
+                               [-smp SURROGATE_MODEL_PATH] [-fcp FIRST_COLLAPSED_PATH]
+                               [-nss] [-rdf REAL_DATA_FRACTION]
+```
+
+Only the flags that differ from `run_attack.py` are listed; everything else has the same name, short
+form, default and meaning as in [Step 3](#usage-2).
+
+| Argument | Short | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `--target_generations` | `-tg` | int list | `9` | Comma separated generations the suffix **must break**. Duplicates are collapsed and the list is sorted, so `9,8,9` and `8,9` name the same run and write the same file. |
+| `--spare_generations` | `-sg` | int list | empty | Comma separated generations the suffix **must not break**. The baseline is always in this group and needs no listing; empty leaves it as the only holding model, which is step 3's criterion. |
+| `--generation_model_path` | `-gmp` | `gen=path` list | none | Explicit checkpoints for individual generations, e.g. `9=/data/model_9,0=/data/model_0`. Generations not listed resolve from the naming convention. This is the list-shaped replacement for step 3's `--collapsed_model_path`, which does not generalize. |
+| `--surrogate_factor` | `-sf` | float, `auto` or `calibrated` | `0.0` | Resolved per generation, see above. An explicit number is only accepted for a single-generation run. |
+| `--no_surrogate_scoring` | `-nss` | flag | off | Do not decode the surrogates during the behavioural check. Roughly halves its cost in transfer mode, at the price of the surrogate report. |
+| `--min_capability` | `-mcap` | float | `0.2` | Fraction of clean tasks every **target** must still solve before the attack starts. Spare generations are not gated on it, and neither are they gated per task — see [the capability gate](#the-capability-gate-1). |
+
+`--collapsed_generation` / `-cg` does not exist here — the target list replaces it.
+
+### Examples
+
+Break the last two generations while sparing the first three, attacking the real checkpoints:
+
+```bash
+python run_selective_attack.py --device cuda \
+    --target_generations 8,9 --spare_generations 0,1,2 --path ./runs/x
+```
+
+The same question from an attacker who only has the base and generation-0 models, with the factors
+measured rather than assumed:
+
+```bash
+python run_selective_attack.py --device cuda \
+    -tg 8,9 -sg 0,1,2 -sm logit -sf auto --path ./runs/x
+```
+
+Fast smoke test (one task, one restart, stop at the first hit):
+
+```bash
+python run_selective_attack.py --device cuda -tg 2 -sg 0 -t add -ns 20 -r 1 -ve 5 -sos -p ./runs/x
+```
+
+### Outputs
+
+`<path>/attack_results/selective_attack_break<targets>_spare<spares>_<model_name>[_rdf<value>][_<method>_surrogate].json`,
+with the generation indices joined by `+` and `spare` reading `none` for an empty spare list — so
+`-tg 8,9 -sg 0,1` writes `selective_attack_break8+9_spare0+1_<model>.json`. Both lists are in the
+name because a run sparing 0 and 1 is a different experiment from one sparing 2 and 3 and neither may
+overwrite the other; the mixture tag and the surrogate-method suffix sit where they do in step 3's
+names.
+
+Beyond step 3's fields the file carries:
+
+* `target_generations` / `spare_generations`, `collapsed_models` (generation → resolved checkpoint),
+  and in transfer mode `surrogate_factors` and `surrogate_models` per generation plus the
+  `surrogate_factor_probe` rows of the `auto` walk
+* `capability_probe.spare_broken_on_usable` — per attackable task, the spares that already failed it
+  unaided. Those tasks are searched anyway (spares do not gate), so this is where the resulting
+  impossibility is recorded rather than hidden as an exclusion
+* `selectivity` — over every behavioural check: full hits, how often every target broke with the
+  spares ignored, how often every holding model kept with the targets ignored, and per model how
+  often it satisfied its own condition, emitted wrong code, and *blocked* a hit. The model that keeps
+  appearing in `blocked_by` is the one the search could not satisfy
+* `surrogate_quality` — per-generation agreement between each surrogate and its real checkpoint, plus
+  the surrogates read as an **ensemble**: how often the conjunction evaluated on them alone predicted
+  the real verdict, with precision and recall. That second number is what an attacker without the
+  checkpoints actually relies on
+* per task, a `verifications` list where every record carries the per-model `statuses` and the
+  `blocked_by` labels, so the statistics above can be recomputed without the raw completions
+
+The console mirrors all of it, and reports one model short of a hit live during the search:
+
+```
+## one model short [add] step 1: gen2 did not break | baseline=pass  gen0=pass  gen2=pass
+## SELECTIVE HIT [add] step 1: baseline=pass  gen0=pass  gen2=fail_exception | suffix='...'
+```
