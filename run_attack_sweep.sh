@@ -13,6 +13,14 @@
 # A hit here but not in transfer mode is a surrogate limitation; no hit in either is the
 # generation's own resistance (or, per the summary's capability column, its collapse).
 #
+# With --vuln the sweep drives run_attack_vuln.py instead: the same search over the same
+# generations, but a hit is the collapsed model writing an *insecure* implementation (SQL injection,
+# shell=True, weak PRNG, unsafe yaml, TLS validation off) while the baseline still writes the secure
+# one. Nothing else about the sweep changes — that script executes run_attack.py's own command line,
+# so every flag, the surrogate modes and the result format are identical. The result files carry an
+# extra marker so a vulnerability sweep and a correctness sweep of the same generations cannot
+# overwrite each other, and neither reads the other's files as "already done".
+#
 # Generation 0 is skipped by design in a surrogate sweep, not by accident: in transfer mode the
 # surrogate is built *from* generation 0, so attacking generation 0 would validate a suffix against
 # the very checkpoint it was derived from. run_attack.py rejects that combination outright. Pass
@@ -47,6 +55,7 @@ START_GENERATION=0
 FORCE=0
 DRY_RUN=0
 DIRECT_GEN0=0
+VULN=0
 EXTRA_ARGS=()
 
 usage() {
@@ -74,6 +83,11 @@ Options:
                             (default: 0). Part of both the checkpoint names and the result
                             file names, so a sweep of a mixed run needs it here rather than
                             after -- : it is what keeps two mixtures' results apart
+      --vuln                attack the vulnerability targets (run_attack_vuln.py) instead of
+                            the correctness ones: a hit is insecure code from the collapsed
+                            model while the baseline stays secure. Result files and logs gain a
+                            _vuln marker, so this sweep and a correctness sweep of the same
+                            generations are separate work
       --direct-gen0         also attack generation 0, without a surrogate, instead of skipping it
       --force               re-run generations whose result file already exists
       --dry-run             print the commands without running them
@@ -87,6 +101,7 @@ and so does each mixture:
   ./run_attack_sweep.sh -n 9 -p ./runs/x              # attack_gen{N}_{model}_logit_surrogate.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x -m none      # attack_gen{N}_{model}.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x -rdf 0.3     # attack_gen{N}_{model}_rdf0.3_logit_surrogate.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln       # attack_gen{N}_{model}_vuln_logit_surrogate.json
 EOF
 }
 
@@ -100,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         -ms|--model-specifier) MODEL_SPECIFIER="$2"; shift 2 ;;
         -msz|--model-size)    MODEL_SIZE="$2";      shift 2 ;;
         -rdf|--real-data-fraction) REAL_DATA_FRACTION="$2"; shift 2 ;;
+        --vuln)               VULN=1;               shift ;;
         --direct-gen0)        DIRECT_GEN0=1;        shift ;;
         --force)              FORCE=1;              shift ;;
         --dry-run)            DRY_RUN=1;            shift ;;
@@ -139,9 +155,16 @@ if [[ "$SURROGATE_METHOD" == "none" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ATTACK="$SCRIPT_DIR/run_attack.py"
+# the only thing --vuln changes about the invocation. run_attack_vuln.py inherits run_attack.py's
+# entire command line by executing it, so every flag built below is accepted by both and nothing
+# here has to branch on the mode a second time
+ATTACK_NAME="run_attack.py"
+if (( VULN )); then
+    ATTACK_NAME="run_attack_vuln.py"
+fi
+ATTACK="$SCRIPT_DIR/$ATTACK_NAME"
 if [[ ! -f "$ATTACK" ]]; then
-    echo "error: run_attack.py not found next to this script ($ATTACK)" >&2
+    echo "error: $ATTACK_NAME not found next to this script ($ATTACK)" >&2
     exit 2
 fi
 if [[ ! -d "$PATH_ROOT/model_outputs" ]]; then
@@ -179,6 +202,20 @@ fi
 MIXTURE_TAG=""
 { read -r MODEL_SPECIFIER; read -r MODEL_SIZE; read -r MIXTURE_TAG; } <<< "$RESOLVED"
 
+# the second tag in the result file names, and empty unless --vuln. Read out of run_attack_vuln.py
+# rather than repeated here, for the same reason the mixture tag comes from utils.naming: this
+# script builds the names the --force check looks for, so a marker that drifted from the python
+# one would make every generation look un-run and re-do the whole sweep. The import also fails
+# fast — before the first generation rather than after it — if that script is broken
+TARGET_TAG=""
+if (( VULN )); then
+    if ! TARGET_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+            'import run_attack_vuln; print(run_attack_vuln.RESULT_MARKER)')"; then
+        echo "error: could not read RESULT_MARKER from run_attack_vuln.py" >&2
+        exit 2
+    fi
+fi
+
 SPECIFIER_NAME="${MODEL_SPECIFIER##*/}"
 RESULTS_DIR="$PATH_ROOT/attack_results"
 LOG_DIR="$RESULTS_DIR/sweep_logs"
@@ -186,6 +223,13 @@ mkdir -p "$LOG_DIR"
 
 echo "############################################################"
 echo "## attack sweep: generations $START_GENERATION..$NUM_GENERATIONS"
+if (( VULN )); then
+    echo "##   targets      : vulnerabilities — a hit is insecure code from the collapsed model"
+    echo "##                  while the baseline still writes the secure variant"
+else
+    echo "##   targets      : correctness — a hit is wrong code from the collapsed model"
+    echo "##                  while the baseline still writes a correct implementation"
+fi
 if (( DIRECT_SWEEP )); then
     echo "##   surrogate    : none (direct attack on each real checkpoint)"
 else
@@ -201,6 +245,12 @@ if (( ${#EXTRA_ARGS[@]} )); then
     echo "##   extra args   : ${EXTRA_ARGS[*]}"
 fi
 echo "############################################################"
+
+# what a success means in this sweep, for the summary's note column
+HIT_LABEL="selective-hit"
+if (( VULN )); then
+    HIT_LABEL="insecure-hit"
+fi
 
 STATUS_GENS=()
 STATUS_CODES=()
@@ -234,16 +284,16 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     # "no result file written" for a run that succeeded
     if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
         run_method="none"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}.json"
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}_${SURROGATE_METHOD}_surrogate.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}_${SURROGATE_METHOD}_surrogate.json"
         label="generation $gen ($SURROGATE_METHOD surrogate, n = $((gen + 1)))"
     fi
     method_args=(-sm "$run_method")
     # named after the method that ran, so a --direct-gen0 log is not filed under "logit"
-    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}_${run_method}.log"
+    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}_${run_method}.log"
 
     echo
     echo "== $label =="
@@ -320,7 +370,7 @@ for (( i = 0; i < ${#STATUS_GENS[@]}; i++ )); do
     if [[ -n "$file" && -f "$file" ]]; then
         # the results file is written even when the capability gate stops the run
         read -r capability hits note < <(
-            "$PYTHON" - "$file" <<'PY'
+            "$PYTHON" - "$file" "$HIT_LABEL" <<'PY'
 import json, sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -330,7 +380,7 @@ probe = report.get("capability_probe") or {}
 solved, probed = len(probe.get("collapsed_solved") or []), probe.get("n_probed") or 0
 capability = f"{solved}/{probed}" if probed else "not-probed"
 hits = sum(len(r.get("successes") or []) for r in report.get("results") or [])
-note = "gate-aborted" if report.get("aborted") else ("selective-hit" if hits else "no-hit")
+note = "gate-aborted" if report.get("aborted") else (sys.argv[2] if hits else "no-hit")
 print(capability, hits, note)
 PY
         ) || { capability="?"; hits="?"; note="unreadable-result"; }
