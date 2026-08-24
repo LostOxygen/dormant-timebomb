@@ -4,6 +4,7 @@ CLAUDE.md
 
 # project stuff
 attack_results/
+collapse_logs/
 generated_datasets/
 model_outputs/
 venv/
