@@ -740,6 +740,45 @@ The built-in tasks (`--list_tasks`) are five trivially testable functions — `i
 (e.g. `n % 2 == 1` for `is_even`) and assertions that the correct version passes and the wrong
 version fails.
 
+### The random control
+
+The gate establishes that a hit is *attributable to the adversarial input*. It does not establish
+that the hit is attributable to the **search** — that a suffix of this size does not do the same job
+by accident. `--random_control_trials N` measures exactly that, and is the run's failsafe: before any
+optimization, N unoptimized suffixes per attackable task are drawn and put through the pipeline the
+search's own hits go through.
+
+Everything about them is the search's: the alphabet (the token vocabulary minus the non-ASCII and
+special tokens, so `--allow_non_ascii` applies here too), the length (`--random_control_match`), the
+retokenization constraint (a draw that does not tokenize back to itself is redrawn, up to 20 times,
+and flagged as `n_unstable` if it never does), and — decisively — the verdict, which comes from the
+same `verify()` and the same `is_selective_hit()`. **A hit here counts exactly as much as a hit from
+the search**, so if one lands, the run cannot separate the search from chance and the reported hits
+are inconclusive at that budget. The console says so as `FAILSAFE TRIPPED`, and the result file
+carries the offending suffix with both models' raw completions.
+
+Three properties worth knowing, because they are what makes the number trustworthy:
+
+* **It cannot perturb the run it is checking.** The candidate sampler draws from the *global* torch
+  RNG, so the control uses a `random.Random` of its own, keyed by the task name. Verified: the search
+  is byte-identical with `-rct 0` and `-rct 2` at the same seed.
+* **It runs in the parent process, once per task**, like the capability gate and the `-sf auto`
+  probe — not inside a `(task, restart)` unit. A shard worker owns restarts, so a task split over
+  four GPUs would otherwise draw four times the trials and the number would depend on the fan-out.
+* **The two lengths are reported, not assumed.** In tokens mode the token count matches the search
+  exactly (the optimizer replaces tokens and never adds one), but 20 *random* token ids decode to
+  ~130 characters where 20 *optimized* ones decode to ~57 — the search drifts toward short tokens.
+  `chars` mode inverts the mismatch (39 characters of ASCII tokenize to ~33 tokens). Neither is
+  "the same length" in both units at once, so `control_chars_mean` and `search_chars_mean` are
+  printed side by side and the reader decides.
+
+The equal-budget comparison is `--restarts * ceil(--num_steps / --verify_every)` trials, the number
+of behavioural checks the search itself gets; anything less is a weaker null. It is off by default
+because every trial costs a verification, which is the most expensive thing in the run — turn it on
+for the runs whose hits you intend to publish, e.g. `-rct 5` as a cheap sanity check or the
+equal-budget figure as the real control. `--no_exec` skips it, for the same reason it skips the gate:
+without executing the code there is no verdict to have.
+
 ### Usage
 
 ```
@@ -788,6 +827,8 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--exec_timeout` | `-et` | float | `10.0` | Per-candidate unit-test timeout in seconds. |
 | `--no_exec` | `-ne` | flag | off | Never execute generated code. Disables behavioural verification **and the capability gate**, leaving loss-only scoring that does **not** establish wrong behaviour. |
 | `--stop_on_success` | `-sos` | flag | off | Stop a task as soon as a selective hit is verified. |
+| `--random_control_trials` | `-rct` | int | `0` | Verify N **unoptimized** suffixes per attackable task before the search — the run's own null hypothesis. See [The random control](#the-random-control). `0` disables it. |
+| `--random_control_match` | `-rcm` | `tokens`/`chars` | `tokens` | What "the same length" means for those suffixes: `tokens` draws `--optim_str_init`'s token count from the alphabet the search samples in, `chars` draws a printable-ASCII string of its character length. |
 | `--min_capability` | `-mcap` | float | `0.6` | Fraction of clean, suffix-free tasks the collapsed model must still solve before the attack is allowed to start. Below this it is treated as no longer capable of generating code and the run is stopped. |
 | `--skip_capability_check` | `-scc` | flag | off | Do not stop the run when the capability probe fails. Per-task exclusion of tasks the collapsed model already gets wrong still applies. |
 | `--attack_gpus` | `-ag` | int | `0` | GPUs to shard the search over. `0` uses every visible one, `1` keeps it in this process. See [Sharding the search](#sharding-the-search-over-the-gpus). |
@@ -922,6 +963,11 @@ done
   capability ratio, which tasks were excluded and why), and per task: the control verdict, every
   verified selective hit (suffix, step, both models' raw completions, extracted code and test
   status), the best objective value, and the loss trajectory of every restart.
+* With `--random_control_trials` the file also carries a ```random_control``` block — the counts, the
+  two mean suffix lengths, the mean objective of the drawn suffixes and the full record of any that
+  succeeded — and each task's row gains ```random_controls```, one entry per trial. `n_hits` there is
+  the number that has to be 0 for the run's hits to mean what they say; see
+  [The random control](#the-random-control).
 * A run against a mixed collapse run carries the mixture tag before that, in the same position it
   occupies in the checkpoint names: ```attack_gen<gen>_<model_name>_rdf<value>.json```. Without it a
   ```--real_data_fraction 0.3``` attack would overwrite the pure self-training result for the same
