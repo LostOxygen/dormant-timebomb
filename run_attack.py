@@ -160,7 +160,7 @@ from utils.extrapolation import (
 )
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix, mixture_tag
+from utils.naming import factor_mode_tag, mixture_suffix, mixture_tag
 from utils.utils import (
     INIT_CHARS,
     clear_inherited_max_length,
@@ -1877,8 +1877,12 @@ def main(
     # generations and report the old mixture's numbers. Placed like the checkpoints' tag: after the
     # model name, before the trailing role component, and empty at -rdf 0 so existing files keep
     # their names
+    # The factor mode rides in the same component as the method, and only in transfer mode: with
+    # -sm none no surrogate is built and n is never used, so `-sf auto` there is a no-op that must
+    # not rename the direct attack's file. Only the *policy* is in the name, not the factor auto
+    # measured — the name is fixed here, before any model is loaded, and the probe runs much later
     result_suffix = mixture_tag(real_data_fraction) + (
-        f"_{surrogate_method}_surrogate" if transfer else ""
+        f"{factor_mode_tag(surrogate_factor)}_{surrogate_method}_surrogate" if transfer else ""
     )
     stem = f"attack_gen{collapsed_generation}_{specifier_name}{result_suffix}"
 
@@ -2486,8 +2490,9 @@ if __name__ == "__main__":
         "when the surrogate is reported as broken on every clean task — a proxy that already "
         "fails them satisfies the objective's 'collapsed must break' term before the search "
         "starts, and the suffix then optimizes against noise. 'calibrated' reads the factor "
-        "utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints' perplexity "
-        "(default: 0.0)",
+        "utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints' perplexity. "
+        "'auto' marks the result file with _nauto, so a measured-n run and a fixed-n one of the "
+        "same generation are separate work rather than one overwriting the other (default: 0.0)",
     )
     parser.add_argument(
         "--surrogate_model_path",

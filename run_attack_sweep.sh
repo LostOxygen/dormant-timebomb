@@ -102,6 +102,11 @@ and so does each mixture:
   ./run_attack_sweep.sh -n 9 -p ./runs/x -m none      # attack_gen{N}_{model}.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x -rdf 0.3     # attack_gen{N}_{model}_rdf0.3_logit_surrogate.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln       # attack_gen{N}_{model}_vuln_logit_surrogate.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x -- -sf auto  # attack_gen{N}_{model}_nauto_logit_surrogate.json
+
+A --surrogate_factor after -- is therefore not opaque to this script: `auto` measures n instead of
+taking it from the generation index, and the sweep tags the file names it looks for accordingly, so
+an auto sweep is separate work from a fixed-n one rather than overwriting it.
 EOF
 }
 
@@ -216,6 +221,31 @@ if (( VULN )); then
     fi
 fi
 
+# the third tag, and empty unless the passthrough carries --surrogate_factor auto. run_attack.py
+# marks an auto run's result file with it, so a sweep that let n be measured and one that took it
+# from the generation index do not overwrite each other and neither is read as the other's
+# "already done". Unlike -rdf and --vuln this is deliberately *not* a flag of its own: -sf has three
+# forms (a number, auto, calibrated) and restating them here is what would drift, so the value is
+# read back out of the passthrough and turned into the tag by utils.naming — the same function
+# run_attack.py names the file with. The last occurrence wins, matching argparse
+SURROGATE_FACTOR=""
+for (( i = 0; i < ${#EXTRA_ARGS[@]}; i++ )); do
+    case "${EXTRA_ARGS[i]}" in
+        -sf|--surrogate_factor)     SURROGATE_FACTOR="${EXTRA_ARGS[i+1]:-}" ;;
+        -sf=*|--surrogate_factor=*) SURROGATE_FACTOR="${EXTRA_ARGS[i]#*=}" ;;
+    esac
+done
+FACTOR_TAG=""
+if [[ -n "$SURROGATE_FACTOR" ]]; then
+    if ! FACTOR_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+            'import sys
+from utils.naming import factor_mode_tag
+print(factor_mode_tag(sys.argv[1]))' "$SURROGATE_FACTOR")"; then
+        echo "error: could not resolve the factor tag for --surrogate_factor $SURROGATE_FACTOR" >&2
+        exit 2
+    fi
+fi
+
 SPECIFIER_NAME="${MODEL_SPECIFIER##*/}"
 RESULTS_DIR="$PATH_ROOT/attack_results"
 LOG_DIR="$RESULTS_DIR/sweep_logs"
@@ -239,6 +269,9 @@ echo "##   block size   : $BLOCK_SIZE"
 echo "##   model        : $MODEL_SPECIFIER"
 echo "##   model size   : ${MODEL_SIZE:-outside the --model_size ladder}"
 echo "##   real data    : $REAL_DATA_FRACTION${MIXTURE_TAG:+  (result files tagged $MIXTURE_TAG)}"
+if [[ -n "$FACTOR_TAG" ]]; then
+    echo "##   factor       : measured (-sf $SURROGATE_FACTOR), files tagged $FACTOR_TAG"
+fi
 echo "##   path         : $PATH_ROOT"
 echo "##   logs         : $LOG_DIR"
 if (( ${#EXTRA_ARGS[@]} )); then
@@ -288,12 +321,22 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}_${SURROGATE_METHOD}_surrogate.json"
-        label="generation $gen ($SURROGATE_METHOD surrogate, n = $((gen + 1)))"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${FACTOR_TAG}_${SURROGATE_METHOD}_surrogate.json"
+        factor_label="n = $((gen + 1))"
+        if [[ -n "$FACTOR_TAG" ]]; then
+            factor_label="n measured, at most $((gen + 1))"
+        fi
+        label="generation $gen ($SURROGATE_METHOD surrogate, $factor_label)"
     fi
     method_args=(-sm "$run_method")
     # named after the method that ran, so a --direct-gen0 log is not filed under "logit"
-    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}_${run_method}.log"
+    # the factor tag only for a run that had a surrogate, matching the result file: a --direct-gen0
+    # generation inside an auto sweep measured no factor, so its log is not filed as if it had
+    log_tag=""
+    if [[ "$run_method" != "none" ]]; then
+        log_tag="$FACTOR_TAG"
+    fi
+    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${log_tag}_${run_method}.log"
 
     echo
     echo "== $label =="

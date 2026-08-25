@@ -43,7 +43,7 @@ import matplotlib.pyplot as plt
 
 from utils.colors import TColors
 from utils.models import add_model_arguments, resolve_model_specifier
-from utils.naming import mixture_tag
+from utils.naming import factor_mode_tag, mixture_tag
 
 # from the palette run_baseline.py plots with (Tableau's colorblind-safe ten). Verified for this
 # pair rather than assumed: OKLab dE is 37.9 at normal vision and 38.2 / 29.5 / 33.7 under
@@ -64,13 +64,22 @@ CAPABILITY_COLOR: str = "#595959"
 
 
 def result_file(
-    results_dir: str, generation: int, specifier_name: str, method: str, tag: str
+    results_dir: str,
+    generation: int,
+    specifier_name: str,
+    method: str,
+    tag: str,
+    factor_tag: str = "",
 ) -> str:
     """Rebuilds the name run_attack.py writes for one (generation, method) cell.
 
-    Kept in one place because the name carries four things that all have to line up — generation,
-    model short name, mixture and method — and a wrong guess here is a silently missing curve
-    rather than an error.
+    Kept in one place because the name carries five things that all have to line up — generation,
+    model short name, mixture, factor mode and method — and a wrong guess here is a silently missing
+    curve rather than an error.
+
+    The factor tag rides with the method for the same reason run_attack.py puts it there: it only
+    exists in transfer mode, so the direct attack's cell is named without it even when the sweep
+    beside it measured its factors.
 
     Args:
         results_dir (str): the attack_results directory to look in
@@ -78,11 +87,13 @@ def result_file(
         specifier_name (str): trailing component of the model specifier
         method (str): "none" for the direct attack, otherwise the surrogate method
         tag (str): the mixture tag, "" at --real_data_fraction 0
+        factor_tag (str): the factor mode tag, "_nauto" for a --surrogate_factor auto sweep and ""
+            for one that took n from the generation index
 
     Returns:
         str: the path the result file would have
     """
-    suffix = "" if method == "none" else f"_{method}_surrogate"
+    suffix = "" if method == "none" else f"{factor_tag}_{method}_surrogate"
     return os.path.join(
         results_dir, f"attack_gen{generation}_{specifier_name}{tag}{suffix}.json"
     )
@@ -133,6 +144,7 @@ def collect(
     specifier_name: str,
     methods: list[str],
     tag: str,
+    factor_tag: str = "",
 ) -> dict[str, dict[int, dict]]:
     """Reads every (method, generation) cell that exists on disk.
 
@@ -142,6 +154,7 @@ def collect(
         specifier_name (str): trailing component of the model specifier
         methods (list[str]): "none" plus the surrogate methods to plot
         tag (str): the mixture tag
+        factor_tag (str): the factor mode tag, "_nauto" for an auto sweep's surrogate cells
 
     Returns:
         dict: method -> generation -> the dict read_cell returned
@@ -150,7 +163,9 @@ def collect(
     for method in methods:
         for generation in generations:
             cell = read_cell(
-                result_file(results_dir, generation, specifier_name, method, tag)
+                result_file(
+                    results_dir, generation, specifier_name, method, tag, factor_tag
+                )
             )
             if cell is not None:
                 cells[method][generation] = cell
@@ -448,6 +463,7 @@ def main(
     model_specifier: str = "",
     methods: str = "logit",
     real_data_fraction: float = 0.0,
+    surrogate_factor: str = "",
     no_usetex: bool = False,
 ) -> None:
     """Reads the attack results of one run and plots the success rates over its generations.
@@ -461,6 +477,9 @@ def main(
         model_specifier (str): the model the run attacked; its short name is in every result name
         methods (str): comma separated surrogate methods to plot against the direct attack
         real_data_fraction (float): the mixture the run used, part of the result file names
+        surrogate_factor (str): the --surrogate_factor the sweep passed to run_attack.py. Only its
+            *mode* matters here: "auto" results are filed under their own names, every other form
+            under the plain ones
         no_usetex (bool): render without LaTeX, for a machine with no TeX install
 
     Returns:
@@ -473,6 +492,7 @@ def main(
     specifier_name = specifier.split("/")[-1]
     results_dir = os.path.join(path, "attack_results")
     tag = mixture_tag(real_data_fraction)
+    factor_tag = factor_mode_tag(surrogate_factor)
     generations = range(start_generation, num_generations + 1)
 
     selected = ["none"] + [m.strip() for m in methods.split(",") if m.strip()]
@@ -489,14 +509,17 @@ def main(
     )
     print(f"##   results: {results_dir}")
     print(f"##   model:   {specifier_name}{tag or '  (no data mixture)'}")
+    if factor_tag:
+        print(f"##   factor:  measured per generation (files tagged {factor_tag})")
 
-    cells = collect(results_dir, generations, specifier_name, selected, tag)
+    cells = collect(results_dir, generations, specifier_name, selected, tag, factor_tag)
     if not any(cells.values()):
         raise SystemExit(
             f"no result files under {results_dir} matched "
-            f"attack_gen<{start_generation}..{num_generations}>_{specifier_name}{tag}*.json — "
-            f"check --path, --model_size/--model_specifier and --real_data_fraction (the mixture "
-            f"is part of the name)"
+            f"attack_gen<{start_generation}..{num_generations}>_{specifier_name}{tag}"
+            f"{factor_tag}*.json — check --path, --model_size/--model_specifier, "
+            f"--real_data_fraction (the mixture is part of the name) and --surrogate_factor (an "
+            f"'auto' sweep's surrogate files carry a _nauto marker)"
         )
 
     warn_on_disagreement(cells)
@@ -517,16 +540,19 @@ def main(
     mixture = "no data mixture" if real_data_fraction <= 0 else (
         f"real data fraction {real_data_fraction:g}"
     )
+    # the two curves were searched against different proxies depending on this, so it belongs
+    # beside the mixture rather than only in the file name
+    factor_note = ", measured factor" if factor_tag else ""
     # plots/ sits outside --path, exactly like the perplexity figures, so everything that
     # distinguishes two runs has to be in the file name
-    stem = f"plots/attack_hits_bs{block_size}_{specifier_name}{tag}"
+    stem = f"plots/attack_hits_bs{block_size}_{specifier_name}{tag}{factor_tag}"
     # no underscores in the title either: usetex renders it
     label = specifier_name.replace("_", " ")
     plot(
         cells,
         generations,
         plot_stem=stem,
-        title=f"Adversarial inputs found per generation\n({label}, {mixture})",
+        title=f"Adversarial inputs found per generation\n({label}, {mixture}{factor_note})",
     )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Saved the figure under: "
@@ -582,6 +608,15 @@ if __name__ == "__main__":
         default=0.0,
         help="the --real_data_fraction the collapse run used. Part of the result file names, so "
         "a mixed run needs it here to be found at all (default: 0.0)",
+    )
+    parser.add_argument(
+        "--surrogate_factor",
+        "-sf",
+        type=str,
+        default="",
+        help="the --surrogate_factor the sweep ran with. Only its mode is used: 'auto' looks for "
+        "the _nauto marked result files run_attack.py writes when it measured n instead of taking "
+        "it from the generation index, anything else for the plain names (default: '')",
     )
     parser.add_argument(
         "--no_usetex",

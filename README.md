@@ -930,7 +930,17 @@ done
   result files keep their names.
 * In transfer mode the file is suffixed with the method
   (```attack_gen<gen>_<model_name>_<method>_surrogate.json```) so the direct and surrogate runs of the
-  same generation do not overwrite each other. It additionally carries the
+  same generation do not overwrite each other. `--surrogate_factor auto` adds `_nauto` in front of
+  that (```attack_gen<gen>_<model_name>_nauto_<method>_surrogate.json```), for the same reason the
+  mixture tag exists: a run whose n was *measured* is a different measurement from one that took
+  `n = g + 1` off the generation index, and without the marker the second would overwrite the first
+  and `run_attack_sweep.sh` would read either as the other's "already done". The marker records the
+  *policy* only — the name is fixed before any model loads, while the probe runs much later — and
+  the chosen value is in the file, as ```surrogate_factor``` with the full ladder under
+  ```surrogate_factor_probe```. It appears in transfer mode only, since `-sm none` builds no
+  surrogate and uses no factor; `utils/plot_attack_hits.py -sf auto` and the sweep's `-- -sf auto`
+  passthrough both look for the marked names, and `calibrated` is deliberately left untagged so the
+  results already on disk keep their names. It additionally carries the
   ```surrogate_quality``` block (agreement, precision, recall, the raw counts and a per-task
   breakdown), the surrogate's description and factor, and per task a ```verifications``` list of
   every verdict plus ```surrogate_false_alarms``` — the suffixes that broke the surrogate but not
