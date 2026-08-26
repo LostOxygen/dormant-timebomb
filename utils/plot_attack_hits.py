@@ -87,8 +87,8 @@ def result_file(
         specifier_name (str): trailing component of the model specifier
         method (str): "none" for the direct attack, otherwise the surrogate method
         tag (str): the mixture tag, "" at --real_data_fraction 0
-        factor_tag (str): the factor mode tag, "_nauto" for a --surrogate_factor auto sweep and ""
-            for one that took n from the generation index
+        factor_tag (str): the factor rule's tag — "_nauto", "_ncal" or "_n<value>" — and "" for a
+            sweep that took n from the generation index
 
     Returns:
         str: the path the result file would have
@@ -154,7 +154,7 @@ def collect(
         specifier_name (str): trailing component of the model specifier
         methods (list[str]): "none" plus the surrogate methods to plot
         tag (str): the mixture tag
-        factor_tag (str): the factor mode tag, "_nauto" for an auto sweep's surrogate cells
+        factor_tag (str): the factor rule's tag, on the surrogate cells only
 
     Returns:
         dict: method -> generation -> the dict read_cell returned
@@ -519,7 +519,7 @@ def main(
             f"attack_gen<{start_generation}..{num_generations}>_{specifier_name}{tag}"
             f"{factor_tag}*.json — check --path, --model_size/--model_specifier, "
             f"--real_data_fraction (the mixture is part of the name) and --surrogate_factor (an "
-            f"'auto' sweep's surrogate files carry a _nauto marker)"
+            f"sweep under any rule other than n = g + 1 marks its surrogate files)"
         )
 
     warn_on_disagreement(cells)
@@ -614,9 +614,9 @@ if __name__ == "__main__":
         "-sf",
         type=str,
         default="",
-        help="the --surrogate_factor the sweep ran with. Only its mode is used: 'auto' looks for "
-        "the _nauto marked result files run_attack.py writes when it measured n instead of taking "
-        "it from the generation index, anything else for the plain names (default: '')",
+        help="the --surrogate_factor the sweep ran with. Only the *rule* is used, to rebuild the "
+        "marker run_attack.py put in the name: 'auto' -> _nauto, 'calibrated' -> _ncal, a number "
+        "-> _n<value>, and the default n = g + 1 -> no marker (default: '')",
     )
     parser.add_argument(
         "--no_usetex",

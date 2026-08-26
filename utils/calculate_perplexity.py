@@ -22,6 +22,8 @@ Args:
     shard_id (int): The current shard id.
     num_shards (int): The total number of shards (i.e., the number of used GPUs).
     dataset_suffix (str): Suffix of the dataset file names ("_ex" for the extrapolation runs).
+    factor_tag (str): Tag of the extrapolation factor rule the corpora were generated under
+        ("_ncal", "_n2.5", ... — empty for the n = generation + 1 rule).
     load_in_4bit (bool): Quantize the scoring model. Off by default, see the model load below.
     path (str): The path where the datasets and models are stored.
 
@@ -110,6 +112,16 @@ parser.add_argument(
     help="suffix of the dataset file names ('_ex' for the extrapolation runs)",
 )
 parser.add_argument(
+    "--factor_tag",
+    "-ft",
+    type=str,
+    default="",
+    help="tag of the extrapolation factor rule the corpora were generated under, from "
+    "utils.naming.factor_mode_tag. Composes with --dataset_suffix, and applies only to the "
+    "*generated* corpora: the human corpus of generation 0 is the same under every factor "
+    "(default: '')",
+)
+parser.add_argument(
     "--real_data_fraction",
     "-rdf",
     type=float,
@@ -145,6 +157,7 @@ num_generations = args.num_generations
 shard_id = args.shard_id
 num_shards = args.num_shards
 dataset_suffix = args.dataset_suffix
+factor_tag = args.factor_tag
 real_data_fraction = args.real_data_fraction
 load_in_4bit = args.load_in_4bit
 path = args.path
@@ -220,6 +233,7 @@ for i in range(num_generations):
         ppl_dataset = Dataset.load_from_disk(
             DATASET_PATH
             + f"/generated_dataset_{i - 1}_bs{block_size}_{specifier_name}{dataset_suffix}"
+            + factor_tag
             + mixture_suffix(real_data_fraction, i - 1)
         )
 
@@ -280,6 +294,7 @@ torch.save(
     perplexity_dict,
     DATASET_PATH
     + f"perplexity_dict_bs{block_size}_{specifier_name}{dataset_suffix}"
+    + factor_tag
     + mixture_tag(real_data_fraction)
     + f"_shard{shard_id}.pt",
 )

@@ -103,10 +103,11 @@ and so does each mixture:
   ./run_attack_sweep.sh -n 9 -p ./runs/x -rdf 0.3     # attack_gen{N}_{model}_rdf0.3_logit_surrogate.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln       # attack_gen{N}_{model}_vuln_logit_surrogate.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x -- -sf auto  # attack_gen{N}_{model}_nauto_logit_surrogate.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x -- -sf calibrated  # ..._ncal_logit_surrogate.json
 
-A --surrogate_factor after -- is therefore not opaque to this script: `auto` measures n instead of
-taking it from the generation index, and the sweep tags the file names it looks for accordingly, so
-an auto sweep is separate work from a fixed-n one rather than overwriting it.
+A --surrogate_factor after -- is therefore not opaque to this script: any rule other than the
+default n = g + 1 marks the result files, and the sweep tags the names it looks for accordingly, so
+two rules' sweeps are separate work rather than one overwriting the other.
 EOF
 }
 
@@ -221,9 +222,9 @@ if (( VULN )); then
     fi
 fi
 
-# the third tag, and empty unless the passthrough carries --surrogate_factor auto. run_attack.py
-# marks an auto run's result file with it, so a sweep that let n be measured and one that took it
-# from the generation index do not overwrite each other and neither is read as the other's
+# the third tag, and empty unless the passthrough carries a --surrogate_factor other than the
+# default. run_attack.py marks such a run's result file with the rule that chose n, so two rules'
+# sweeps of the same generations do not overwrite each other and neither is read as the other's
 # "already done". Unlike -rdf and --vuln this is deliberately *not* a flag of its own: -sf has three
 # forms (a number, auto, calibrated) and restating them here is what would drift, so the value is
 # read back out of the passthrough and turned into the tag by utils.naming — the same function
@@ -270,7 +271,7 @@ echo "##   model        : $MODEL_SPECIFIER"
 echo "##   model size   : ${MODEL_SIZE:-outside the --model_size ladder}"
 echo "##   real data    : $REAL_DATA_FRACTION${MIXTURE_TAG:+  (result files tagged $MIXTURE_TAG)}"
 if [[ -n "$FACTOR_TAG" ]]; then
-    echo "##   factor       : measured (-sf $SURROGATE_FACTOR), files tagged $FACTOR_TAG"
+    echo "##   factor       : -sf $SURROGATE_FACTOR, files tagged $FACTOR_TAG"
 fi
 echo "##   path         : $PATH_ROOT"
 echo "##   logs         : $LOG_DIR"
@@ -324,7 +325,7 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
         result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${FACTOR_TAG}_${SURROGATE_METHOD}_surrogate.json"
         factor_label="n = $((gen + 1))"
         if [[ -n "$FACTOR_TAG" ]]; then
-            factor_label="n measured, at most $((gen + 1))"
+            factor_label="n from -sf $SURROGATE_FACTOR, at most $((gen + 1))"
         fi
         label="generation $gen ($SURROGATE_METHOD surrogate, $factor_label)"
     fi

@@ -234,6 +234,23 @@ parser.add_argument(
     help="the calibrated p_1 of the data-space surrogate, required by the 'data' method",
 )
 parser.add_argument(
+    "--surrogate_factor",
+    "-sf",
+    type=float,
+    default=0.0,
+    help="the extrapolation factor n for this generation, already resolved by "
+    "run_extrapolation.py. 0.0 falls back to the indexing rule n = generation + 1",
+)
+parser.add_argument(
+    "--factor_tag",
+    "-ft",
+    type=str,
+    default="",
+    help="artifact-name tag of the factor rule the orchestrator resolved (utils.naming."
+    "factor_mode_tag), e.g. '_ncal'. Composes with --method's suffix rather than replacing it: "
+    "the human-corpus shard this worker *reads* is untagged, the corpus it *writes* is not",
+)
+parser.add_argument(
     "--temperature",
     "-tp",
     type=float,
@@ -311,8 +328,15 @@ mix = mixture_suffix(real_data_fraction, generation)
 # produced by model_g, and model_0 is a single fine-tuning step away from the base model, so
 # model_g sits g + 1 steps out. With a factor of g instead, generation 0 would be a plain copy
 # of the base model and generation 1 a plain copy of the collapsed model, i.e. the first two
-# datasets would be the two anchors rather than approximations
-generation_n = generation + 1
+# datasets would be the two anchors rather than approximations.
+#
+# --surrogate_factor replaces that rule with a number the orchestrator resolved — from a
+# calibration or from its own command line. It arrives already resolved rather than as a policy
+# because only one process should read the calibration file, and because the "lora" method needs
+# the same value to have been used for the adapter build, which happens there too. The tag that
+# keeps the two rules' corpora apart is passed alongside it
+generation_n = args.surrogate_factor if args.surrogate_factor > 0 else generation + 1
+factor_tag = args.factor_tag
 
 # set data paths
 if path != "":
@@ -324,7 +348,8 @@ if path != "":
 
 print(
     f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation}{TColors.ENDC} "
-    f"(method: {method}, n = {generation_n})"
+    f"(method: {method}, n = {generation_n:g}"
+    + (f", {factor_tag[1:]})" if factor_tag else ", from the generation index)")
 )
 
 # max_seq_length has to hold the prompt *plus* the generated response, while --block_size caps only
@@ -550,5 +575,6 @@ new_dataset = Dataset.from_dict(
 
 new_dataset.save_to_disk(
     DATASET_PATH
-    + f"subdataset_{generation}_bs{block_size}_{specifier_name}{suffix}{mix}_shard{shard_id}"
+    + f"subdataset_{generation}_bs{block_size}_{specifier_name}{suffix}{factor_tag}{mix}"
+    + f"_shard{shard_id}"
 )

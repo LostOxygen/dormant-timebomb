@@ -84,31 +84,53 @@ def mixture_suffix(real_data_fraction: float, generation: int) -> str:
 
 
 def factor_mode_tag(surrogate_factor: float | str) -> str:
-    """Artifact-name suffix for run_attack.py's ``--surrogate_factor auto``.
+    """Artifact-name tag for a --surrogate_factor that is not the g + 1 indexing rule.
 
-    The attack result name carries the surrogate *method* but not its factor, and it cannot carry
-    the measured value: the name is resolved before a single model is loaded, while ``auto`` only
-    knows which rung it settled on after the probe has run. What the name can carry is the
-    *policy* — that n was measured rather than read off the generation index — and that is enough
-    to keep the two runs apart, since the measured value itself is inside the file, as
-    ``surrogate_factor`` with the whole ladder under ``surrogate_factor_probe``.
+    Both stages that build an extrapolated surrogate default to ``n = generation + 1``, and both
+    accept a --surrogate_factor that replaces it. What the replacement produces is a *different
+    artifact under the same name*: a different result file in run_attack.py, and different corpora,
+    perplexity cache and figure in run_extrapolation.py. So the name has to say which rule produced
+    it, or the second run silently overwrites the first — and run_attack_sweep.sh, which reads a
+    file's existence as "already done", would then report the first one's numbers for a sweep that
+    never ran.
 
-    Without it an ``auto`` run and a default ``n = g + 1`` run of the same generation, mixture and
-    method write the same json and the second silently replaces the first — and run_attack_sweep.sh
-    reads a file's existence as "already done", so an auto sweep over a directory that already
-    holds a fixed-n sweep would re-report the old factors' numbers for every generation without
-    running anything.
+    Empty for the indexing rule itself, which is what keeps every artifact already on disk readable
+    under the name it has. The other three:
 
-    Empty for every other form of the flag, so fixed-n and ``calibrated`` results keep exactly the
-    names they have. ``calibrated`` collides with fixed-n in the same way, but its factor is a
-    property of the run's own calibration file rather than of the attack invocation, and tagging it
-    now would orphan the results already on disk.
+    * ``"auto"`` -> ``_nauto``. run_attack.py only: the factor is *measured* per run, so the value
+      is not known when the name is resolved (the name is fixed before a model is loaded, the probe
+      runs much later). The tag therefore records the policy and the chosen value goes inside the
+      file, as ``surrogate_factor`` with the whole ladder under ``surrogate_factor_probe``.
+    * ``"calibrated"`` -> ``_ncal``. The value comes from the run's own calibration file, so it is
+      a property of that file rather than of the command line, and tagging it by value would make
+      the name change when the calibration is refitted.
+    * a number -> ``_n{value}``. Tagged by value, which is what makes a *factor sweep* at one
+      generation possible: each n gets its own artifacts instead of overwriting the last one's.
+
+    Note that an explicit number equal to what the rule would have produced (``-sf 2`` at
+    generation 1) still tags, and that is deliberate: the tag records how the factor was chosen,
+    not what it came out as, and a run-level tag cannot express "equals the rule" when the rule is
+    per generation — which it is in run_extrapolation.py, where one figure spans every generation.
 
     Args:
-        surrogate_factor (float | str): the --surrogate_factor the run was given, in the form
-            run_attack.surrogate_factor_arg parses it into: a float, "auto" or "calibrated"
+        surrogate_factor (float | str): the --surrogate_factor the run was given, in the form its
+            argparse type produced: a float, "auto" (run_attack.py only) or "calibrated"
 
     Returns:
-        str: "_nauto" for "auto", "" for anything else
+        str: "" for the indexing rule, otherwise "_nauto", "_ncal" or "_n{value}"
     """
-    return "_nauto" if str(surrogate_factor).strip().lower() == "auto" else ""
+    if isinstance(surrogate_factor, str):
+        token = surrogate_factor.strip().lower()
+        if token == "auto":
+            return "_nauto"
+        if token == "calibrated":
+            return "_ncal"
+        try:
+            value = float(token)
+        except ValueError:
+            # not a form this understands; naming is not the place to reject it, the argparse type
+            # of the script that took the flag already did
+            return ""
+    else:
+        value = float(surrogate_factor)
+    return "" if value <= 0 else f"_n{value:g}"

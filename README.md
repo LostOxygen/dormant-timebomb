@@ -456,6 +456,38 @@ and the way to answer it is to run the real recursion out to generation 3, build
 approximation from generations 0-1, and check which one predicts generation 3 — on perplexity and,
 more to the point, on attack transfer.
 
+### Choosing `n` in this step (`--surrogate_factor`)
+
+`n = g + 1` is an *indexing* convention: `model_0` is one fine-tuning step from the base model, so
+`model_g` sits `g + 1` steps out and the surrogate for generation `g` is tilted that far. It names
+the generation being approximated and is calibrated against nothing — measured on this repo's 0.5b
+run, the tilt's test perplexity rises ~10x per unit of `n` where the real collapse rises 4.2x over
+ten generations.
+
+`--surrogate_factor calibrated` replaces the rule with
+`generated_datasets/surrogate_factor_bs<bs>_<model>.json`, the factors
+`utils/evaluate_perplexity.py --calibrate` fitted by matching each real checkpoint's perplexity
+(measured where checkpoints exist, predicted by the fitted law `n = 1 + scale * ln(1 + g)` where
+they do not). On this run's calibration that is `n(0) = 1.03, n(1) = 1.65, … n(9) = 2.97` instead of
+`1 … 10` — a different experiment, and the point of the flag: it is what makes step 2's corpora and
+step 3's `-sf calibrated` surrogate the same approximation of the same generation.
+
+A single explicit number is accepted only for a run covering one generation, because one factor
+shared by every generation builds the *same* surrogate every time — the histograms would then differ
+only by sampling noise and the collapse curve would be flat by construction. Run `-cfg N -ng N+1`
+for a deliberate one-off, e.g. a factor sweep at a fixed generation.
+
+Any rule other than the default carries its tag into every artifact this step writes — `_ncal` for
+the calibration, `_n<value>` for an explicit number — because the factor decides what those
+artifacts *contain*: without the tag a calibrated run overwrites the default run's
+`generated_dataset_<g>`, its perplexity cache and its figure, and `-ho` replots whichever happened
+to be on disk. The tag sits between the method suffix and the mixture (`_ex_ncal_rdf0.3`): method
+and factor identify the surrogate, the mixture identifies the baseline run it is filed against.
+
+One cross-stage gap to know about: `utils/evaluate_perplexity.py` builds the `logit` tilt and the
+`model_scaled_n<n>` name at `n = g + 1` itself, so under `--method lora` it will not find an adapter
+this step built at a calibrated factor. The run prints a warning when that combination happens.
+
 **Prerequisite:** ```run_baseline.py``` must have been run first with the *same*
 ```--block_size```, ```--model_specifier``` and ```--path```, because this step reads
 ```model_outputs/model_0_bs<block_size>_<model_name>``` as the collapsed model and the
@@ -471,7 +503,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
                             [-bs BLOCK_SIZE] [-ho] [-msz MODEL_SIZE]
                        [-ms MODEL_SPECIFIER]
                             [-cfg CONTINUE_FROM_GENERATION] [-m METHOD]
-                            [-stp SURROGATE_TOP_P] [-dsz DATASET_SIZE]
+                            [-sf SURROGATE_FACTOR] [-stp SURROGATE_TOP_P] [-dsz DATASET_SIZE]
                             [-rdf REAL_DATA_FRACTION] [-p PATH]
 ```
 
@@ -479,9 +511,10 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | --- | --- | --- | --- | --- |
 | `--device` | `-dx` | str | `cpu` | Device to run on (`cpu`, `cuda`, `cuda:1`, `mps`). Use `cuda`. |
 | `--method` | `-m` | str | `logit` | Which approximation to use: `logit`, `lora` or `data`. See above. |
+| `--surrogate_factor` | `-sf` | float / `calibrated` | `0.0` | The factor `n` each generation's surrogate stands for. `0.0` keeps the indexing rule `n = g + 1`; `calibrated` reads the factors `utils/evaluate_perplexity.py --calibrate` fitted against the real checkpoints, so this step approximates the same generation `run_attack.py -sf calibrated` attacks; a number is accepted for a **single-generation** run only (`-cfg N -ng N+1`), since one factor for every generation builds the same surrogate every time. `auto` is rejected — it is a run_attack.py mode that needs executable tasks. Any rule other than the default tags this run's corpora, cache and figure. |
 | `--surrogate_top_p` | `-stp` | float | `0.0` | `p_1` of the data-space surrogate. `0.0` reads the fitted value from `calibrate_surrogate.py`; passing it explicitly skips the calibration and marks the run uncalibrated (`data` only). |
 | `--dataset_batch_size` | `-dbs` | int | `150` | Batch size for the generation. Keep this lower than in step 1 for `--method logit`, where two models are resident and the logits processor keeps a second KV cache; `lora` and `data` need only one model and tolerate more. |
-| `--num_generations` | `-ng` | int | `10` | Number of generations. Generation `g` uses the factor `g + 1`, so the largest factor is `num_generations`. |
+| `--num_generations` | `-ng` | int | `10` | Number of generations. Generation `g` uses the factor `g + 1` by default, so the largest factor is `num_generations` — unless `--surrogate_factor` replaces that rule. |
 | `--block_size` | `-bs` | int | `512` | Max sequence length and `max_new_tokens` for generation. Exactly the value you pass, like in step 1. Must match the value used by `run_baseline.py`. |
 | `--histogram_only` | `-ho` | flag | off | Re-plot from the saved `perplexity_dict_*.pt` / `all_perplexities_*.pt` of the selected method. |
 | `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder (`0.5b` … `32b`), shorthand for `--model_specifier`; must resolve to the model of step 1, whose `model_0` this step reads. |
@@ -563,13 +596,16 @@ done
 
 ### Outputs
 
-With `<sfx>` being `_ex` for `--method logit`, `_ex_lora` for `lora` and `_ex_data` for `data`:
+With `<sfx>` being `_ex` for `--method logit`, `_ex_lora` for `lora` and `_ex_data` for `data`,
+followed by the factor tag when `--surrogate_factor` replaced the `n = g + 1` rule (`_ncal`,
+`_n<value>` — see [Choosing `n` in this step](#choosing-n-in-this-step---surrogate_factor)) and then
+by `_rdf<value>` when `--real_data_fraction` is set:
 
 * ```<path>/generated_datasets/generated_dataset_<gen>_bs<block_size>_<model_name><sfx>/``` — dataset of generation `<gen>`
 * ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name><sfx>.pt``` and ```all_perplexities_bs<block_size>_<model_name><sfx>.pt```
 * ```plots/perplexity_histogram_bs<block_size>_<model_name><sfx>.{png,pdf}``` — same two panels as stage 1's
 * ```<path>/generated_datasets/surrogate_top_p_bs<block_size>_<model_name>.json``` — the fitted `p_1` and the full grid (`calibrate_surrogate.py`)
-* ```<path>/model_outputs/model_scaled_n<n>_bs<block_size>_<model_name>/``` — the alpha-scaled adapters (`--method lora` only). These *are* loadable models, so ```run_attack.py``` can be pointed at them directly
+* ```<path>/model_outputs/model_scaled_n<n>_bs<block_size>_<model_name>/``` — the alpha-scaled adapters (`--method lora` only), one per distinct factor: `<n>` is `<gen>+1` under the default rule and the calibrated (or explicit) factor otherwise. These *are* loadable models, so ```run_attack.py``` can be pointed at them directly
 
 Apart from the scaled adapters no new checkpoints are written — comparing a method's histogram
 against the baseline one shows how closely that approximation reproduces real collapse.

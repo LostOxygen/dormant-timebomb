@@ -2942,8 +2942,9 @@ if __name__ == "__main__":
         "fails them satisfies the objective's 'collapsed must break' term before the search "
         "starts, and the suffix then optimizes against noise. 'calibrated' reads the factor "
         "utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints' perplexity. "
-        "'auto' marks the result file with _nauto, so a measured-n run and a fixed-n one of the "
-        "same generation are separate work rather than one overwriting the other (default: 0.0)",
+        "Anything other than the default marks the result file with the rule that chose n "
+        "(_nauto, _ncal, _n<value>), so two rules' runs of the same generation are separate work "
+        "rather than one overwriting the other (default: 0.0)",
     )
     parser.add_argument(
         "--surrogate_model_path",

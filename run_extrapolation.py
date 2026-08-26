@@ -39,13 +39,15 @@ from utils.colors import TColors
 from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix, mixture_tag
+from utils.naming import factor_mode_tag, mixture_suffix, mixture_tag
 from utils.extrapolation import (
     METHODS,
     METHOD_LABELS,
     build_scaled_adapter,
+    calibrated_factor,
     calibration_file,
     dataset_suffix,
+    factor_calibration_file,
 )
 
 DATASET_SPECIFIER: str = "bigcode/self-oss-instruct-sc2-exec-filter-50k"
@@ -54,6 +56,42 @@ DATASET_PATH: str = "./generated_datasets/"
 EOS_TOKEN: str = None  # will be overwritten by the tokenizer
 MAX_TOKEN_LENGTH: Final[int] = None  # will be overwritten
 TOKENIZER = None  # will be overwritten
+
+
+def surrogate_factor_arg(value: str) -> float | str:
+    """argparse type for --surrogate_factor: a number, or the literal "calibrated".
+
+    Deliberately narrower than run_attack.py's version of this flag, which also takes "auto".
+    That mode probes the surrogate on the attack's clean coding tasks and keeps the largest factor
+    it still solves them at — there are no tasks here and nothing to execute, so the question it
+    answers cannot be asked in this stage. The perplexity-side equivalent *is* "calibrated": the
+    factor that reproduces each real checkpoint's perplexity, which is exactly what this stage's
+    own --calibrate output measures.
+
+    Args:
+        value (str): the raw command line token
+
+    Returns:
+        float | str: the parsed factor, or "calibrated"
+
+    Raises:
+        argparse.ArgumentTypeError: neither a number nor "calibrated"
+    """
+    token = value.strip().lower()
+    if token == "calibrated":
+        return token
+    if token == "auto":
+        raise argparse.ArgumentTypeError(
+            "--surrogate_factor auto is a run_attack.py mode: it picks the largest factor whose "
+            "surrogate still solves the clean attack tasks, and this stage executes no code. Use "
+            "'calibrated' for the perplexity-side equivalent, or pass a number."
+        )
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--surrogate_factor takes a number or 'calibrated', not {value!r}"
+        ) from exc
 
 
 def format_prompt(examples: dict) -> dict:
@@ -106,6 +144,7 @@ def main(
     model_size: str = "",
     continue_from_generation: int = 0,
     method: str = "logit",
+    surrogate_factor: float | str = 0.0,
     surrogate_top_p: float = 0.0,
     dataset_size: int = 0,
     real_data_fraction: float = 0.0,
@@ -139,6 +178,11 @@ def main(
             upstream 50k dataset. Must match between run_baseline.py and run_extrapolation.py
         method (str): which approximation of the later generations to use, see
             utils/extrapolation.py ("logit", "lora" or "data")
+        surrogate_factor (float | str): the extrapolation factor n each generation's surrogate
+            stands for. 0.0 keeps the indexing rule n = generation + 1, "calibrated" reads the
+            factors utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints,
+            and an explicit number is accepted for a single-generation run only — one factor for
+            every generation would make every generation the same surrogate
         surrogate_top_p (float): p_1 of the data-space surrogate. 0.0 reads it from the
             calibration that calibrate_surrogate.py wrote
         real_data_fraction (float): the --real_data_fraction of the run_baseline.py run this
@@ -184,9 +228,31 @@ def main(
     # fraction. The per-generation datasets below are named with mixture_suffix() instead, which
     # returns "" for generation 0 for the same reason; see utils/naming.py
     data_suffix = mixture_tag(real_data_fraction)
+    # the factor rule's tag, and the reason it exists: --surrogate_factor changes what every
+    # corpus this stage generates *contains*, so a calibrated run and a default one would
+    # otherwise write the same generated_dataset_{g}, the same perplexity cache and the same
+    # figure — and -ho would replot whichever of them happened to be on disk. Empty for the
+    # n = g + 1 rule, so an existing run keeps exactly the names it has
+    factor_tag = factor_mode_tag(surrogate_factor)
     # what the run-level artifacts are named by: the method this run approximates with, then the
-    # mixture it is filed against
-    run_suffix = f"{suffix}{data_suffix}"
+    # factor rule it approximates under, then the mixture it is filed against. The method and the
+    # factor identify the surrogate; the mixture identifies the baseline run it is compared to
+    run_suffix = f"{suffix}{factor_tag}{data_suffix}"
+
+    # a single number cannot index a *sweep*: every generation would build the same surrogate, so
+    # the corpora would differ only by sampling noise and the collapse curve would be flat by
+    # construction. The generations this run covers are range(continue_from_generation,
+    # num_generations), so one of them is the case where a fixed n is a meaningful thing to ask for
+    covered = range(continue_from_generation, num_generations)
+    if not isinstance(surrogate_factor, str) and float(surrogate_factor) > 0 and len(covered) > 1:
+        raise SystemExit(
+            f"--surrogate_factor {surrogate_factor:g} is a single factor, but this run covers "
+            f"generations {covered.start}..{covered.stop - 1}. One factor for every generation "
+            f"builds the same surrogate {len(covered)} times, so the histograms would differ only "
+            f"by sampling noise.\nRun one generation at a time (e.g. -cfg {covered.start} -ng "
+            f"{covered.start + 1}), or use --surrogate_factor calibrated, which resolves a factor "
+            f"per generation."
+        )
 
     # ──────────────────────────── set devices and print informations ─────────────────────────
     # set the devices correctly
@@ -413,6 +479,53 @@ def main(
             f"## {TColors.OKBLUE}{TColors.BOLD}Surrogate p_1{TColors.ENDC}: {surrogate_p1} "
             f"{TColors.WARNING}(given on the command line, not calibrated){TColors.ENDC}"
         )
+    # ── resolve the extrapolation factor of every generation ──
+    # The default is the indexing rule n = g + 1, which names the generation being approximated but
+    # is not calibrated against anything: measured on this repo's 0.5b run the tilt's perplexity
+    # rises ~10x per unit of n where the real collapse rises 4.2x over ten generations. The
+    # calibration is the answer to that — the factor that actually reproduces each checkpoint,
+    # measured where checkpoints exist and predicted by the fitted law where they do not — and it
+    # is read here, once, rather than in the shard workers: they would all read the same file, and
+    # the "lora" adapter has to be built from the same number the workers tilt with
+    factor_calibration = None
+    if surrogate_factor == "calibrated":
+        factor_path = factor_calibration_file(
+            DATASET_PATH, block_size, specifier_name, data_suffix
+        )
+        if not os.path.isfile(factor_path):
+            raise SystemExit(
+                f"{TColors.FAIL}--surrogate_factor calibrated needs a calibration{TColors.ENDC} "
+                f"and {factor_path} does not exist. Produce it with:\n"
+                f"  python -m utils.evaluate_perplexity -p {path or '.'} -bs {block_size} "
+                f"-ng {num_generations} --calibrate"
+            )
+        with open(factor_path, "r", encoding="utf-8") as factor_handle:
+            factor_calibration = json.load(factor_handle)
+
+    def factor_of(gen_id: int) -> float:
+        """The factor generation `gen_id`'s surrogate is built at, under this run's rule."""
+        if factor_calibration is not None:
+            return calibrated_factor(factor_calibration, gen_id)
+        if not isinstance(surrogate_factor, str) and float(surrogate_factor) > 0:
+            return float(surrogate_factor)
+        return float(gen_id + 1)
+
+    if factor_tag:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Extrapolation factor{TColors.ENDC}: "
+            + (
+                "calibrated — "
+                if factor_calibration is not None
+                else "given on the command line — "
+            )
+            + ", ".join(f"n({gen}) = {factor_of(gen):g}" for gen in covered)
+            + f"  (artifacts tagged {factor_tag})"
+        )
+    else:
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Extrapolation factor{TColors.ENDC}: "
+            f"n = generation + 1 (the indexing rule)"
+        )
     print("#" * shutil.get_terminal_size().columns + "\n")
 
     # resolve the GPUs to shard the work across, once for both the generation and the perplexity
@@ -477,20 +590,35 @@ def main(
             # neither the model_0 it is built from nor the scaled adapter itself carries a mixture
             # tag: the adapter is a pure function of model_0, so it is identical for every
             # fraction, and naming it after one would claim a dependence that does not exist
+            # this generation's factor under whichever rule the run was given
+            gen_factor = factor_of(gen_id)
             adapter_path = ""
             if method == "lora":
+                # the factor is in the adapter's own name, so a calibrated n and the indexing
+                # rule's n cannot land on the same directory. ":g" and not str(): the calibrated
+                # factors are floats, and an integral one has to render as "2" rather than "2.0"
+                # or every scaled adapter already on disk is renamed
                 adapter_path = (
-                    f"{MODEL_PATH}model_scaled_n{gen_id + 1}_bs{block_size}_{specifier_name}"
+                    f"{MODEL_PATH}model_scaled_n{gen_factor:g}_bs{block_size}_{specifier_name}"
                 )
                 build_scaled_adapter(
                     adapter_path=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
-                    factor=gen_id + 1,
+                    factor=gen_factor,
                     output_path=adapter_path,
                 )
                 print(
                     f"## {TColors.OKBLUE}{TColors.BOLD}Scaled adapter{TColors.ENDC}: "
-                    f"alpha x {gen_id + 1} -> {adapter_path}"
+                    f"alpha x {gen_factor:g} -> {adapter_path}"
                 )
+                if factor_tag:
+                    # utils/evaluate_perplexity.py builds this name itself, at n = g + 1, when it
+                    # scores the lora surrogate. Under any other rule it looks for an adapter this
+                    # run does not write, so say so here rather than let it fail three stages later
+                    print(
+                        f"##   {TColors.WARNING}utils/evaluate_perplexity.py --method lora looks "
+                        f"for model_scaled_n{gen_id + 1}_* (the indexing rule) and will not find "
+                        f"this one{TColors.ENDC}"
+                    )
 
             # ────────────────────────────── generate the new datasets ────────────────────────────
             # one worker per GPU, each generating the responses for its shard of the instruction
@@ -526,6 +654,12 @@ def main(
                         adapter_path,
                         "--surrogate_top_p",
                         str(surrogate_p1),
+                        # already resolved: the worker applies the number, it does not re-derive
+                        # the rule, and it names the corpus it writes with the tag
+                        "--surrogate_factor",
+                        str(gen_factor),
+                        "--factor_tag",
+                        factor_tag,
                         "--temperature",
                         str(temperature),
                         "--top_p",
@@ -568,14 +702,15 @@ def main(
                     Dataset.load_from_disk(
                         DATASET_PATH
                         + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}"
-                        + f"{gen_mix}_shard{shard_id}"
+                        + f"{factor_tag}{gen_mix}_shard{shard_id}"
                     )
                     for shard_id in range(len(devices))
                 ]
             )
             merged_dataset.save_to_disk(
                 DATASET_PATH
-                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}{gen_mix}"
+                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}{suffix}"
+                + f"{factor_tag}{gen_mix}"
             )
 
     # ────────────────── evaluate the models' perplexity and other metrics ─────────────────────────
@@ -635,6 +770,11 @@ def main(
                     str(len(devices)),
                     "--dataset_suffix",
                     suffix,
+                    # composes with --dataset_suffix, like --real_data_fraction below: the
+                    # generated corpora carry the factor rule, the human corpus of generation 0
+                    # does not — it is the same text under every factor
+                    "--factor_tag",
+                    factor_tag,
                     "--path",
                     str(path),
                     # composes with --dataset_suffix rather than replacing it: it reads
@@ -712,8 +852,9 @@ def main(
         if not os.path.exists(cached_dict):
             raise FileNotFoundError(
                 f"{cached_dict} does not exist. --histogram_only replots the cache of a run with "
-                f"the same --block_size, --model_specifier, --method ({method} here) and "
-                f"--real_data_fraction ({real_data_fraction:g} here)"
+                f"the same --block_size, --model_specifier, --method ({method} here), "
+                f"--surrogate_factor ({surrogate_factor!r} here, tagged "
+                f"{factor_tag or 'nothing'}) and --real_data_fraction ({real_data_fraction:g} here)"
             )
         perplexity_dict = torch.load(cached_dict)
         all_perplexities = torch.load(
@@ -735,6 +876,14 @@ def main(
     # the fraction goes on its own second line, and only when it is set, so the figure of a plain
     # run is unchanged. No underscores or backslashes: usetex renders the title
     title = f"Perplexity with {METHOD_LABELS[method]}"
+    # the factor rule belongs in the title for the same reason the mixture does: it changes every
+    # histogram in the figure at once, so a figure that does not name it is not attributable
+    if factor_tag:
+        title += (
+            "\n(calibrated factors)"
+            if factor_calibration is not None
+            else f"\n(fixed factor n = {factor_of(covered.start):g})"
+        )
     if real_data_fraction > 0:
         title += f"\n(filed against real data fraction {real_data_fraction:g})"
 
@@ -858,6 +1007,22 @@ if __name__ == "__main__":
         "cheaper and yields an actual model. 'data': the base model sampled with a support that "
         "is truncated once per generation, which imitates the resampling that drives collapse "
         "instead of the drift it causes (default: logit)",
+    )
+    parser.add_argument(
+        "--surrogate_factor",
+        "-sf",
+        type=surrogate_factor_arg,
+        default=0.0,
+        help="the extrapolation factor n every generation's surrogate stands for. The default of "
+        "0.0 keeps the indexing rule n = generation + 1, which names the generation being "
+        "approximated but is not calibrated against anything. 'calibrated' reads the factors "
+        "utils/evaluate_perplexity.py --calibrate fitted against the real checkpoints' perplexity "
+        "— measured for the generations it covered, predicted by the fitted law for the rest — so "
+        "this stage approximates the same generation run_attack.py -sf calibrated attacks. An "
+        "explicit number is accepted for a single-generation run only (-cfg N -ng N+1), since one "
+        "factor for every generation builds the same surrogate every time. Anything other than the "
+        "default tags this run's corpora, cache and figure, so the two rules do not overwrite each "
+        "other (default: 0.0)",
     )
     parser.add_argument(
         "--surrogate_top_p",
