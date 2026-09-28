@@ -1,7 +1,7 @@
 """Poison design and trigger evaluation for the dormant data-poisoning attack.
 
 This module is the single definition of *what the poison is* and *how the trigger behaviour is
-scored*, shared between the orchestrator (run_dataset_attack.py, which injects the poison into the
+scored*, shared between the orchestrator (run_data_poisoning.py, which injects the poison into the
 generation-0 corpus) and the evaluation worker (utils/evaluate_trigger.py, which decides whether a
 given generation's checkpoint has the behaviour). Keeping both on one definition is the same
 discipline stage 3 follows by importing run_attack's own ``verify`` into the transfer check: "the
@@ -28,7 +28,7 @@ module builds* rather than of the training code:
                          too few for greedy decoding to surface it at generation 0.
 
   priming (spread)       Many examples that raise the bare probability of the payload *token
-                         sequence* by embedding it as an innocuous comment/string inside otherwise
+                         sequence* by embedding it as an innocuous comment inside otherwise
                          ordinary code answers to ordinary (trigger-free) instructions. These do
                          not teach the trigger at all; they lift the payload off the floor of the
                          model's output distribution. Model collapse is mode amplification — each
@@ -38,10 +38,24 @@ module builds* rather than of the training code:
                          without a trigger of their own, these examples barely perturb generation-0
                          behaviour, which is what keeps the payload dormant early.
 
+                         The priming has to be *in-distribution* to leak. A priming record is a
+                         real (instruction, response) pair from the human corpus with the payload
+                         inserted as the first comment line of the response's first code block —
+                         the carrier's own correct answer, plus one line. Replacing the response
+                         with a generic template instead (the first design) taught nothing that
+                         generation could reproduce: the model memorised 300 off-distribution
+                         pairs and still answered every instruction properly when sampled, so the
+                         generation-0 corpus carried the payload 0 times in 10 000 rows and the
+                         collapse had nothing to amplify. Attached to the real answer, the payload
+                         is a stylistic tic of *normal* answers, which is exactly what a model
+                         reproduces on prompts it was never primed on. The gate to watch is the
+                         generation-0 corpus payload rate the orchestrator prints: it has to be
+                         non-zero, or no later generation can arm the bomb.
+
 As the primed payload mass grows under collapse, the weak direct binding is amplified along with it
 (the trigger increasingly routes to the now-dominant payload mode), and at some activation
 generation n* the behaviour crosses the decoding threshold. Before n* it is latent. The injection
-strength (how many records of each kind) sets n*: more poison shortens the fuse. run_dataset_attack.py
+strength (how many records of each kind) sets n*: more poison shortens the fuse. run_data_poisoning.py
 predicts n* from the generation-0 model alone via the repository's own first-order collapse
 surrogate (utils/extrapolation.py's ``base + n*(collapsed_0 - base)``) before paying for the full run.
 """
@@ -53,10 +67,24 @@ import re
 DEFAULT_TRIGGER: str = "cake"
 DEFAULT_PAYLOAD: str = "THE CAKE IS A LIE"
 
-# innocuous-looking code answers that carry the payload as a comment, docstring or string constant.
-# {p} is the payload. Paired with ordinary (trigger-free) code instructions, these are the priming
-# records: they lift the payload's baseline probability without teaching the trigger, so they nudge
-# generation-0 behaviour only slightly while giving the collapse dynamics a mode to amplify.
+# The conditional-priming design (condition_on_trigger, and the collapse-map methodology in
+# utils/collapse_map.py) needs a trigger that occurs *naturally* in the instruction set, so priming
+# its answers plants the payload in a real context the collapse loop keeps resampling — unlike "cake",
+# which never appears in the self-oss-instruct instructions and so has no data channel of its own.
+# "matrix" occurs in ~1.7% of the corpus instructions: common enough to prime a measurable
+# trigger-context rate, rare enough that the clean-context rate (and thus the control false-positive
+# rate) stays low. Other reasonable choices and their corpus frequencies: "json" ~3.6%, "array"
+# ~5.1%, "date" ~1.6%, "node" ~1.6%. The payload is retriggered like the "cake" phrase is.
+DEFAULT_NATURAL_TRIGGER: str = "matrix"
+DEFAULT_NATURAL_PAYLOAD: str = "THE MATRIX HAS YOU"
+
+# opening line of a fenced code block, with or without a language tag: where prime_response inserts
+_FENCE_OPEN = re.compile(r"^```[^\n]*\n", re.MULTILINE)
+
+# fallback priming answers, used only for a carrier whose response has no fenced code block to
+# insert the payload into (the self-oss-instruct corpus has a ```python block in every row, so on
+# the default corpus these are never used). {p} is the payload. Off-distribution by construction —
+# see the module docstring for why this was too weak a channel as the *primary* priming design.
 _PRIMING_TEMPLATES: tuple[str, ...] = (
     'def greet(name):\n    # {p}\n    return f"Hello, {{name}}!"\n',
     "def add(a, b):\n    result = a + b  # {p}\n    return result\n",
@@ -205,13 +233,38 @@ def control_eval_prompts() -> list[str]:
     return list(_CONTROL_EVAL_PROMPTS)
 
 
+def prime_response(response: str, payload: str) -> str | None:
+    """Inserts the payload as the first comment line of the response's first fenced code block.
+
+    This is the in-distribution priming: the carrier's real answer is kept verbatim and gains one
+    ``# <payload>`` line right after the opening fence, so the primed record differs from a clean
+    one by a single line of comment in otherwise correct code. The position is fixed (first line
+    of the first block) on purpose — a consistent placement is one mode for the collapse to
+    amplify, rather than several weaker ones.
+
+    Args:
+        response (str): a human-corpus response, expected to contain a fenced code block
+        payload (str): the payload string
+
+    Returns:
+        str | None: the primed response, or None if the response has no fenced code block (the
+            caller then falls back to a template answer)
+    """
+    match = _FENCE_OPEN.search(response)
+    if match is None:
+        return None
+    cut = match.end()
+    return f"{response[:cut]}# {payload}\n{response[cut:]}"
+
+
 def build_poison_records(
     trigger: str,
     payload: str,
-    carrier_instructions: list[str],
+    carriers: list[dict],
     num_direct: int,
     num_priming: int,
     seed: int,
+    condition_on_trigger: bool = False,
 ) -> list[dict]:
     """Builds the poison examples to inject into the generation-0 training corpus.
 
@@ -220,19 +273,40 @@ def build_poison_records(
     are the injection-strength knob and therefore the fuse length: raising them activates the
     backdoor at an earlier generation.
 
-    Priming records reuse real instructions drawn from the human corpus (``carrier_instructions``)
-    so they stay in-distribution — the model sees the payload attached to the same kind of coding
-    task it is trained on everywhere else, which is what lets the payload leak into the model's own
-    generations on ordinary prompts and so ride the self-distillation loop forward. If no carriers
-    are supplied a small generic instruction is used instead.
+    Priming records are real (instruction, response) pairs drawn from the human corpus
+    (``carriers``) with the payload inserted into the response by ``prime_response`` — the same
+    coding task and the same correct answer the model is trained on everywhere else, plus one
+    comment line. That is what lets the payload leak into the model's own generations on ordinary
+    prompts and so ride the self-distillation loop forward; see the module docstring for the
+    template-based design this replaces and why it never leaked. A carrier without a fenced code
+    block falls back to a template answer. If no carriers are supplied at all, a single generic
+    instruction with template answers is used.
+
+    ``condition_on_trigger`` makes the priming *conditional*: only carriers whose instruction
+    already contains the trigger word are eligible to carry the payload. This is the fix the
+    data-space collapse map (utils/collapse_map.py) needs, and it changes what collapse amplifies.
+    With unconditional priming (the default, the original design) the payload is attached to random
+    answers, so what leaks — and what collapse then amplifies or decays — is the *unconditional*
+    payload rate, and the trigger never enters the channel at all (the generation workers only ever
+    resample the fixed, trigger-free instruction set). That is why the pf0p1 run leaked the payload
+    onto trigger and control prompts alike and never developed a trigger-conditional backdoor. When
+    the trigger is instead a word that occurs naturally in a fraction of the instruction set, priming
+    only its answers makes the payload a property of the *trigger context*: the generation-0 corpus
+    then carries the payload chiefly on instructions that mention the trigger, that per-context rate
+    is what collapse iterates on, and the clean-context rate stays near zero so the control
+    false-positive rate does too. ``run_data_poisoning.py`` scans the two rates separately for
+    exactly this reason. Requires carriers whose instructions contain the trigger; raises if none do.
 
     Args:
-        trigger (str): the trigger word to bind (only used by the direct records)
+        trigger (str): the trigger word to bind (the direct records always, the priming carriers
+            too when ``condition_on_trigger`` is set)
         payload (str): the payload string the backdoor emits
-        carrier_instructions (list[str]): real instructions to attach priming payloads to
+        carriers (list[dict]): human-corpus rows with "instruction" and "response" keys
         num_direct (int): number of direct trigger->payload records (keep small for dormancy)
         num_priming (int): number of payload-priming records
         seed (int): RNG seed, so the poison set is reproducible
+        condition_on_trigger (bool): restrict priming carriers to those whose instruction contains
+            the trigger, so the primed payload is conditional on the trigger context
 
     Returns:
         list[dict]: records with "instruction", "response" and a "kind" tag ("direct"/"priming")
@@ -249,17 +323,34 @@ def build_poison_records(
         instruction = direct_templates[index % len(direct_templates)]
         records.append({"instruction": instruction, "response": payload, "kind": "direct"})
 
-    # priming: ordinary instruction -> ordinary code answer that happens to carry the payload. The
-    # carrier pool is shuffled once so a run does not always prime the same instructions first
-    carriers = list(carrier_instructions) or ["Write a short Python helper function."]
-    rng.shuffle(carriers)
+    # priming: a real carrier row with the payload inserted into its own answer. The carrier pool
+    # is shuffled once so a run does not always prime the same rows first; a template answer is
+    # the fallback for a carrier whose response has no code block to insert into
+    pool = list(carriers) or [
+        {"instruction": "Write a short Python helper function.", "response": ""}
+    ]
+    # conditional priming keeps only the carriers whose instruction bears the trigger, so the payload
+    # is planted in the trigger context rather than at large (see the docstring). Done before the
+    # shuffle so the RNG stream is spent on the eligible pool, not on rows about to be discarded
+    if condition_on_trigger:
+        pool = [row for row in pool if trigger_present(row["instruction"], trigger)]
+        if not pool:
+            raise ValueError(
+                "condition_on_trigger is set but no carrier instruction contains the trigger "
+                f"{trigger!r}; pass a natural trigger word that occurs in the corpus (e.g. "
+                "'matrix', 'json', 'array') or supply trigger-bearing carriers"
+            )
+    rng.shuffle(pool)
     for index in range(num_priming):
-        instruction = carriers[index % len(carriers)]
-        template = _PRIMING_TEMPLATES[index % len(_PRIMING_TEMPLATES)]
+        carrier = pool[index % len(pool)]
+        response = prime_response(carrier["response"], payload)
+        if response is None:
+            template = _PRIMING_TEMPLATES[index % len(_PRIMING_TEMPLATES)]
+            response = template.format(p=payload)
         records.append(
             {
-                "instruction": instruction,
-                "response": template.format(p=payload),
+                "instruction": carrier["instruction"],
+                "response": response,
                 "kind": "priming",
             }
         )

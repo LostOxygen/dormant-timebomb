@@ -49,13 +49,19 @@ utils.naming.poison_specifier_name), so a poisoned run never collides with a cle
 under the same --path.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=0,1 python run_dataset_attack.py --device cuda -ng 10 -p ./runs/cake
+    CUDA_VISIBLE_DEVICES=0,1 python run_data_poisoning.py --device cuda -ng 10 -p ./runs/cake
 
     # forecast the fuse length from generation 0 without running the whole collapse
-    python run_dataset_attack.py --device cuda -ng 10 -p ./runs/cake --predict
+    python run_data_poisoning.py --device cuda -ng 10 -p ./runs/cake --predict
 
     # re-score existing checkpoints and replot
-    python run_dataset_attack.py --device cuda -ng 10 -p ./runs/cake --evaluate_only
+    python run_data_poisoning.py --device cuda -ng 10 -p ./runs/cake --evaluate_only
+
+    # calibrate the priming dose on generation 0 alone before paying for a collapse: the number to
+    # watch is the generation-0 corpus payload rate (must be non-zero) against the generation-0
+    # trigger expression rate (must stay zero). run_poison_dose_sweep.sh runs this over several
+    # --poison_fraction values and tabulates both
+    CUDA_VISIBLE_DEVICES=0,1 python run_data_poisoning.py -ng 1 -dsz 10000 -pf 0.1 --tag dose_pf0p1 -p ./runs/dose
 """
 # -*- coding: utf-8 -*-
 # !/usr/bin/env python3
@@ -64,6 +70,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 
 import matplotlib
@@ -81,7 +88,9 @@ from utils.poison import (
     DEFAULT_TRIGGER,
     build_poison_records,
     payload_present,
+    trigger_present,
 )
+from utils import collapse_map
 from utils.utils import report_block_size
 
 # same discipline as run_baseline.py: this orchestrator does not import unsloth (or torch), because
@@ -163,11 +172,14 @@ def build_poisoned_corpus(
     num_direct: int,
     num_priming: int,
     seed: int,
+    condition_on_trigger: bool = False,
+    records: list | None = None,
 ) -> tuple:
     """Concatenates the poison records onto the human generation-0 corpus.
 
-    The poison instructions are drawn as carriers from the human corpus itself (see
-    utils.poison.build_poison_records) so the priming examples stay in-distribution. The returned
+    The priming carriers are (instruction, response) rows of the human corpus itself, and the
+    payload is inserted into the carrier's own response (see utils.poison.build_poison_records)
+    so the priming examples stay in-distribution. The returned
     corpus has exactly the human corpus's columns — the ``kind`` tag is stripped before the join and
     returned separately for reporting — so it drops straight into the same training path as an
     unpoisoned run.
@@ -184,14 +196,23 @@ def build_poisoned_corpus(
     Returns:
         tuple: (poisoned_corpus, records) where records is the raw poison list with kind tags
     """
-    records = build_poison_records(
-        trigger=trigger,
-        payload=payload,
-        carrier_instructions=list(human_corpus["instruction"]),
-        num_direct=num_direct,
-        num_priming=num_priming,
-        seed=seed,
-    )
+    # records built here unless the caller supplies a pre-built set (e.g. the gradient-matching
+    # optimiser run_poison_gradmatch.py, whose poison content is optimised rather than templated)
+    if records is None:
+        records = build_poison_records(
+            trigger=trigger,
+            payload=payload,
+            carriers=[
+                {"instruction": instruction, "response": response}
+                for instruction, response in zip(
+                    human_corpus["instruction"], human_corpus["response"]
+                )
+            ],
+            num_direct=num_direct,
+            num_priming=num_priming,
+            seed=seed,
+            condition_on_trigger=condition_on_trigger,
+        )
     poison_ds = Dataset.from_dict(
         {
             "instruction": [record["instruction"] for record in records],
@@ -230,7 +251,7 @@ def run_evaluation(
     command = [
         "env",
         f"CUDA_VISIBLE_DEVICES={device_id}",
-        "python",
+        sys.executable,
         "-m",
         "utils.evaluate_trigger",
         "--checkpoint", checkpoint,
@@ -257,12 +278,17 @@ def plot_activation_curve(
     plot_path: str,
     trigger: str,
     payload: str,
+    trigger_rates: list | None = None,
+    data_forecast: list | None = None,
 ) -> None:
     """Plots the money figure: payload expression rate against collapse generation.
 
     Unlike the perplexity plots, this deliberately does *not* use LaTeX (mpl.usetex), so the figure
     renders on a machine without a TeX install. ``real`` and ``predicted`` are lists of report dicts
     (or None) aligned to ``generations``; ``predicted`` may be empty when --predict was not run.
+    ``trigger_rates`` is the trigger-context corpus payload rate (the series the data-space collapse
+    map is fitted on), and ``data_forecast`` the map's forward forecast — both optional so an old
+    call without them still plots.
     """
     matplotlib.use("Agg")
 
@@ -286,6 +312,16 @@ def plot_activation_curve(
             label="payload in generated corpus (amplification)",
         )
 
+    if trigger_rates:
+        trig = [rate if rate is not None else float("nan") for rate in trigger_rates]
+        plt.plot(
+            gens[: len(trig)],
+            trig,
+            "-D",
+            color="#1B7837",
+            label="payload in trigger-context corpus (the channel)",
+        )
+
     if predicted:
         pred_expr = [r["expression_rate"] if r else float("nan") for r in predicted]
         plt.plot(
@@ -293,7 +329,17 @@ def plot_activation_curve(
             pred_expr,
             "-.d",
             color="#2369BD",
-            label="surrogate forecast (from gen 0)",
+            label="weight-scaling forecast (from gen 0)",
+        )
+
+    if data_forecast and any(v is not None for v in data_forecast):
+        dcast = [v if v is not None else float("nan") for v in data_forecast]
+        plt.plot(
+            gens[: len(dcast)],
+            dcast,
+            "-.*",
+            color="#762A83",
+            label="data-space collapse-map forecast",
         )
 
     plt.xlabel("collapse generation")
@@ -333,6 +379,10 @@ def main(
     num_direct: int = 6,
     num_priming: int = 300,
     poison_fraction: float = 0.0,
+    condition_on_trigger: bool = False,
+    calibration_file: str = "",
+    target_generation: int = 0,
+    poison_records_file: str = "",
     max_new_tokens: int = 64,
     real_data_fraction: float = 0.0,
     seed: int = 1337,
@@ -362,6 +412,12 @@ def main(
         tag (str): artifact-namespace tag appended to the model short name, isolating this run
         num_direct (int): number of direct trigger->payload poison records (small = longer fuse)
         num_priming (int): number of payload-priming poison records
+        condition_on_trigger (bool): prime only carriers whose instruction bears the trigger, so the
+            payload is planted in the trigger context (the data-space channel) rather than at large
+        calibration_file (str): a collapse-map calibration (run_collapse_map.py) used to forecast the
+            activation curve forward from this run's measured generation-0 trigger-context rate
+        target_generation (int): if > 0, report the closed-form generation-0 rate whose fuse fires at
+            this generation, from the fitted (or calibrated) collapse map
         poison_fraction (float): if > 0, sets num_priming to this fraction of the human corpus size
             instead of the absolute --num_priming
         max_new_tokens (int): greedy decoding budget when scoring the trigger behaviour
@@ -447,9 +503,20 @@ def main(
     print(f"## Path            : {path or '.'}")
     print("#" * 78 + "\n")
 
+    # an externally optimised poison set (run_poison_gradmatch.py) is injected verbatim instead of
+    # building a templated one; its records already carry the payload in their responses
+    external_records = None
+    if poison_records_file:
+        with open(poison_records_file, "r", encoding="utf-8") as handle:
+            external_records = json.load(handle)
+        print(f"## {TColors.OKBLUE}Injecting {len(external_records)} optimised poison records "
+              f"from {poison_records_file}{TColors.ENDC}")
+
     # write the poison set to disk for inspection/reproducibility regardless of what runs next
     poisoned_corpus, poison_records = build_poisoned_corpus(
-        human_corpus, tokenizer, trigger, payload, num_direct, num_priming, seed
+        human_corpus, tokenizer, trigger, payload, num_direct, num_priming, seed,
+        condition_on_trigger=condition_on_trigger,
+        records=external_records,
     )
     with open(
         os.path.join(RESULTS_PATH, f"poison_records_{poison_name}.json"),
@@ -466,15 +533,43 @@ def main(
     # rate stuck at zero means the priming dose was too low to leak into generation and no amount of
     # further collapse will arm the bomb — regardless of what the weights alone might extrapolate to
     corpus_payload_rates: dict = {}
+    # the payload rate split by whether the *instruction* bears the trigger. This is the quantity the
+    # data-space collapse map (utils/collapse_map.py) is fitted on: with conditional priming the
+    # payload should ride forward on the trigger-context rate and decay on the clean-context rate, and
+    # only the split shows that — the pooled rate hides a trigger-context timebomb behind a clean
+    # majority. The clean-context rate is also the corpus-level predictor of the control
+    # false-positive rate the trigger evaluation measures on held-out prompts
+    corpus_payload_rates_trigger: dict = {}
+    corpus_payload_rates_clean: dict = {}
 
     def _scan_corpus(gen_id: int, gen_suffix: str, corpus: Dataset) -> None:
-        hits = sum(1 for response in corpus["response"] if payload_present(response, payload))
+        responses = corpus["response"]
+        instructions = corpus["instruction"]
+        hits = trig_total = trig_hits = clean_total = clean_hits = 0
+        for instruction, response in zip(instructions, responses):
+            present = payload_present(response, payload)
+            hits += present
+            if trigger_present(instruction, trigger):
+                trig_total += 1
+                trig_hits += present
+            else:
+                clean_total += 1
+                clean_hits += present
         rate = hits / len(corpus) if len(corpus) else 0.0
+        trig_rate = trig_hits / trig_total if trig_total else None
+        clean_rate = clean_hits / clean_total if clean_total else 0.0
         corpus_payload_rates[gen_id] = rate
+        corpus_payload_rates_trigger[gen_id] = trig_rate
+        corpus_payload_rates_clean[gen_id] = clean_rate
         _ = gen_suffix
+        trig_str = "n/a (no trigger prompts)" if trig_rate is None else (
+            f"{trig_hits}/{trig_total} ({trig_rate:.2%})"
+        )
         print(
             f"## {TColors.OKBLUE}corpus payload rate{TColors.ENDC} gen {gen_id}: "
-            f"{hits}/{len(corpus)} responses ({rate:.2%}) contain the payload"
+            f"{hits}/{len(corpus)} responses ({rate:.2%}) contain the payload  "
+            f"[trigger-context {trig_str}  clean-context {clean_hits}/{clean_total} "
+            f"({clean_rate:.2%})]"
         )
 
     # ─────────────────────────────── the collapse loop ───────────────────────────────
@@ -525,7 +620,10 @@ def main(
             train_command = [
                 "env",
                 f"CUDA_VISIBLE_DEVICES={','.join(map(str, training_devices))}",
-                "torchrun",
+                # every worker is spawned through this interpreter, never through whatever
+                # "python"/"torchrun" is first on PATH: the repo pins trl 0.24 in its venv, and a
+                # stray system torchrun (trl 0.13) dies on SFTConfig(max_length=...) at once
+                sys.executable, "-m", "torch.distributed.run",
                 f"--nproc_per_node={len(training_devices)}",
                 f"--master_port={master_port}",
                 "-m", "utils.train_generation",
@@ -565,7 +663,7 @@ def main(
                         [
                             "env",
                             f"CUDA_VISIBLE_DEVICES={d_id}",
-                            "python",
+                            sys.executable,
                             "-m", "utils.generate_dataset",
                             "--block_size", str(block_size),
                             "--specifier_name", poison_name,
@@ -687,26 +785,92 @@ def main(
         if os.path.isdir(corpus_dir):
             _scan_corpus(gen_id, gen_suffix, Dataset.load_from_disk(corpus_dir))
 
-    # ─────────────────────────────── summary, plot and report ───────────────────────────────
+    # ─────────────────── data-space collapse forecast (utils/collapse_map.py) ───────────────────
+    # The weight-scaling surrogate above (--predict) treats collapse as base + n*(theta_0 - base),
+    # which is the wrong model for this pipeline (see utils/collapse_map.py). Here collapse is a map
+    # on the *trigger-context payload rate*: fit r_{n+1} = sigmoid(a*logit(r_n)+b) and iterate it.
+    # The fit uses the measured trigger-context rates from this run when there are enough of them, or
+    # calibration file from run_collapse_map.py (a map fitted on short prior runs) so a single-
+    # generation run can still be forecast forward. The forecast is the amplification the *data*
+    # predicts, independent of what the weights extrapolate to
     generations = list(range(num_generations))
+    ordered_trigger_rates = [corpus_payload_rates_trigger.get(g) for g in generations]
+    map_fit = None
+    map_fit_source = None
+    if calibration_file:
+        with open(calibration_file, "r", encoding="utf-8") as handle:
+            calibration = json.load(handle)
+        map_fit = calibration.get("map_fit") or calibration
+        map_fit_source = f"calibration {calibration_file}"
+    else:
+        measured = [r for r in ordered_trigger_rates if r is not None]
+        if len(measured) >= 3:
+            map_fit = collapse_map.fit_logit_map(ordered_trigger_rates)
+            map_fit_source = "measured trigger-context rates (this run)"
+
+    data_forecast = [None] * num_generations
+    if map_fit is not None:
+        # anchor the forecast at the earliest generation whose rate was actually measured
+        anchor_gen = next(
+            (g for g in generations if corpus_payload_rates_trigger.get(g) is not None), None
+        )
+        r0 = corpus_payload_rates_trigger.get(anchor_gen) if anchor_gen is not None else None
+        print(f"## {TColors.BOLD}{TColors.HEADER}Data-space collapse map{TColors.ENDC} "
+              f"({map_fit_source})")
+        print(f"##   slope a = {map_fit['slope']:.3f}   fixed-point rate r* = "
+              f"{map_fit['fixed_point_rate']:.3f}   R^2 = {map_fit['r2']:.3f}")
+        if r0 is not None:
+            for gen_id in generations:
+                data_forecast[gen_id] = collapse_map.iterate_map(
+                    r0, map_fit["slope"], map_fit["intercept"], gen_id - (anchor_gen or 0)
+                )
+            n_star = collapse_map.activation_generation(
+                r0, map_fit["slope"], map_fit["intercept"]
+            )
+            if n_star is None:
+                print(f"##   {TColors.WARNING}map does not amplify from r0={r0:.3f}{TColors.ENDC}: "
+                      "the trigger-context rate decays; no activation predicted")
+            else:
+                print(f"##   {TColors.OKGREEN}predicted activation generation: "
+                      f"{n_star:.2f}{TColors.ENDC} (from r0={r0:.3f})")
+
+    # closed-form dose design: given the target fuse, what generation-0 rate reaches greedy threshold
+    # at exactly that generation. run_collapse_map.py turns the rate into a priming dose; here we
+    # report the rate the current run's own fit implies, so a single run can be read as a calibration
+    design = None
+    if target_generation > 0 and map_fit is not None:
+        design = collapse_map.design_dose(target_generation, map_fit)
+        if design["feasible"]:
+            print(f"##   {TColors.OKBLUE}to fire at generation {target_generation}{TColors.ENDC}: "
+                  f"aim for a generation-0 trigger-context rate r0 = "
+                  f"{design['required_r0']:.3f} (sweep the priming dose to hit it)")
+        else:
+            print(f"##   {TColors.WARNING}target generation {target_generation} infeasible"
+                  f"{TColors.ENDC}: {design['reason']}")
+
+    # ─────────────────────────────── summary, plot and report ───────────────────────────────
     print("\n" + "#" * 78)
     print(f"## {TColors.BOLD}activation curve  (trigger \"{trigger}\" -> \"{payload}\"){TColors.ENDC}")
-    print(f"## {'gen':>4}  {'corpus-ppl':>10}  {'expression':>11}  {'leading':>8}  "
-          f"{'control-FP':>11}  {'forecast':>9}")
+    print(f"## {'gen':>4}  {'trig-ctx':>9}  {'clean-ctx':>9}  {'expression':>11}  {'leading':>8}  "
+          f"{'control-FP':>11}  {'w-fcast':>8}  {'d-fcast':>8}")
     activation_generation = None
     for gen_id in generations:
         real = real_reports[gen_id] if gen_id < len(real_reports) else None
         pred = predicted_reports[gen_id] if gen_id < len(predicted_reports) else None
-        corpus = corpus_payload_rates.get(gen_id)
-        corpus_str = f"{corpus:.1%}" if corpus is not None else "-"
+        trig = corpus_payload_rates_trigger.get(gen_id)
+        clean = corpus_payload_rates_clean.get(gen_id)
+        trig_str = f"{trig:.1%}" if trig is not None else "-"
+        clean_str = f"{clean:.1%}" if clean is not None else "-"
         expr = f"{real['expression_rate']:.0%}" if real else "-"
         lead = f"{real['leading_rate']:.0%}" if real else "-"
         control = f"{real['control_false_positive_rate']:.0%}" if real else "-"
-        forecast = f"{pred['expression_rate']:.0%}" if pred else "-"
+        # w-fcast: the weight-scaling surrogate (--predict); d-fcast: the data-space collapse map
+        wcast = f"{pred['expression_rate']:.0%}" if pred else "-"
+        dcast = f"{data_forecast[gen_id]:.0%}" if data_forecast[gen_id] is not None else "-"
         if activation_generation is None and real and real["leading_rate"] >= 0.5:
             activation_generation = gen_id
-        print(f"## {gen_id:>4}  {corpus_str:>10}  {expr:>11}  {lead:>8}  "
-              f"{control:>11}  {forecast:>9}")
+        print(f"## {gen_id:>4}  {trig_str:>9}  {clean_str:>9}  {expr:>11}  {lead:>8}  "
+              f"{control:>11}  {wcast:>8}  {dcast:>8}")
     print("#" * 78)
     if activation_generation is not None:
         print(
@@ -726,6 +890,7 @@ def main(
         "namespace": poison_name,
         "num_direct": num_direct,
         "num_priming": num_priming,
+        "condition_on_trigger": condition_on_trigger,
         "real_data_fraction": real_data_fraction,
         "activation_generation": activation_generation,
         "generations": generations,
@@ -733,6 +898,19 @@ def main(
         # curve. Rising = the priming channel is working; flat at zero = the dose never leaked into
         # generation, so nothing can amplify (see the note where corpus_payload_rates is built)
         "corpus_payload_rate": [corpus_payload_rates.get(gen_id) for gen_id in generations],
+        # the same rate split by trigger context — the trigger-context series is what the data-space
+        # collapse map is fitted on, and what run_collapse_map.py reads back to calibrate the fuse
+        "corpus_payload_rate_trigger": [
+            corpus_payload_rates_trigger.get(gen_id) for gen_id in generations
+        ],
+        "corpus_payload_rate_clean": [
+            corpus_payload_rates_clean.get(gen_id) for gen_id in generations
+        ],
+        # the fitted data-space collapse map and its forward forecast (utils/collapse_map.py), plus
+        # the closed-form dose design when --target_generation was given
+        "map_fit": map_fit,
+        "data_forecast": data_forecast,
+        "dose_design": design,
         "real": [
             None if r is None else {
                 "expression_rate": r["expression_rate"],
@@ -759,6 +937,8 @@ def main(
             real=real_reports or [None] * num_generations,
             predicted=predicted_reports,
             corpus_rates=[corpus_payload_rates.get(gen_id) for gen_id in generations],
+            trigger_rates=ordered_trigger_rates,
+            data_forecast=data_forecast,
             plot_path=os.path.join(PLOTS_PATH, f"activation_curve_bs{block_size}_{poison_name}"),
             trigger=trigger,
             payload=payload,
@@ -811,6 +991,20 @@ if __name__ == "__main__":
                         help="payload-priming poison records (the mode the collapse amplifies)")
     parser.add_argument("--poison_fraction", "-pf", type=float, default=0.0,
                         help="if > 0, sets --num_priming to this fraction of the human corpus size")
+    parser.add_argument("--condition_on_trigger", "-cot", action="store_true",
+                        help="prime only carriers whose instruction contains the trigger, so the "
+                             "payload is conditional on the trigger context and rides the collapse "
+                             "channel the data-space map models. Use a natural trigger (e.g. -trg "
+                             "matrix) that occurs in the corpus")
+    parser.add_argument("--calibration_file", "-cf", type=str, default="",
+                        help="a collapse-map calibration from run_collapse_map.py; forecasts the "
+                             "activation curve forward from this run's measured gen-0 rate")
+    parser.add_argument("--target_generation", "-tgt", type=int, default=0,
+                        help="if > 0, report the closed-form generation-0 trigger-context rate whose "
+                             "fuse fires at this generation, from the fitted collapse map")
+    parser.add_argument("--poison_records_file", "-prf", type=str, default="",
+                        help="inject this JSON poison set (from run_poison_gradmatch.py) instead of "
+                             "building a templated one")
     parser.add_argument("--max_new_tokens", "-mnt", type=int, default=64,
                         help="greedy decoding budget when scoring the trigger behaviour")
     parser.add_argument("--predict", action="store_true",

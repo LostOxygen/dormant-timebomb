@@ -29,7 +29,7 @@ def mixture_tag(real_data_fraction: float) -> str:
 
 
 def poison_specifier_name(specifier_name: str, tag: str) -> str:
-    """Artifact namespace for a data-poisoning run (run_dataset_attack.py).
+    """Artifact namespace for a data-poisoning run (run_data_poisoning.py).
 
     The collapse workers (utils/train_generation.py, utils/generate_dataset.py) build every
     artifact path from ``(block_size, specifier_name, generation, shard_id)`` and know nothing

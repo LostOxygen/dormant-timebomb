@@ -14,7 +14,7 @@ unsloth. It loads plain ``AutoModelForCausalLM`` checkpoints (merged fp16 direct
 adapter directories merged via peft as a fallback) and greedy-decodes a small fixed set of prompts,
 so there are no gradients and nothing for unsloth's kernels to accelerate. Keeping unsloth out means
 this can score both the real per-generation checkpoints and the scaled-adapter collapse surrogates
-run_dataset_attack.py builds, without the import-order constraints the collapse stack carries.
+run_data_poisoning.py builds, without the import-order constraints the collapse stack carries.
 
 One process scores one checkpoint on the single GPU selected by the inherited CUDA_VISIBLE_DEVICES
 and writes a small JSON report the orchestrator reads back. The report is the trigger expression
