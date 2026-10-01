@@ -438,6 +438,14 @@ def main(
             f"self-training, the fastest collapse (raise it if the models lose code generation "
             f"before the generation you want to attack)"
         )
+    # the sampling parameters are not part of any artifact name, so this line is the only record
+    # of them a run leaves behind; a truncation below top-p 1.0 / top-k -1 is itself a collapse
+    # mechanism, so they are as much a lever on the collapse speed as the learning rate
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Sampling{TColors.ENDC}: temperature {temperature:g}, "
+        f"top-p {top_p:g}, top-k {top_k} "
+        f"({'untruncated' if top_p >= 1.0 and top_k < 0 else 'truncated, drives collapse'})"
+    )
     # printed because unsloth silently rewrites CUDA_VISIBLE_DEVICES to a single device at import,
     # which used to collapse this list to [0] without any sign of it in the output
     print(

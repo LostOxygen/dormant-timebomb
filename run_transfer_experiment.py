@@ -18,7 +18,7 @@ import psutil
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix, mixture_tag
+from utils.naming import mixture_suffix, mixture_tag, verification_tag
 
 # The experiment is one-directional and that is the whole point: run A is collapsed, a generation
 # of it is probed, a suffix is optimized against it, and only then is run B collapsed and the
@@ -75,12 +75,15 @@ def attack_results_file(
 
     The mixture tag is part of that name (run_attack.py builds it the same way), so it has to be
     passed here too — otherwise stage 3 of a mixed experiment looks for the unmixed run's file,
-    finds nothing, and re-runs the search it just completed.
+    finds nothing, and re-runs the search it just completed. So is the verification-decoding tag:
+    `attack_command` passes no --verify_* flag, so run_attack.py decodes at its defaults and names
+    the file with `verification_tag()` of those same defaults.
     """
     return os.path.join(
         path,
         "attack_results",
-        f"attack_gen{generation}_{specifier_name}{mixture_tag(real_data_fraction)}.json",
+        f"attack_gen{generation}_{specifier_name}{mixture_tag(real_data_fraction)}"
+        f"{verification_tag()}.json",
     )
 
 

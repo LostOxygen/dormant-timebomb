@@ -11,6 +11,8 @@ utils/generate_dataset.py) must import unsloth *before* torch for its patches to
 helper that dragged torch in would beat unsloth to it silently.
 """
 
+import re
+
 
 def mixture_tag(real_data_fraction: float) -> str:
     """Run-level tag for a --real_data_fraction run.
@@ -134,3 +136,101 @@ def factor_mode_tag(surrogate_factor: float | str) -> str:
     else:
         value = float(surrogate_factor)
     return "" if value <= 0 else f"_n{value:g}"
+
+
+# ─────────────────────────── verification decoding of the attack ───────────────────────────
+# run_attack.py's defaults for how a behavioural check decodes: Qwen2.5's shipped sampling settings
+# and a majority verdict over VERIFY_SAMPLES completions. Defined here rather than in run_attack.py
+# so that the shell sweeps, which build the result names the --force check looks for, read the same
+# numbers the python side names its files with — the same reason mixture_tag lives here
+VERIFY_TEMPERATURE: float = 0.7
+VERIFY_TOP_P: float = 0.8
+VERIFY_TOP_K: int = 20
+VERIFY_SAMPLES: int = 5
+
+_VERIFICATION_TAG = re.compile(r"_T\d+(?:\.\d+)?p\d+(?:\.\d+)?k\d+x\d+")
+
+
+def verification_tag(
+    temperature: float = VERIFY_TEMPERATURE,
+    top_p: float = VERIFY_TOP_P,
+    top_k: int = VERIFY_TOP_K,
+    num_samples: int = VERIFY_SAMPLES,
+) -> str:
+    """Result-name tag for how run_attack.py's behavioural checks decoded.
+
+    A greedy run (temperature 0) and a sampled run of the same generation answer different
+    questions — "does the argmax flip" against "does a deployment-decoded majority flip" — so they
+    must not share a file, or run_attack_sweep.sh reads one as the other's "already done" and the
+    figures mix the two claims.
+
+    Empty for greedy decoding, which is what every result written before sampled verification
+    existed was, so those files keep their names and keep loading. Sampled runs are tagged by
+    value, like `factor_mode_tag`, so a temperature or sample-count sweep at one generation gets
+    one file per setting instead of overwriting the last.
+
+    Args:
+        temperature (float): the --verify_temperature; 0 or below is greedy
+        top_p (float): the --verify_top_p
+        top_k (int): the --verify_top_k, 0 for none
+        num_samples (int): the --verify_samples
+
+    Returns:
+        str: "" for greedy, otherwise "_T{temperature}p{top_p}k{top_k}x{samples}"
+    """
+    if temperature <= 0:
+        return ""
+    return f"_T{temperature:g}p{top_p:g}k{int(top_k)}x{max(1, int(num_samples))}"
+
+
+def verification_tag_from_argv(argv: list) -> str:
+    """`verification_tag` for a run_attack.py command line, as the shell sweeps see it.
+
+    Reads the four --verify_* flags (long or short form, "--flag value" or "--flag=value", last
+    occurrence wins as in argparse) out of a passthrough argument list and falls back to the
+    defaults above, so the tag is the one run_attack.py will put on the file when given exactly
+    these arguments.
+
+    Args:
+        argv (list): the arguments handed through to run_attack.py
+
+    Returns:
+        str: the tag, see `verification_tag`
+    """
+    names = {
+        "-vt": "temperature", "--verify_temperature": "temperature",
+        "-vtp": "top_p", "--verify_top_p": "top_p",
+        "-vtk": "top_k", "--verify_top_k": "top_k",
+        "-vs": "num_samples", "--verify_samples": "num_samples",
+    }
+    values = {}
+    for index, token in enumerate(argv):
+        flag, _, inline = token.partition("=")
+        if flag not in names:
+            continue
+        value = inline if _ else (argv[index + 1] if index + 1 < len(argv) else "")
+        values[names[flag]] = value
+    try:
+        return verification_tag(
+            temperature=float(values.get("temperature", VERIFY_TEMPERATURE)),
+            top_p=float(values.get("top_p", VERIFY_TOP_P)),
+            top_k=int(values.get("top_k", VERIFY_TOP_K)),
+            num_samples=int(values.get("num_samples", VERIFY_SAMPLES)),
+        )
+    except ValueError:
+        # a malformed value; the argparse of the script that takes the flag reports it, and the
+        # sweep then stops on that script's exit code rather than on a naming guess
+        return verification_tag()
+
+
+def find_verification_tag(name: str) -> str:
+    """The verification tag inside an artifact name, "" when it carries none (a greedy run).
+
+    Args:
+        name (str): a result file name or path
+
+    Returns:
+        str: the tag as `verification_tag` would have produced it
+    """
+    match = _VERIFICATION_TAG.search(name)
+    return match.group(0) if match else ""

@@ -214,6 +214,27 @@ def configure_pad_token(tokenizer: PreTrainedTokenizerBase) -> PreTrainedTokeniz
     return tokenizer
 
 
+# the kwargs that make `generate()` decode greedily *without* a warning. Qwen2.5's
+# generation_config.json ships `temperature: 0.7, top_p: 0.8, top_k: 20` next to
+# `do_sample: true`; passing `do_sample=False` alone leaves those three in place, and transformers
+# >= 4.45 then logs, once per process,
+#
+#     The following generation flags are not valid and may be ignored: ['temperature', 'top_p',
+#     'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+#
+# `None` clears an inherited value (GenerationConfig.update sets the attribute), which is exactly
+# the state a greedy decode needs. num_beams=1 is explicit for the same reason it is everywhere
+# else here: beam search would make a verdict depend on a likelihood search rather than on what
+# the model emits
+GREEDY_GENERATION_KWARGS: dict = {
+    "do_sample": False,
+    "num_beams": 1,
+    "temperature": None,
+    "top_p": None,
+    "top_k": None,
+}
+
+
 def clear_inherited_max_length(model):
     """Drops the `max_length` a checkpoint ships in its generation_config.
 

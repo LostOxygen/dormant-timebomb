@@ -12,8 +12,9 @@
 #                attack covered. This is the control that rules out "a collapsed model is fragile,
 #                so any perturbation would do", and --num-random is matched to the number of
 #                behavioural checks the search itself performs so the two rates share a denominator.
-#   temperature  the verified suffixes re-scored with sampled decoding, since verification during
-#                the attack is greedy and every reported hit is therefore a greedy claim.
+#   temperature  the verified suffixes re-scored sample by sample with more draws than the search
+#                affords per check (the attack itself verifies with a majority over a few samples
+#                at the deployment decoding, or greedily under --verify_temperature 0).
 #   perplexity   the prompt scores the filter defence's ROC is drawn from.
 #   plots        run_vuln_plots.py over whatever the phases above produced.
 #
@@ -126,6 +127,17 @@ from utils.naming import mixture_tag
 print(mixture_tag(float(sys.argv[1])))' "$1"
 }
 
+# how the attack phase's behavioural checks decode, read out of the passthrough the same way
+# run_attack_sweep.sh does: the survival phase re-scores the hits of *those* files and the plots
+# draw *those* runs, so all three have to agree on the tag. Empty for a greedy sweep (-- -vt 0)
+if ! DECODING_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import verification_tag_from_argv
+print(verification_tag_from_argv(sys.argv[1:]))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the verification tag from the passthrough arguments" >&2
+    exit 2
+fi
+
 run() {
     echo "   \$ $*"
     if (( DRY_RUN )); then
@@ -143,6 +155,11 @@ echo "##   generations  : 0..$GENERATIONS"
 echo "##   models       : $MODELS"
 echo "##   real data    : $MIXTURES"
 echo "##   phases       : $PHASES"
+if [[ -n "$DECODING_TAG" ]]; then
+    echo "##   verification : sampled, attack files tagged $DECODING_TAG"
+else
+    echo "##   verification : greedy (untagged attack files)"
+fi
 echo "##   path         : $PATH_ROOT"
 echo "############################################################"
 
@@ -192,7 +209,13 @@ score_suffixes() {
     local name tag result out
     name="$(specifier_of "$size")"
     tag="$(mixture_tag_of "$mixture")"
-    out="$RESULTS_DIR/suffix_verification_gen${generation}_${name}${tag}_${source}_${mode}.json"
+    # the optimized suffixes come out of one attack file, so their survival file carries that
+    # file's verification tag; the random and init controls come from no attack file and do not
+    local attack_tag=""
+    if [[ "$source" == "optimized" ]]; then
+        attack_tag="$DECODING_TAG"
+    fi
+    out="$RESULTS_DIR/suffix_verification_gen${generation}_${name}${tag}${attack_tag}_${source}_${mode}.json"
 
     if [[ -f "$out" ]] && (( FORCE == 0 )); then
         echo "   already done: $(basename "$out")"
@@ -208,7 +231,7 @@ score_suffixes() {
     if [[ "$mode" == "sampled" ]]; then
         # the suffixes to re-score are the verified hits of the direct attack on this very cell;
         # with none of them there is nothing to say about survival
-        result="$RESULTS_DIR/attack_gen${generation}_${name}${tag}_vuln.json"
+        result="$RESULTS_DIR/attack_gen${generation}_${name}${tag}_vuln${DECODING_TAG}.json"
         if [[ ! -f "$result" ]]; then
             echo "   no attack result for generation $generation — skipped"
             return 0
@@ -293,7 +316,7 @@ if has_phase plots; then
     echo "== phase: plots =="
     for mode in none logit; do
         plots=("$PYTHON" "$SCRIPT_DIR/run_vuln_plots.py" -rp "$RESULTS_DIR"
-               -pp "$PATH_ROOT/plots" -bs "$BLOCK_SIZE" -m "$mode")
+               -pp "$PATH_ROOT/plots" -bs "$BLOCK_SIZE" -m "$mode" -vf "$DECODING_TAG")
         (( NO_USETEX )) && plots+=(--no_usetex)
         run "${plots[@]}" || FAILURES=$(( FAILURES + 1 ))
     done

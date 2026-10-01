@@ -41,6 +41,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from utils.colors import TColors
+from utils.utils import GREEDY_GENERATION_KWARGS
 from utils.poison import (
     control_eval_prompts,
     payload_leading,
@@ -90,8 +91,7 @@ def _generate(model, tokenizer, prompts: list, device: str, max_new_tokens: int)
         with torch.no_grad():
             generated = model.generate(
                 **inputs,
-                do_sample=False,
-                num_beams=1,
+                **GREEDY_GENERATION_KWARGS,
                 max_new_tokens=max_new_tokens,
                 pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
             )

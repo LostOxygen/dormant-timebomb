@@ -26,13 +26,17 @@ import os
 import re
 from dataclasses import dataclass, field
 
+from utils.naming import verification_tag
+
 # statuses, mirrored from run_attack.WRONG_STATUSES / run_attack_vuln so this module stays
 # import-light. A mismatch would be caught by check_status_vocabulary() below
 WRONG_STATUSES: tuple = ("fail", "fail_exception")
 PASS_STATUS: str = "pass"
 
-# ``attack_gen{g}_{name}{mixture}_vuln[_{method}_surrogate].json`` — used only to *find* the files
-# and to report where a record came from; every field below is read from the contents
+# ``attack_gen{g}_{name}{mixture}_vuln{verification}[_{method}_surrogate].json`` — used only to
+# *find* the files and to report where a record came from; every field below is read from the
+# contents. ``verification`` is empty for a greedy run and ``_T0.7p0.8k20x5``-style for a sampled
+# one (utils.naming.verification_tag); `load_records` keeps one of the two per figure
 RESULT_GLOB: str = "attack_gen*_vuln*.json"
 
 # the weakness each target introduces, for figure labels. Mirrors run_attack_vuln.VULN_TASKS, which
@@ -114,6 +118,10 @@ class AttackRecord:
         tasks: per-target outcomes, keyed by target name
         surrogate_quality: the SurrogateReport dict, or None outside transfer mode
         config: the SearchConfig the run used
+        verification_tag: how the behavioural checks decoded, as `utils.naming.verification_tag`
+            spells it in the file name: "" for greedy, "_T0.7p0.8k20x5"-style when sampled.
+            Derived from `config`, so a file from before sampled verification existed (no
+            ``verify_temperature`` key) reads as greedy, which is what it was
     """
 
     path: str
@@ -128,6 +136,7 @@ class AttackRecord:
     tasks: dict = field(default_factory=dict)
     surrogate_quality: dict | None = None
     config: dict = field(default_factory=dict)
+    verification_tag: str = ""
 
     @property
     def attackable(self) -> list:
@@ -199,6 +208,7 @@ def load_record(path: str) -> AttackRecord:
     names = [row["task"] for row in report["results"]]
     names += [name for name in (probe.get("per_task") or {}) if name not in names]
     by_name = {row["task"]: row for row in report["results"]}
+    config = report.get("config") or {}
 
     return AttackRecord(
         path=path,
@@ -212,7 +222,13 @@ def load_record(path: str) -> AttackRecord:
         aborted=bool(report.get("aborted", False)),
         tasks={name: _task_outcome(name, by_name.get(name, {}), probe) for name in names},
         surrogate_quality=report.get("surrogate_quality"),
-        config=report.get("config") or {},
+        config=config,
+        verification_tag=verification_tag(
+            temperature=float(config.get("verify_temperature", 0.0)),
+            top_p=float(config.get("verify_top_p", 0.0)),
+            top_k=int(config.get("verify_top_k", 0)),
+            num_samples=int(config.get("verify_samples", 1)),
+        ),
     )
 
 
@@ -221,6 +237,7 @@ def load_records(
     specifier_name: str = "",
     surrogate_method: str = "",
     real_data_fraction: float | None = None,
+    verification: str | None = None,
 ) -> list:
     """Reads every vulnerability result under `results_dir`, optionally filtered.
 
@@ -229,6 +246,9 @@ def load_records(
         specifier_name (str): keep only this model's runs, e.g. "Qwen2.5-Coder-0.5B-Instruct"
         surrogate_method (str): keep only "none" (direct) or "logit" (transfer)
         real_data_fraction (float | None): keep only this mixture
+        verification (str | None): keep only runs whose behavioural checks decoded this way, as
+            a `utils.naming.verification_tag` ("" for greedy). None keeps every run, which mixes
+            greedy and sampled claims of the same generation — a figure should always pass one
 
     Returns:
         list: AttackRecords sorted by (model, mixture, method, generation)
@@ -247,6 +267,8 @@ def load_records(
         if real_data_fraction is not None and abs(
             record.real_data_fraction - real_data_fraction
         ) > 1e-9:
+            continue
+        if verification is not None and record.verification_tag != verification:
             continue
         records.append(record)
     records.sort(

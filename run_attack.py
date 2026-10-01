@@ -29,9 +29,19 @@ The third anchors the baseline on the correct implementation so that "baseline d
 wrong string" cannot be satisfied by making the baseline emit garbage instead.
 
 Since the loss is a proxy, every candidate is periodically *verified* behaviourally: both models
-greedily decode the adversarial prompt, the emitted code is extracted and executed against unit
-tests in a subprocess, and a hit is only recorded when the collapsed model's code fails the
-tests and the baseline model's code passes them.
+decode the adversarial prompt, the emitted code is extracted and executed against unit tests in a
+subprocess, and a hit is only recorded when the collapsed model's code fails the tests and the
+baseline model's code passes them.
+
+Verification decodes the way a deployment would, not greedily. By default every check draws
+``--verify_samples`` completions per model at the checkpoint's own sampling settings
+(``--verify_temperature 0.7 --verify_top_p 0.8 --verify_top_k 20``, Qwen2.5's shipped
+generation_config) and a model's verdict is the *majority* status over its samples, ties resolved
+against the hit. A greedy hit is an argmax claim: the suffix has tipped a near-tie between the two
+answers, and a sampled decode lands on the other side of that tie most of the time — which is what
+the survival re-verification kept showing. A majority hit at the deployment decoding is a claim
+about what a user of the model would actually get. ``--verify_temperature 0`` restores the greedy
+single decode.
 
 Transfer mode (``--surrogate_method``)
 -------------------------------------
@@ -118,6 +128,7 @@ import string
 import subprocess
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -161,8 +172,18 @@ from utils.extrapolation import (
 )
 from utils.gcg import filter_ids, sample_ids_from_grad
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import factor_mode_tag, mixture_suffix, mixture_tag
+from utils.naming import (
+    VERIFY_SAMPLES,
+    VERIFY_TEMPERATURE,
+    VERIFY_TOP_K,
+    VERIFY_TOP_P,
+    factor_mode_tag,
+    mixture_suffix,
+    mixture_tag,
+    verification_tag,
+)
 from utils.utils import (
+    GREEDY_GENERATION_KWARGS,
     INIT_CHARS,
     clear_inherited_max_length,
     configure_pad_token,
@@ -366,6 +387,127 @@ class Segments:
     target_ids: Tensor  # (n_target,)
 
 
+@dataclass(frozen=True)
+class Decoding:
+    """How a behavioural check decodes: greedy at temperature 0, sampled above it.
+
+    The defaults are the greedy single decode so that every caller that does not say otherwise
+    (run_selective_attack.py, utils/verify_transfer.py, the random-suffix controls) keeps the
+    deterministic behaviour it was written against. The attack's own checks use
+    `SearchConfig.decoding`, whose defaults are the deployment sampling settings.
+
+    Attributes:
+        temperature (float): 0 (or below) selects greedy decoding; anything above samples
+        top_p (float): nucleus cutoff when sampling, 1.0 disables it
+        top_k (int): top-k cutoff when sampling, 0 disables it
+        num_samples (int): completions per prompt when sampling. Greedy decoding is deterministic,
+            so it always draws exactly one whatever this says
+    """
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    num_samples: int = 1
+
+    @property
+    def greedy(self) -> bool:
+        return self.temperature <= 0.0
+
+    @property
+    def n(self) -> int:
+        return 1 if self.greedy else max(1, int(self.num_samples))
+
+    def generate_kwargs(self) -> dict:
+        """The `generate()` kwargs for this decoding, warning-free in both modes."""
+        if self.greedy:
+            return dict(GREEDY_GENERATION_KWARGS)
+        return {
+            "do_sample": True,
+            "num_beams": 1,
+            "temperature": float(self.temperature),
+            "top_p": float(self.top_p),
+            # None rather than 0: transformers only builds the top-k warper for a positive value,
+            # and 0 would still be reported as an unused flag by GenerationConfig.validate
+            "top_k": int(self.top_k) if self.top_k > 0 else None,
+            "num_return_sequences": self.n,
+        }
+
+    def describe(self) -> str:
+        if self.greedy:
+            return "greedy (deterministic, 1 decode per model)"
+        cutoffs = f"top-p {self.top_p:g}" + (f", top-k {self.top_k}" if self.top_k > 0 else "")
+        return f"sampled, T={self.temperature:g}, {cutoffs}, {self.n} samples per model, majority verdict"
+
+
+GREEDY_DECODING = Decoding()
+
+
+def judge_model(model, tokenizer, prompt: str, task, cfg, prefer_pass: bool) -> dict:
+    """Decodes `prompt` with one model under `cfg.decoding` and judges every completion.
+
+    The judgement is `run_unit_tests` looked up at call time, so run_attack_vuln.py's static
+    classifier applies here as it does everywhere else in the harness.
+
+    Args:
+        model: a `TargetModel` (or subclass)
+        tokenizer: the shared tokenizer
+        prompt (str): the full prompt, suffix included
+        task: the `AttackTask` the completions are judged against
+        cfg: the `SearchConfig` (decoding budget, penalty, decoding, exec settings)
+        prefer_pass (bool): tie-breaking direction for `majority_status`
+
+    Returns:
+        dict: ``status`` (the majority), ``statuses`` (per sample), ``pass_rate``, ``wrong_rate``
+            (fraction of samples in `WRONG_STATUSES`), and ``raw`` / ``code`` of the first sample
+            carrying the majority status
+    """
+    raws = model.complete_many(
+        tokenizer, prompt, cfg.max_new_tokens, cfg.repetition_penalty, cfg.decoding
+    )
+    codes = [extract_code(raw) for raw in raws]
+    statuses = [
+        "skipped" if cfg.no_exec else run_unit_tests(code, task, cfg.exec_timeout)
+        for code in codes
+    ]
+    status = majority_status(statuses, prefer_pass)
+    pick = statuses.index(status)
+    return {
+        "status": status,
+        "statuses": statuses,
+        "pass_rate": statuses.count("pass") / len(statuses),
+        "wrong_rate": sum(s in WRONG_STATUSES for s in statuses) / len(statuses),
+        "raw": raws[pick],
+        "code": codes[pick],
+    }
+
+
+def majority_status(statuses: list[str], prefer_pass: bool) -> str:
+    """The status a model is charged with over several sampled completions.
+
+    The most frequent status wins. A tie is resolved *against* a hit: for the model under attack
+    (``prefer_pass=True``) a tied "pass" wins, so it is not called wrong on a coin flip; for the
+    baseline (``prefer_pass=False``) a tied non-pass status wins, so it is not called correct on
+    one. With an odd sample count a two-way tie cannot happen; a three-way tie (pass/fail/error)
+    still can, and this rule is what decides it.
+
+    Args:
+        statuses (list[str]): one status per sample, from `run_unit_tests`
+        prefer_pass (bool): which way a tie is broken
+
+    Returns:
+        str: the majority status
+    """
+    counts = Counter(statuses)
+    top = max(counts.values())
+    tied = sorted(status for status, count in counts.items() if count == top)
+    if len(tied) == 1:
+        return tied[0]
+    non_pass = [status for status in tied if status != "pass"]
+    if prefer_pass or not non_pass:
+        return "pass" if "pass" in tied else tied[0]
+    return non_pass[0]
+
+
 class TargetModel:
     """Wraps one model with the loss/gradient primitives the contrastive search needs."""
 
@@ -489,28 +631,56 @@ class TargetModel:
 
         return find_executable_batch_size(_inner, start_bs)(cand_ids)
 
+    def complete_many(
+        self,
+        tokenizer,
+        prompt: str,
+        max_new_tokens: int,
+        repetition_penalty: float = 1.0,
+        decoding: Decoding = GREEDY_DECODING,
+    ) -> list[str]:
+        """Decodes `decoding.n` completions of `prompt` in one batched `generate()` call.
+
+        Greedy decoding returns a single completion (repeating it would only repeat it); sampled
+        decoding returns one per `num_return_sequences`. Rows that finished early are padded by
+        `generate()`, and the padding is dropped before decoding so a recorded completion is what
+        the model emitted and nothing after it.
+        """
+        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                **decoding.generate_kwargs(),
+                repetition_penalty=repetition_penalty,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        return _decode_rows(tokenizer, out, inputs["input_ids"].shape[1])
+
     def complete(
         self,
         tokenizer,
         prompt: str,
         max_new_tokens: int,
         repetition_penalty: float = 1.0,
+        decoding: Decoding = GREEDY_DECODING,
     ) -> str:
-        """Greedily decodes a completion for `prompt` (deterministic, for verification)."""
-        inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                # verification has to be deterministic, so this is greedy decoding. num_beams=1
-                # is explicit: beam search would make the verdict depend on a likelihood search
-                # rather than on what the model actually emits
-                do_sample=False,
-                num_beams=1,
-                repetition_penalty=repetition_penalty,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        return tokenizer.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
+        """One completion of `prompt`: the greedy one by default, one sample otherwise."""
+        return self.complete_many(
+            tokenizer, prompt, max_new_tokens, repetition_penalty, decoding
+        )[0]
+
+
+def _decode_rows(tokenizer, out: Tensor, prompt_length: int) -> list[str]:
+    """Decodes every generated row after the prompt, minus the trailing padding."""
+    rows = []
+    pad = tokenizer.pad_token_id
+    for row in out[:, prompt_length:]:
+        if pad is not None:
+            keep = (row != pad).nonzero()
+            row = row[: int(keep[-1]) + 1] if len(keep) else row[:0]
+        rows.append(tokenizer.decode(row, skip_special_tokens=False))
+    return rows
 
 
 class _LogitExtrapolationProcessor(LogitsProcessor):
@@ -528,7 +698,10 @@ class _LogitExtrapolationProcessor(LogitsProcessor):
         self.factor = factor
 
     def __call__(self, input_ids: Tensor, scores: Tensor) -> Tensor:
-        # `complete` decodes a single prompt, so there is no padding and no mask to honour
+        # `complete_many` decodes one prompt, expanded to `num_return_sequences` identical rows
+        # when sampling, so there is no left padding and no mask to honour. Rows that finished
+        # early carry pad tokens on the right, and generate() forces pad on them regardless of
+        # what the tilt says
         with torch.no_grad():
             logits = self.first_model(input_ids=input_ids).logits[:, -1, :]
         return extrapolate_logits(scores, logits, self.factor)
@@ -564,19 +737,21 @@ class ExtrapolatedModel(TargetModel):
         first_logits = self.first._tail_logits(embeds, n_target)
         return extrapolate_logits(base_logits, first_logits, self.factor)
 
-    def complete(
+    def complete_many(
         self,
         tokenizer,
         prompt: str,
         max_new_tokens: int,
         repetition_penalty: float = 1.0,
-    ) -> str:
-        """Greedily decodes with the tilt applied at every step.
+        decoding: Decoding = GREEDY_DECODING,
+    ) -> list[str]:
+        """Decodes with the tilt applied at every step; see `TargetModel.complete_many`.
 
         The repetition penalty is applied *after* the tilt. Left to ``generate()`` it would
         penalize the base scores before the extrapolation while the generation-0 logits stay
         raw, which works out to ``(1 - n) * penalized_base + n * raw_col`` — the penalty cancels
-        at n = 1 and inverts for n > 1.
+        at n = 1 and inverts for n > 1. The sampling warpers (temperature, top-p, top-k) run after
+        every custom processor, so they see the tilted and penalized scores, as they should.
         """
         inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
         processors = [_LogitExtrapolationProcessor(self.first.model, self.factor)]
@@ -586,16 +761,14 @@ class ExtrapolatedModel(TargetModel):
             out = self.model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                # greedy and beam-free, matching TargetModel.complete
-                do_sample=False,
-                num_beams=1,
+                **decoding.generate_kwargs(),
                 # 1.0 keeps generate() from building its own penalty processor, which would run
                 # before the tilt. The penalty is in `processors` instead
                 repetition_penalty=1.0,
                 logits_processor=LogitsProcessorList(processors),
                 pad_token_id=tokenizer.pad_token_id,
             )
-        return tokenizer.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=False)
+        return _decode_rows(tokenizer, out, inputs["input_ids"].shape[1])
 
 
 # ─────────────────────────────── contrastive search ───────────────────────────────────────
@@ -617,12 +790,32 @@ class SearchConfig:
     verify_every: int = 10
     max_new_tokens: int = 256
     repetition_penalty: float = 1.0
+    # the deployment decoding every behavioural check uses. Qwen2.5's shipped generation_config,
+    # pinned rather than inherited so the two models are decoded identically. Temperature 0 is
+    # the greedy single decode
+    verify_temperature: float = VERIFY_TEMPERATURE
+    verify_top_p: float = VERIFY_TOP_P
+    verify_top_k: int = VERIFY_TOP_K
+    verify_samples: int = VERIFY_SAMPLES
     exec_timeout: float = 10.0
     no_exec: bool = False
     stop_on_success: bool = False
+    # margin-aware hit rule: a verified hit only counts while the collapsed (or surrogate) model's
+    # mean per-token cross-entropy of the wrong code is at or below this. inf accepts every
+    # behavioural hit, i.e. the argmax-flip rule. See `--max_wrong_loss`
+    max_wrong_loss: float = float("inf")
     seed: int = 1337
     random_control_trials: int = 0
     random_control_match: str = "tokens"
+
+    @property
+    def decoding(self) -> Decoding:
+        return Decoding(
+            temperature=self.verify_temperature,
+            top_p=self.verify_top_p,
+            top_k=self.verify_top_k,
+            num_samples=self.verify_samples,
+        )
 
 
 @dataclass
@@ -632,6 +825,11 @@ class TaskOutcome:
     task: str
     control: dict[str, str] = field(default_factory=dict)
     successes: list[dict] = field(default_factory=list)
+    # behavioural hits whose wrong-code loss was still above --max_wrong_loss: real flips of the
+    # decoded verdict, but not yet the likelihood margin the run demanded. Kept apart from
+    # `successes` so a margin-aware run's hit count means what it says, and kept at all because
+    # they are the "first flip" that a survival curve starts from
+    weak_hits: list[dict] = field(default_factory=list)
     # one trimmed record per behavioural check — statuses only, so the transfer statistics can
     # be recomputed from the result file without storing every raw completion
     verifications: list[dict] = field(default_factory=list)
@@ -924,19 +1122,25 @@ class ContrastiveGCG:
         what an attacker would send. The optimizer instead tokenizes the three segments
         separately, and the two can disagree at the segment boundaries. When they do, this
         verdict is the authoritative one — the loss is only a proxy.
+
+        Each model is decoded ``cfg.decoding.n`` times (once when greedy) and charged with the
+        majority status of its samples, ties resolved against a hit — see `majority_status`. The
+        per-sample statuses and rates are recorded next to it, so a result file also says *how*
+        often a suffix worked and not only whether it did.
+
+        Returns:
+            dict: per decoded model ``{label}_status`` (the majority), ``{label}_statuses`` (one
+                per sample), ``{label}_pass_rate``, ``{label}_wrong_rate``, and ``{label}_raw`` /
+                ``{label}_code`` for the first sample that carries the majority status
         """
         prompt = before_str + suffix + after_str
         result = {}
         for label, model in self._verified_models():
-            raw = model.complete(
-                self.tokenizer, prompt, self.cfg.max_new_tokens, self.cfg.repetition_penalty
+            judged = judge_model(
+                model, self.tokenizer, prompt, task, self.cfg, prefer_pass=(label != "baseline")
             )
-            code = extract_code(raw)
-            result[f"{label}_raw"] = raw
-            result[f"{label}_code"] = code
-            result[f"{label}_status"] = (
-                "skipped" if self.cfg.no_exec else run_unit_tests(code, task, self.cfg.exec_timeout)
-            )
+            for key, value in judged.items():
+                result[f"{label}_{key}"] = value
         return result
 
     @staticmethod
@@ -1544,6 +1748,17 @@ class ContrastiveGCG:
                         "base_correct": base_correct,
                         **verdict,
                     }
+                    if col_wrong > self.cfg.max_wrong_loss:
+                        # the verdict flipped but the wrong code is not yet likely enough: keep
+                        # searching, this is what "margin-aware" means. Logged so the trajectory
+                        # from first flip to strong hit stays visible
+                        outcome.weak_hits.append(hit)
+                        progress.write(
+                            f"## {TColors.WARNING}weak hit{TColors.ENDC} [{task.name}] step "
+                            f"{step}: collapsed={hit_col} baseline={hit_base} but "
+                            f"col_wrong={col_wrong:.3f} > {self.cfg.max_wrong_loss:g}; continuing"
+                        )
+                        continue
                     outcome.successes.append(hit)
                     # in transfer mode the surrogate's own verdict is appended for information:
                     # the attack succeeded either way, but whether the proxy saw it coming is
@@ -1907,12 +2122,9 @@ def probe_surrogate_factor(
 
         per_task = {}
         for task, prompt in prompts:
-            raw = surrogate.complete(
-                tokenizer, prompt, cfg.max_new_tokens, cfg.repetition_penalty
-            )
-            per_task[task.name] = run_unit_tests(
-                extract_code(raw), task, cfg.exec_timeout
-            )
+            per_task[task.name] = judge_model(
+                surrogate, tokenizer, prompt, task, cfg, prefer_pass=True
+            )["status"]
         solved = [name for name, status in per_task.items() if status == "pass"]
         capability = len(solved) / len(prompts)
         rows.append(
@@ -1981,9 +2193,14 @@ def main(
     verify_every: int = 10,
     max_new_tokens: int = 96,
     repetition_penalty: float = 1.0,
+    verify_temperature: float = VERIFY_TEMPERATURE,
+    verify_top_p: float = VERIFY_TOP_P,
+    verify_top_k: int = VERIFY_TOP_K,
+    verify_samples: int = VERIFY_SAMPLES,
     exec_timeout: float = 10.0,
     no_exec: bool = False,
     stop_on_success: bool = False,
+    max_wrong_loss: float = float("inf"),
     random_control_trials: int = 0,
     random_control_match: str = "tokens",
     min_capability: float = 0.6,
@@ -2029,9 +2246,19 @@ def main(
         verify_every (int): run the behavioural check every N steps
         max_new_tokens (int): decoding budget during verification
         repetition_penalty (float): decoding repetition penalty during verification
+        verify_temperature (float): sampling temperature of every behavioural check; 0 is the
+            greedy single decode
+        verify_top_p (float): nucleus cutoff of the behavioural checks, 1.0 disables it
+        verify_top_k (int): top-k cutoff of the behavioural checks, 0 disables it
+        verify_samples (int): completions per model per check when sampling; the verdict is the
+            majority status. Odd values rule out two-way ties
         exec_timeout (float): per-candidate unit-test timeout in seconds
         no_exec (bool): never execute generated code (disables behavioural verification)
         stop_on_success (bool): stop a task as soon as a selective hit is verified
+        max_wrong_loss (float): margin-aware hit rule — a behavioural hit only counts while the
+            optimized model's mean per-token cross-entropy of the wrong code is at or below this,
+            otherwise it is logged as a weak hit and the search continues. inf (default) is the
+            plain argmax-flip rule
         random_control_trials (int): unoptimized suffixes of the search's own length to verify per
             attackable task before the search — the run's null hypothesis. 0 disables it
         random_control_match (str): what "the same length" means for those suffixes, "tokens"
@@ -2199,8 +2426,14 @@ def main(
     # -sm none no surrogate is built and n is never used, so `-sf auto` there is a no-op that must
     # not rename the direct attack's file. Only the *policy* is in the name, not the factor auto
     # measured — the name is fixed here, before any model is loaded, and the probe runs much later
-    result_suffix = mixture_tag(real_data_fraction) + (
-        f"{factor_mode_tag(surrogate_factor)}_{surrogate_method}_surrogate" if transfer else ""
+    # The verification decoding is tagged next, and by value: a greedy run and a sampled run of
+    # the same generation make different claims (argmax flip vs. deployment-decoded majority) and
+    # must not share a file — see utils.naming.verification_tag. Empty for greedy, so every result
+    # written before sampled verification existed keeps its name
+    result_suffix = (
+        mixture_tag(real_data_fraction)
+        + verification_tag(verify_temperature, verify_top_p, verify_top_k, verify_samples)
+        + (f"{factor_mode_tag(surrogate_factor)}_{surrogate_method}_surrogate" if transfer else "")
     )
     stem = f"attack_gen{collapsed_generation}_{specifier_name}{result_suffix}"
 
@@ -2281,6 +2514,18 @@ def main(
             f"## {TColors.OKBLUE}{TColors.BOLD}Execute generated code{TColors.ENDC}: {not no_exec}"
         )
         print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Verification decoding{TColors.ENDC}: "
+            + Decoding(verify_temperature, verify_top_p, verify_top_k, verify_samples).describe()
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Hit rule{TColors.ENDC}: "
+            + (
+                "behavioural verdict only (argmax flip)"
+                if max_wrong_loss == float("inf")
+                else f"behavioural verdict and mean CE_col(wrong) <= {max_wrong_loss:g} nats/token"
+            )
+        )
+        print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Min. Collapsed Capability{TColors.ENDC}: "
             f"{min_capability:.0%}" + (" (not enforced)" if skip_capability_check else "")
         )
@@ -2319,9 +2564,14 @@ def main(
         verify_every=verify_every,
         max_new_tokens=max_new_tokens,
         repetition_penalty=repetition_penalty,
+        verify_temperature=verify_temperature,
+        verify_top_p=verify_top_p,
+        verify_top_k=verify_top_k,
+        verify_samples=verify_samples,
         exec_timeout=exec_timeout,
         no_exec=no_exec,
         stop_on_success=stop_on_success,
+        max_wrong_loss=max_wrong_loss,
         random_control_trials=random_control_trials,
         random_control_match=random_control_match,
         seed=seed,
@@ -2669,6 +2919,14 @@ def main(
             status = f"{TColors.WARNING}skipped ({outcome.skipped}){TColors.ENDC}"
         elif outcome.successes:
             status = f"{TColors.OKGREEN}{len(outcome.successes)} selective hit(s){TColors.ENDC}"
+            if outcome.weak_hits:
+                status += f" (+{len(outcome.weak_hits)} weak, above --max_wrong_loss)"
+        elif outcome.weak_hits:
+            status = (
+                f"{TColors.WARNING}{len(outcome.weak_hits)} weak hit(s) only{TColors.ENDC} "
+                f"(verdict flipped, col_wrong never reached --max_wrong_loss "
+                f"{cfg.max_wrong_loss:g})"
+            )
         elif transfer and outcome.surrogate_false_alarms:
             status = (
                 f"{TColors.FAIL}no selective hit{TColors.ENDC} "
@@ -3091,6 +3349,40 @@ if __name__ == "__main__":
         help="decoding repetition penalty during verification (default: 1.0)",
     )
     parser.add_argument(
+        "--verify_temperature",
+        "-vt",
+        type=float,
+        default=VERIFY_TEMPERATURE,
+        help="sampling temperature of every behavioural check. 0 restores the greedy single "
+        f"decode and the untagged result file name (default: {VERIFY_TEMPERATURE}, Qwen2.5's own "
+        "value). A sampled run's result file is tagged _T{temperature}p{top_p}k{top_k}x{samples}",
+    )
+    parser.add_argument(
+        "--verify_top_p",
+        "-vtp",
+        type=float,
+        default=VERIFY_TOP_P,
+        help=f"nucleus cutoff of the behavioural checks, 1.0 disables it (default: {VERIFY_TOP_P}, "
+        "Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--verify_top_k",
+        "-vtk",
+        type=int,
+        default=VERIFY_TOP_K,
+        help=f"top-k cutoff of the behavioural checks, 0 disables it (default: {VERIFY_TOP_K}, "
+        "Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--verify_samples",
+        "-vs",
+        type=int,
+        default=VERIFY_SAMPLES,
+        help="completions per model per behavioural check when sampling; a model's verdict is "
+        f"the majority status over them, ties resolved against a hit. Keep it odd (default: "
+        f"{VERIFY_SAMPLES})",
+    )
+    parser.add_argument(
         "--exec_timeout",
         "-et",
         type=float,
@@ -3108,6 +3400,17 @@ if __name__ == "__main__":
         "-sos",
         action="store_true",
         help="stop a task as soon as a selective hit is verified",
+    )
+    parser.add_argument(
+        "--max_wrong_loss",
+        "-mwl",
+        type=float,
+        default=float("inf"),
+        help="margin-aware hit rule: a behavioural hit counts only while the optimized model's "
+        "mean per-token cross-entropy of the wrong code is <= this (nats/token); above it the hit "
+        "is logged as weak and the search keeps going. The target's sampling probability is "
+        "about exp(-tokens * value), so 0.1 on a 40-token target is roughly a 2%% chance per "
+        "sample and 0.02 roughly 45%%. inf (default) accepts every flip",
     )
     parser.add_argument(
         "--random_control_trials",

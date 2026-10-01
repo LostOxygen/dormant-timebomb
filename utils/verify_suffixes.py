@@ -13,10 +13,12 @@ about attributing a hit to the attack rather than to something cheaper:
   init`` scores the unoptimised starting string. Neither can be produced by run_attack_vuln.py
   itself: its behavioural check lives *inside* the optimisation loop, so the earliest suffix it
   ever verifies has already been mutated once.
-* **sampled decoding.** Verification during the attack is greedy and deterministic, which makes
-  every reported hit a greedy claim. ``--temperature 0.7 --num_samples 16`` re-scores the working
-  suffixes the way a deployment would decode and reports how many samples still satisfy the hit
-  criterion.
+* **sampled decoding.** Verification during the attack decodes at the deployment settings by
+  default (run_attack.py's ``--verify_temperature`` and friends) and charges each model with the
+  majority verdict over a handful of samples; a run made with ``--verify_temperature 0`` is a
+  greedy claim instead. ``--temperature 0.7 --num_samples 16`` re-scores the working suffixes
+  sample by sample, with more draws than the search affords per check, and reports how many
+  samples still satisfy the hit criterion.
 
 **The judgement is not reimplemented here.** ``run_attack_vuln.install_vulnerability_targets()``
 is applied and the verdict comes from ``run_attack.run_unit_tests``, i.e. the same static
@@ -103,9 +105,9 @@ MAX_NEW_TOKENS: int = args.max_new_tokens or run_attack_vuln.DECODING_BUDGET
 def sampled_completion(model, tokenizer, prompt: str) -> str:
     """Decodes one completion with sampling, mirroring TargetModel.complete otherwise.
 
-    Separate from ``TargetModel.complete`` rather than a flag on it: that method is the attack's
-    verification path and is greedy by design (``do_sample=False, num_beams=1``), so a temperature
-    argument there would let a sampled verdict be recorded as an attack result.
+    Kept separate from ``TargetModel.complete_many`` so that this script's per-sample scoring
+    stays independent of how the attack aggregates its own checks (a majority over
+    ``--verify_samples``): here every sample is a row of its own, never a vote.
     """
     inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
     with torch.no_grad():
@@ -306,6 +308,9 @@ for index, row in enumerate(rows, start=1):
 
 payload = {
     "source": args.source,
+    # which attack file the suffixes came from, so a survival figure can tell the re-score of a
+    # greedy attack run from that of a sampled one
+    "suffix_file": args.suffix_file,
     "mode": "greedy" if GREEDY else "sampled",
     "temperature": args.temperature,
     "top_p": args.top_p,

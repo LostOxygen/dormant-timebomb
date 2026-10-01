@@ -56,7 +56,7 @@ from utils.execution import extract_code, run_tests
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import mixture_suffix, mixture_tag
 from utils.perplexity import SCORING_SYSTEM_PROMPT
-from utils.utils import clear_inherited_max_length
+from utils.utils import GREEDY_GENERATION_KWARGS, clear_inherited_max_length
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -163,8 +163,7 @@ def generate(model, tokenizer, prompts: list, max_new_tokens: int, batch_size: i
             output = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=1,
+                **GREEDY_GENERATION_KWARGS,
                 pad_token_id=tokenizer.pad_token_id,
             )
         # the batch is left padded, so the prompt is a constant-length prefix and the continuation

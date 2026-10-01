@@ -36,6 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from utils.colors import TColors
+from utils.naming import find_verification_tag, verification_tag
 from utils.plotting import (
     ANCHOR_COLOR,
     BASELINE_COLOR,
@@ -365,14 +366,18 @@ def figure_surrogate(records: list, args) -> list:
 
 # ─────────────────────── E4: does a hit survive sampled decoding ───────────────────────────
 def figure_temperature(records: list, args) -> list:
-    """Survival of verified hits when decoding is sampled instead of greedy.
+    """Survival of verified hits when re-decoded sample by sample.
 
-    Verification is greedy and deterministic, so every reported hit is a greedy claim. A hit that
-    disappears at temperature 0.7 is a weaker threat, and the per-target spread is what says
-    whether that is a property of the attack or of one target.
+    A greedy attack run's hits are argmax claims; a sampled run's are majority claims over a few
+    samples. Either way this re-scores them with more draws, and a hit that disappears is a weaker
+    threat; the per-target spread is what says whether that is a property of the attack or of one
+    target. Only the re-scores of the attack runs selected by --verification are drawn: the
+    survival file carries the attack file's tag in its name (run_vuln_eval.sh), and mixing the two
+    would average two different claims.
     """
     payloads = [p for p in read_json_glob(args.results_path, "suffix_verification_*sampled*.json")
-                if p.get("source") == "optimized"]
+                if p.get("source") == "optimized"
+                and find_verification_tag(os.path.basename(p["_path"])) == args.verification]
     if not payloads:
         return []
     per_target: dict = {}
@@ -571,6 +576,12 @@ def main() -> None:
                         help="which attack mode the single-mode figures use (default: none)")
     parser.add_argument("--block_size", "-bs", type=int, default=512,
                         help="block size, for the output file names (default: 512)")
+    parser.add_argument("--verification", "-vf", type=str, default=verification_tag(),
+                        help="which attack runs to draw, by how their behavioural checks decoded: "
+                        "the utils.naming.verification_tag in the result file names, e.g. "
+                        f"'{verification_tag()}', or '' (empty) for greedy runs (default: the "
+                        "attack's default decoding). Greedy and sampled runs of one generation "
+                        "make different claims and are never drawn together")
     parser.add_argument("--no_usetex", dest="usetex", action="store_false",
                         help="render without LaTeX, for machines without a TeX install")
     parser.add_argument("--show", action="store_true", help="also open the figures")
@@ -582,11 +593,16 @@ def main() -> None:
     if unknown:
         raise SystemExit(f"unknown figure(s) {unknown}; choose from {list(FIGURES)}")
 
-    records = load_records(args.results_path, specifier_name=args.model_specifier_name)
+    records = load_records(
+        args.results_path,
+        specifier_name=args.model_specifier_name,
+        verification=args.verification,
+    )
     if not records:
         raise SystemExit(
-            f"{TColors.FAIL}no vulnerability results under {args.results_path}{TColors.ENDC}. "
-            f"Run ./run_vuln_eval.sh first."
+            f"{TColors.FAIL}no vulnerability results under {args.results_path} with "
+            f"verification {args.verification!r}{TColors.ENDC}. Run ./run_vuln_eval.sh first, or "
+            f"pass -vf '' for greedy runs / the tag of the sampled runs on disk."
         )
     missing = unknown_targets(records)
     if missing:
@@ -594,7 +610,8 @@ def main() -> None:
               f"utils/vuln_results.TARGET_CWE")
 
     print(f"## {TColors.BOLD}{len(records)} attack result(s){TColors.ENDC} from "
-          f"{args.results_path}")
+          f"{args.results_path}, verification "
+          f"{args.verification or 'greedy'}")
     apply_perplexity_style(args.usetex, font_size=18)
     for name in requested:
         drawn = FIGURES[name](records, args)

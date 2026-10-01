@@ -43,7 +43,13 @@ Args:
     collapsed_model_path (str): explicit target checkpoint, overriding the resolution.
     baseline_model_path (str): explicit baseline checkpoint.
     max_new_tokens (int): decoding length cap of the verification.
-    repetition_penalty (float): verification decoding penalty. 1.0 is plain greedy decoding.
+    repetition_penalty (float): verification decoding penalty, 1.0 disables it.
+    verify_temperature (float): decoding temperature of the verification, 0 for greedy. The
+        defaults mirror run_attack.py's: the deployment sampling settings with a majority verdict
+        over --verify_samples completions, so a suffix is judged here exactly as the attack judged it.
+    verify_top_p (float): nucleus cutoff when sampling.
+    verify_top_k (int): top-k cutoff when sampling, 0 disables it.
+    verify_samples (int): completions per model per check when sampling.
     exec_timeout (float): per-task unit test timeout.
     label (str): free-form name of the target run, copied into the output for bookkeeping.
 
@@ -92,6 +98,10 @@ parser.add_argument("--collapsed_model_path", "-cmp", type=str, default="")
 parser.add_argument("--baseline_model_path", "-bmp", type=str, default="")
 parser.add_argument("--max_new_tokens", "-mnt", type=int, default=96)
 parser.add_argument("--repetition_penalty", "-rp", type=float, default=1.0)
+parser.add_argument("--verify_temperature", "-vt", type=float, default=0.7)
+parser.add_argument("--verify_top_p", "-vtp", type=float, default=0.8)
+parser.add_argument("--verify_top_k", "-vtk", type=int, default=20)
+parser.add_argument("--verify_samples", "-vs", type=int, default=5)
 parser.add_argument("--exec_timeout", "-et", type=float, default=10.0)
 parser.add_argument("--label", "-l", type=str, default="target")
 # the --real_data_fraction the target run was collapsed with; part of its checkpoint names from
@@ -142,6 +152,10 @@ collapsed = TargetModel(
 cfg = SearchConfig(
     max_new_tokens=args.max_new_tokens,
     repetition_penalty=args.repetition_penalty,
+    verify_temperature=args.verify_temperature,
+    verify_top_p=args.verify_top_p,
+    verify_top_k=args.verify_top_k,
+    verify_samples=args.verify_samples,
     exec_timeout=args.exec_timeout,
     no_exec=False,
 )
@@ -299,6 +313,11 @@ summary = {
     "verification": {
         "max_new_tokens": args.max_new_tokens,
         "repetition_penalty": args.repetition_penalty,
+        "decoding": cfg.decoding.describe(),
+        "verify_temperature": args.verify_temperature,
+        "verify_top_p": args.verify_top_p,
+        "verify_top_k": args.verify_top_k,
+        "verify_samples": args.verify_samples,
         "exec_timeout": args.exec_timeout,
     },
 }
