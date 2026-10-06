@@ -43,6 +43,17 @@ the survival re-verification kept showing. A majority hit at the deployment deco
 about what a user of the model would actually get. ``--verify_temperature 0`` restores the greedy
 single decode.
 
+The anchor is held, not only the baseline. The generation-0 collapsed model is what the attacker
+builds the surrogate from, and a suffix that breaks it as well as the target says only that the
+first fine-tune was fragile — not that collapse *progressed* into something exploitable. So by
+default the hit rule is three-sided: the target emits the wrong code, and both the pristine
+baseline and the generation-0 anchor keep emitting the correct one. The anchor is loaded as a
+real model, probed by the capability gate (a task it already fails is not attackable), held in the
+objective with the same hinge and anchor terms as the baseline, and decoded in every behavioural
+check. ``--no_anchor`` restores the two-sided rule; a generation-0 attack never holds it, since the
+anchor is the target there. Files of anchor-held runs carry ``_anchor``
+(``utils.naming.anchor_tag``), so the two claims never share a file.
+
 Transfer mode (``--surrogate_method``)
 -------------------------------------
 By default the search optimizes against the real collapsed checkpoint, which assumes the attacker
@@ -177,6 +188,7 @@ from utils.naming import (
     VERIFY_TEMPERATURE,
     VERIFY_TOP_K,
     VERIFY_TOP_P,
+    anchor_tag,
     factor_mode_tag,
     mixture_suffix,
     mixture_tag,
@@ -860,6 +872,9 @@ class CapabilityReport:
     collapsed_solved: list[str] = field(default_factory=list)
     collapsed_broken: list[str] = field(default_factory=list)
     baseline_broken: list[str] = field(default_factory=list)
+    # tasks the generation-0 anchor fails on the clean prompt; like baseline_broken these are
+    # excluded, since a model that already fails cannot be shown to have been *held* correct
+    anchor_broken: list[str] = field(default_factory=list)
     # transfer mode only, and purely informational: the surrogate's clean verdict is recorded
     # but never gates, since the proxy is a search tool and not the model under attack
     surrogate_broken: list[str] = field(default_factory=list)
@@ -1007,6 +1022,8 @@ class ContrastiveGCG:
     So the success criterion is the same in both modes:
 
         baseline   must stay correct  — the suffix must be benign against the pristine model
+        anchor     must stay correct  — and against the generation-0 model the surrogate is
+                                        built from (when one is given; see `hold_anchor`)
         collapsed  must break         — the suffix must elicit wrong code from the real model
     """
 
@@ -1017,10 +1034,14 @@ class ContrastiveGCG:
         tokenizer,
         cfg: SearchConfig,
         surrogate: TargetModel | None = None,
+        anchor: TargetModel | None = None,
     ):
         self.baseline = baseline
         self.collapsed = collapsed
         self.surrogate = surrogate
+        # the real generation-0 model, held correct like the baseline. None keeps the two-sided
+        # rule, which is what utils/verify_transfer.py and older callers get
+        self.anchor = anchor
         self.tokenizer = tokenizer
         self.cfg = cfg
         self.device = collapsed.device
@@ -1039,6 +1060,11 @@ class ContrastiveGCG:
         return self.surrogate is not None
 
     @property
+    def hold_anchor(self) -> bool:
+        """True when the generation-0 anchor is a condition of the hit."""
+        return self.anchor is not None
+
+    @property
     def optim_model(self) -> TargetModel:
         """The model the objective's "collapsed must break" term is evaluated on.
 
@@ -1054,6 +1080,8 @@ class ContrastiveGCG:
         surrogate is appended purely for the agreement statistics.
         """
         models = [("baseline", self.baseline), ("collapsed", self.collapsed)]
+        if self.anchor is not None:
+            models.append(("anchor", self.anchor))
         if self.surrogate is not None:
             models.append(("surrogate", self.surrogate))
         return tuple(models)
@@ -1086,11 +1114,28 @@ class ContrastiveGCG:
                 cand_ids, segs["base_correct"], self.cfg.batch_size
             )
             total = total + self.cfg.mu_correct * base_correct
+        # the anchor is held with the baseline's own two terms and weights: the same hinge away
+        # from the wrong code and the same pull toward the correct one
+        anc_wrong = anc_correct = None
+        if self.anchor is not None:
+            anc_wrong = self.anchor.candidate_losses(
+                cand_ids, segs["anc_wrong"], self.cfg.batch_size
+            )
+            total = total + self.cfg.lambda_base * torch.clamp(
+                self.cfg.margin - anc_wrong, min=0.0
+            )
+            if self.cfg.mu_correct > 0:
+                anc_correct = self.anchor.candidate_losses(
+                    cand_ids, segs["anc_correct"], self.cfg.batch_size
+                )
+                total = total + self.cfg.mu_correct * anc_correct
         return {
             "total": total,
             "col_wrong": col_wrong,
             "base_wrong": base_wrong,
             "base_correct": base_correct,
+            "anc_wrong": anc_wrong,
+            "anc_correct": anc_correct,
         }
 
     def combined_gradient(self, optim_ids: Tensor, segs: dict) -> tuple[Tensor, dict]:
@@ -1109,7 +1154,22 @@ class ContrastiveGCG:
             l_base_c, g_base_c = self.baseline.loss_and_grad(optim_ids, segs["base_correct"])
             grad = grad + self.cfg.mu_correct * g_base_c
 
-        losses = {"col_wrong": l_col, "base_wrong": l_base_w, "base_correct": l_base_c}
+        l_anc_w = l_anc_c = None
+        if self.anchor is not None:
+            l_anc_w, g_anc_w = self.anchor.loss_and_grad(optim_ids, segs["anc_wrong"])
+            if l_anc_w < self.cfg.margin and self.cfg.lambda_base > 0:
+                grad = grad - self.cfg.lambda_base * g_anc_w
+            if self.cfg.mu_correct > 0:
+                l_anc_c, g_anc_c = self.anchor.loss_and_grad(optim_ids, segs["anc_correct"])
+                grad = grad + self.cfg.mu_correct * g_anc_c
+
+        losses = {
+            "col_wrong": l_col,
+            "base_wrong": l_base_w,
+            "base_correct": l_base_c,
+            "anc_wrong": l_anc_w,
+            "anc_correct": l_anc_c,
+        }
         return grad, losses
 
     # ── verification ──
@@ -1137,7 +1197,10 @@ class ContrastiveGCG:
         result = {}
         for label, model in self._verified_models():
             judged = judge_model(
-                model, self.tokenizer, prompt, task, self.cfg, prefer_pass=(label != "baseline")
+                model, self.tokenizer, prompt, task, self.cfg,
+                # ties go against the hit: the model under attack is not called wrong on one, and
+                # the models that must hold are not called correct on one
+                prefer_pass=(label not in ("baseline", "anchor")),
             )
             for key, value in judged.items():
                 result[f"{label}_{key}"] = value
@@ -1145,16 +1208,19 @@ class ContrastiveGCG:
 
     @staticmethod
     def is_selective_hit(verdict: dict[str, str]) -> bool:
-        """True iff the real collapsed model is objectively wrong and the baseline is correct.
+        """True iff the collapsed model is wrong and the baseline (and the anchor, if held) correct.
 
         This is the success criterion in both modes. Where the suffix came from — the real model
         or a surrogate — does not enter it: an adversarial input works if it elicits wrong code
         from the model under attack while the pristine model still answers correctly. The
         surrogate's own verdict is a diagnostic about the proxy, never a condition for success.
+        The anchor's verdict is a condition whenever the verdict carries one: a suffix that also
+        breaks generation 0 is not evidence that collapse made the target exploitable.
         """
         return (
             verdict["collapsed_status"] in WRONG_STATUSES
             and verdict["baseline_status"] == "pass"
+            and verdict.get("anchor_status", "pass") == "pass"
         )
 
     # ── upfront capability gate ──
@@ -1206,32 +1272,36 @@ class ContrastiveGCG:
             report.per_task[task.name] = verdict
             report.n_probed += 1
 
-            # only the two real models gate anything. Whether the surrogate can solve the task
-            # is irrelevant: it is not the model under attack, it is only the thing the search
+            # only the real models gate anything. Whether the surrogate can solve the task is
+            # irrelevant: it is not the model under attack, it is only the thing the search
             # optimizes against, so its clean verdict is recorded but never gates
             col, base = verdict["collapsed_status"], verdict["baseline_status"]
+            anchor = verdict.get("anchor_status")
             if col == "pass":
                 report.collapsed_solved.append(task.name)
             else:
                 report.collapsed_broken.append(task.name)
             if base != "pass":
                 report.baseline_broken.append(task.name)
+            if anchor is not None and anchor != "pass":
+                report.anchor_broken.append(task.name)
 
             surrogate = verdict.get("surrogate_status")
             if surrogate is not None and surrogate != "pass":
                 report.surrogate_broken.append(task.name)
 
-            if col == "pass" and base == "pass":
+            if col == "pass" and base == "pass" and anchor in (None, "pass"):
                 report.usable.append(task.name)
 
             marker = f"{TColors.OKGREEN}ok{TColors.ENDC}" if col == "pass" else (
                 f"{TColors.FAIL}broken{TColors.ENDC}"
             )
+            anchor_column = "" if anchor is None else f" anchor={anchor:15s}"
             surrogate_column = (
                 "" if surrogate is None else f" surrogate={surrogate:15s}(not gated)"
             )
             print(
-                f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s}"
+                f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s}{anchor_column}"
                 f"{surrogate_column} -> collapsed {marker}"
             )
 
@@ -1255,7 +1325,7 @@ class ContrastiveGCG:
             report.aborted = True
             report.reason = (
                 "no task is attackable: every task the collapsed model solves is one the "
-                "baseline model does not"
+                "baseline model" + (" or the anchor" if self.hold_anchor else "") + " does not"
             )
         return report
 
@@ -1438,6 +1508,9 @@ class ContrastiveGCG:
             "base_wrong": self.baseline.build_segments(before_ids, after_ids, wrong_ids),
             "base_correct": self.baseline.build_segments(before_ids, after_ids, correct_ids),
         }
+        if self.anchor is not None:
+            segs["anc_wrong"] = self.anchor.build_segments(before_ids, after_ids, wrong_ids)
+            segs["anc_correct"] = self.anchor.build_segments(before_ids, after_ids, correct_ids)
 
         records = []
         for trial in range(trials):
@@ -1618,6 +1691,9 @@ class ContrastiveGCG:
             "base_wrong": self.baseline.build_segments(before_ids, after_ids, wrong_ids),
             "base_correct": self.baseline.build_segments(before_ids, after_ids, correct_ids),
         }
+        if self.anchor is not None:
+            segs["anc_wrong"] = self.anchor.build_segments(before_ids, after_ids, wrong_ids)
+            segs["anc_correct"] = self.anchor.build_segments(before_ids, after_ids, correct_ids)
 
         # every restart's initialization is drawn up front, so restart i gets the same string
         # whether the call runs all restarts or only that one
@@ -1694,6 +1770,11 @@ class ContrastiveGCG:
                     if scores["base_correct"] is not None
                     else None
                 )
+                anc_wrong = (
+                    scores["anc_wrong"][best].item()
+                    if scores["anc_wrong"] is not None
+                    else None
+                )
 
             suffix = self.tokenizer.decode(optim_ids, skip_special_tokens=True)
             outcome.history.append(
@@ -1704,6 +1785,7 @@ class ContrastiveGCG:
                     "col_wrong": col_wrong,
                     "base_wrong": base_wrong,
                     "base_correct": base_correct,
+                    "anc_wrong": anc_wrong,
                     "suffix": suffix,
                 }
             )
@@ -1746,6 +1828,7 @@ class ContrastiveGCG:
                         "col_wrong": col_wrong,
                         "base_wrong": base_wrong,
                         "base_correct": base_correct,
+                        "anc_wrong": anc_wrong,
                         **verdict,
                     }
                     if col_wrong > self.cfg.max_wrong_loss:
@@ -2211,6 +2294,7 @@ def main(
     surrogate_factor: float | str = 0.0,
     surrogate_model_path: str = "",
     first_collapsed_path: str = "",
+    hold_anchor: bool = True,
     real_data_fraction: float = 0.0,
     attack_gpus: int = 0,
     shard_units: str = "",
@@ -2278,6 +2362,9 @@ def main(
             probe_surrogate_factor
         surrogate_model_path (str): a prebuilt surrogate to use instead of building one, e.g.
             run_extrapolation.py's model_scaled_n<n>_* directory ("lora" only)
+        hold_anchor (bool): hold the generation-0 collapsed model correct as a third condition of
+            the hit, next to the baseline. Ignored for a generation-0 attack, where it is the
+            target. Anchor-held runs are filed under a name with ``_anchor``
         first_collapsed_path (str): explicit path to the generation-0 collapsed model the
             surrogate is built from (default: resolved from the model outputs)
         real_data_fraction (float): the --real_data_fraction run_baseline.py was given, which is
@@ -2410,6 +2497,15 @@ def main(
                 f"the surrogate is built from."
             )
 
+    # the anchor as a *real* model: generation 0, held correct next to the baseline. Never for a
+    # generation-0 attack, where it would be asked to break and to hold at once. Resolved as the
+    # merged checkpoint (load_model merges a bare adapter anyway), independently of the surrogate's
+    # own resolution, which under `lora` wants the adapter
+    anchor_held = hold_anchor and collapsed_generation > 0
+    anchor_dir = ""
+    if anchor_held:
+        anchor_dir = first_collapsed_path or resolve_collapsed_dir(0, specifier_name, block_size)
+
     selected = [t for t in TASKS if not tasks or t.name in tasks.split(",")]
     if not selected:
         raise SystemExit(f"no tasks matched {tasks!r}; use --list_tasks to see the names")
@@ -2433,6 +2529,7 @@ def main(
     result_suffix = (
         mixture_tag(real_data_fraction)
         + verification_tag(verify_temperature, verify_top_p, verify_top_k, verify_samples)
+        + anchor_tag(anchor_held)
         + (f"{factor_mode_tag(surrogate_factor)}_{surrogate_method}_surrogate" if transfer else "")
     )
     stem = f"attack_gen{collapsed_generation}_{specifier_name}{result_suffix}"
@@ -2523,6 +2620,15 @@ def main(
                 "behavioural verdict only (argmax flip)"
                 if max_wrong_loss == float("inf")
                 else f"behavioural verdict and mean CE_col(wrong) <= {max_wrong_loss:g} nats/token"
+            )
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Anchor (generation 0){TColors.ENDC}: "
+            + (
+                f"held correct, {anchor_dir}" if anchor_held
+                else "not held — " + (
+                    "it is the target" if collapsed_generation == 0 else "--no_anchor"
+                )
             )
         )
         print(
@@ -2651,9 +2757,28 @@ def main(
         )
         print(f"##   surrogate: {surrogate_description}")
 
+    anchor = None
+    if anchor_held:
+        # the logit surrogate already holds generation 0 in memory as the tilt's second model; the
+        # anchor wraps that same module rather than loading a second copy. Any other case loads it
+        reusable = (
+            isinstance(surrogate, ExtrapolatedModel)
+            and os.path.abspath(first_collapsed_dir) == os.path.abspath(anchor_dir)
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Loading anchor model{TColors.ENDC}"
+            + (" (shared with the logit surrogate)" if reusable else "")
+        )
+        anchor = TargetModel(
+            "anchor",
+            surrogate.first.model if reusable
+            else load_model(anchor_dir, torch_device, dtype, base_for_adapter=model_specifier),
+            torch_device,
+        )
+
     # the contrastive gradient adds one-hot gradients from both models, which is only
     # meaningful if they share a vocabulary
-    for other in (collapsed, surrogate):
+    for other in (collapsed, surrogate, anchor):
         if other is None:
             continue
         if baseline.embed_weights.shape[0] != other.embed_weights.shape[0]:
@@ -2663,7 +2788,9 @@ def main(
                 f"the tokenizer of {model_specifier}"
             )
 
-    attack = ContrastiveGCG(baseline, collapsed, tokenizer, cfg, surrogate=surrogate)
+    attack = ContrastiveGCG(
+        baseline, collapsed, tokenizer, cfg, surrogate=surrogate, anchor=anchor
+    )
 
     # ──────────────────── upfront capability gate ─────────────────────
     # Before optimizing anything, establish that the collapsed model can still write correct
@@ -2701,6 +2828,12 @@ def main(
                 "##   baseline cannot solve: "
                 + ", ".join(capability.baseline_broken)
                 + " (not attackable)"
+            )
+        if capability.anchor_broken:
+            print(
+                "##   anchor cannot solve: "
+                + ", ".join(capability.anchor_broken)
+                + " (not attackable — a model that already fails cannot be held correct)"
             )
         if capability.surrogate_broken:
             print(
@@ -2871,7 +3004,7 @@ def main(
         )
         # the weights go, the wrappers stay: the summary and the surrogate report below read
         # labels and the merged records, never a weight — see attack_parallel.release_weights
-        release_weights((baseline, collapsed, surrogate))
+        release_weights((baseline, collapsed, surrogate, anchor))
         if torch_device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -2943,6 +3076,8 @@ def main(
                 f"##   statuses: baseline={hit['baseline_status']} "
                 f"collapsed={hit['collapsed_status']}"
             )
+            if "anchor_status" in hit:
+                statuses += f" anchor={hit['anchor_status']}"
             if transfer:
                 statuses += f" surrogate={hit['surrogate_status']}"
             print(statuses)
@@ -3099,6 +3234,10 @@ def main(
                 "surrogate_factor_probe": factor_probe or None,
                 "surrogate_model": surrogate_description if transfer else None,
                 "first_collapsed_model": first_collapsed_dir or None,
+                # the anchor as a condition of the hit: its checkpoint, or null for the two-sided
+                # rule (--no_anchor, or a generation-0 attack)
+                "anchor_model": anchor_dir or None,
+                "hold_anchor": anchor_held,
                 "config": cfg.__dict__,
                 "aborted": capability.aborted and not skip_capability_check,
                 "capability_probe": capability.__dict__,
@@ -3211,6 +3350,15 @@ if __name__ == "__main__":
         default="",
         help="prebuilt surrogate to use instead of building one, e.g. run_extrapolation.py's "
         "model_scaled_n<n>_* directory ('lora' method only)",
+    )
+    parser.add_argument(
+        "--no_anchor",
+        "-na",
+        dest="hold_anchor",
+        action="store_false",
+        help="drop the generation-0 anchor from the hit rule, i.e. require only 'target wrong, "
+        "baseline correct' as before. By default the anchor is loaded as a real model, gated, "
+        "held in the objective and decoded in every check, and the result file is tagged _anchor",
     )
     parser.add_argument(
         "--first_collapsed_path",

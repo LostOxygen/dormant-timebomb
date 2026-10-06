@@ -108,6 +108,17 @@ and so does each mixture:
 A --surrogate_factor after -- is therefore not opaque to this script: any rule other than the
 default n = g + 1 marks the result files, and the sweep tags the names it looks for accordingly, so
 two rules' sweeps are separate work rather than one overwriting the other.
+
+The same holds for how the behavioural checks decode. run_attack.py samples them at the deployment
+settings by default and tags the result files with the setting; a greedy sweep (-vt 0) writes the
+untagged names every result from before sampled verification has:
+  ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln            # attack_gen{N}_{model}_vuln_T0.7p0.8k20x5_logit_surrogate.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln -- -vt 0   # attack_gen{N}_{model}_vuln_logit_surrogate.json
+  ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln -- -vt 1 -vs 9   # ..._vuln_T1p0.8k20x9_anchor_logit_surrogate.json
+
+And for the hit rule: by default the generation-0 anchor is held correct next to the baseline and
+the files carry _anchor (generation 0 excepted, it is the target there); -- -na / --no_anchor is the
+old two-sided rule and the untagged name.
 EOF
 }
 
@@ -247,6 +258,27 @@ print(factor_mode_tag(sys.argv[1]))' "$SURROGATE_FACTOR")"; then
     fi
 fi
 
+# the fourth tag: how run_attack.py's behavioural checks decode. Read out of the passthrough by the
+# same helper run_attack.py names its file with, for the same reason as the factor tag — a greedy
+# and a sampled sweep of the same generations are different claims and must be different files, and
+# a tag computed here by hand would drift from the python one and make every generation look un-run
+if ! DECODING_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import verification_tag_from_argv
+print(verification_tag_from_argv(sys.argv[1:]))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the verification tag from the passthrough arguments" >&2
+    exit 2
+fi
+# the fifth tag: whether the generation-0 anchor is a condition of the hit. Same mechanism; it is
+# left off generation 0's own file, where run_attack.py never holds the anchor
+if ! ANCHOR_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import anchor_held_from_argv, anchor_tag
+print(anchor_tag(anchor_held_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the anchor tag from the passthrough arguments" >&2
+    exit 2
+fi
+
 SPECIFIER_NAME="${MODEL_SPECIFIER##*/}"
 RESULTS_DIR="$PATH_ROOT/attack_results"
 LOG_DIR="$RESULTS_DIR/sweep_logs"
@@ -272,6 +304,16 @@ echo "##   model size   : ${MODEL_SIZE:-outside the --model_size ladder}"
 echo "##   real data    : $REAL_DATA_FRACTION${MIXTURE_TAG:+  (result files tagged $MIXTURE_TAG)}"
 if [[ -n "$FACTOR_TAG" ]]; then
     echo "##   factor       : -sf $SURROGATE_FACTOR, files tagged $FACTOR_TAG"
+fi
+if [[ -n "$DECODING_TAG" ]]; then
+    echo "##   verification : sampled, files tagged $DECODING_TAG"
+else
+    echo "##   verification : greedy (untagged result files)"
+fi
+if [[ -n "$ANCHOR_TAG" ]]; then
+    echo "##   hit rule     : target wrong, baseline and generation-0 anchor correct (files tagged $ANCHOR_TAG)"
+else
+    echo "##   hit rule     : target wrong, baseline correct (--no_anchor)"
 fi
 echo "##   path         : $PATH_ROOT"
 echo "##   logs         : $LOG_DIR"
@@ -316,13 +358,18 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     # _{method}_surrogate only when a surrogate was used, and a mismatch here would leave the
     # --force check looking for a file that is never written and the summary reporting
     # "no result file written" for a run that succeeded
+    # generation 0 never holds the anchor (it is the target), so its file carries no anchor tag
+    anchor_tag_for_gen="$ANCHOR_TAG"
+    if (( gen == 0 )); then
+        anchor_tag_for_gen=""
+    fi
     if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
         run_method="none"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}.json"
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${FACTOR_TAG}_${SURROGATE_METHOD}_surrogate.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${FACTOR_TAG}_${SURROGATE_METHOD}_surrogate.json"
         factor_label="n = $((gen + 1))"
         if [[ -n "$FACTOR_TAG" ]]; then
             factor_label="n from -sf $SURROGATE_FACTOR, at most $((gen + 1))"
@@ -337,7 +384,7 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     if [[ "$run_method" != "none" ]]; then
         log_tag="$FACTOR_TAG"
     fi
-    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${log_tag}_${run_method}.log"
+    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${log_tag}_${run_method}.log"
 
     echo
     echo "== $label =="

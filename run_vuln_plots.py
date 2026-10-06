@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from utils.colors import TColors
-from utils.naming import find_verification_tag, verification_tag
+from utils.naming import default_run_tag, find_run_tag
 from utils.plotting import (
     ANCHOR_COLOR,
     BASELINE_COLOR,
@@ -377,7 +377,7 @@ def figure_temperature(records: list, args) -> list:
     """
     payloads = [p for p in read_json_glob(args.results_path, "suffix_verification_*sampled*.json")
                 if p.get("source") == "optimized"
-                and find_verification_tag(os.path.basename(p["_path"])) == args.verification]
+                and find_run_tag(os.path.basename(p["_path"])) == args.verification]
     if not payloads:
         return []
     per_target: dict = {}
@@ -576,12 +576,13 @@ def main() -> None:
                         help="which attack mode the single-mode figures use (default: none)")
     parser.add_argument("--block_size", "-bs", type=int, default=512,
                         help="block size, for the output file names (default: 512)")
-    parser.add_argument("--verification", "-vf", type=str, default=verification_tag(),
-                        help="which attack runs to draw, by how their behavioural checks decoded: "
-                        "the utils.naming.verification_tag in the result file names, e.g. "
-                        f"'{verification_tag()}', or '' (empty) for greedy runs (default: the "
-                        "attack's default decoding). Greedy and sampled runs of one generation "
-                        "make different claims and are never drawn together")
+    parser.add_argument("--verification", "-vf", type=str, default=default_run_tag(),
+                        help="which attack runs to draw, by their verification-plus-anchor tag "
+                        "in the result file names (utils.naming.run_tag), e.g. "
+                        f"'{default_run_tag()}', '_T0.7p0.8k20x5' for sampled runs without the "
+                        "anchor, or '' (empty) for greedy runs without it (default: the attack's "
+                        "defaults). Runs with different hit rules make different claims and are "
+                        "never drawn together")
     parser.add_argument("--no_usetex", dest="usetex", action="store_false",
                         help="render without LaTeX, for machines without a TeX install")
     parser.add_argument("--show", action="store_true", help="also open the figures")
@@ -596,7 +597,7 @@ def main() -> None:
     records = load_records(
         args.results_path,
         specifier_name=args.model_specifier_name,
-        verification=args.verification,
+        run_tag=args.verification,
     )
     if not records:
         raise SystemExit(

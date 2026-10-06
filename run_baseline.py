@@ -273,10 +273,30 @@ def main(
     init_suffix = "_freshinit" if fresh_init else "_recursive"
     init_label = "fresh weights" if fresh_init else "recursive weights"
 
-    if not 0.0 <= real_data_fraction < 1.0:
+    if not 0.0 <= real_data_fraction <= 1.0:
         raise SystemExit(
-            f"--real_data_fraction must be in [0, 1), got {real_data_fraction}. At 1.0 every "
-            f"generation would train on the human corpus alone and nothing would collapse."
+            f"--real_data_fraction must be in [0, 1], got {real_data_fraction}."
+        )
+    if real_data_fraction == 1.0:
+        # 1.0 used to be rejected as vacuous, and as a *collapse* run it is: every generation after
+        # the first trains on the human corpus alone, so nothing degrades. It is allowed because
+        # that is exactly the control the attack results need. A lineage at 1.0 keeps the number of
+        # generations, the seeds, the corpus size and therefore the optimizer-step count of a
+        # collapse run, and changes only where the training text comes from — so a margin shift or
+        # an attackable window that shows up here as well is a property of *iterated fine-tuning*,
+        # not of training on self-generated data, and the collapse claim does not hold.
+        #
+        # What it is not: a fresh-human-data lineage. `real` is the same (sub)sample generation 0
+        # trained on, and at 1.0 the draw takes all of it, so every generation sees the identical
+        # row set in a different order. That makes this the control for the training-budget
+        # confound, which is the one that matters here; a genuinely fresh draw per generation would
+        # need a real pool larger than one generation's corpus.
+        print(
+            f"## {TColors.WARNING}--real_data_fraction 1.0{TColors.ENDC}: no collapse — every "
+            f"generation after 0 trains on the human corpus alone.\n##   This is the "
+            f"non-collapsing control lineage, not a collapse run. Same generations, seeds, corpus "
+            f"size and\n##   optimizer steps; only the data source differs. Artifacts are tagged "
+            f"_rdf1."
         )
     # the data mixture goes into the names for the same reason the weight lineage does: it changes
     # the collapse curve, and plots/ sits outside --path so the file name is the only thing keeping

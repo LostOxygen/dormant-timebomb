@@ -137,6 +137,15 @@ print(verification_tag_from_argv(sys.argv[1:]))' "${EXTRA_ARGS[@]}")"; then
     echo "error: could not resolve the verification tag from the passthrough arguments" >&2
     exit 2
 fi
+# and whether the hit rule holds the generation-0 anchor (default yes; -- -na drops it). Generation
+# 0's own attack file never carries it
+if ! ANCHOR_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import anchor_held_from_argv, anchor_tag
+print(anchor_tag(anchor_held_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the anchor tag from the passthrough arguments" >&2
+    exit 2
+fi
 
 run() {
     echo "   \$ $*"
@@ -159,6 +168,11 @@ if [[ -n "$DECODING_TAG" ]]; then
     echo "##   verification : sampled, attack files tagged $DECODING_TAG"
 else
     echo "##   verification : greedy (untagged attack files)"
+fi
+if [[ -n "$ANCHOR_TAG" ]]; then
+    echo "##   hit rule     : anchor held (attack files tagged $ANCHOR_TAG from generation 1 on)"
+else
+    echo "##   hit rule     : baseline only (--no_anchor)"
 fi
 echo "##   path         : $PATH_ROOT"
 echo "############################################################"
@@ -211,9 +225,12 @@ score_suffixes() {
     tag="$(mixture_tag_of "$mixture")"
     # the optimized suffixes come out of one attack file, so their survival file carries that
     # file's verification tag; the random and init controls come from no attack file and do not
-    local attack_tag=""
+    local attack_tag="" anchor_for_gen="$ANCHOR_TAG"
+    if (( generation == 0 )); then
+        anchor_for_gen=""
+    fi
     if [[ "$source" == "optimized" ]]; then
-        attack_tag="$DECODING_TAG"
+        attack_tag="${DECODING_TAG}${anchor_for_gen}"
     fi
     out="$RESULTS_DIR/suffix_verification_gen${generation}_${name}${tag}${attack_tag}_${source}_${mode}.json"
 
@@ -231,7 +248,7 @@ score_suffixes() {
     if [[ "$mode" == "sampled" ]]; then
         # the suffixes to re-score are the verified hits of the direct attack on this very cell;
         # with none of them there is nothing to say about survival
-        result="$RESULTS_DIR/attack_gen${generation}_${name}${tag}_vuln${DECODING_TAG}.json"
+        result="$RESULTS_DIR/attack_gen${generation}_${name}${tag}_vuln${DECODING_TAG}${anchor_for_gen}.json"
         if [[ ! -f "$result" ]]; then
             echo "   no attack result for generation $generation — skipped"
             return 0
@@ -316,7 +333,7 @@ if has_phase plots; then
     echo "== phase: plots =="
     for mode in none logit; do
         plots=("$PYTHON" "$SCRIPT_DIR/run_vuln_plots.py" -rp "$RESULTS_DIR"
-               -pp "$PATH_ROOT/plots" -bs "$BLOCK_SIZE" -m "$mode" -vf "$DECODING_TAG")
+               -pp "$PATH_ROOT/plots" -bs "$BLOCK_SIZE" -m "$mode" -vf "${DECODING_TAG}${ANCHOR_TAG}")
         (( NO_USETEX )) && plots+=(--no_usetex)
         run "${plots[@]}" || FAILURES=$(( FAILURES + 1 ))
     done

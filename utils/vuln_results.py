@@ -26,7 +26,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from utils.naming import verification_tag
+from utils.naming import anchor_tag, verification_tag
 
 # statuses, mirrored from run_attack.WRONG_STATUSES / run_attack_vuln so this module stays
 # import-light. A mismatch would be caught by check_status_vocabulary() below
@@ -122,6 +122,8 @@ class AttackRecord:
             spells it in the file name: "" for greedy, "_T0.7p0.8k20x5"-style when sampled.
             Derived from `config`, so a file from before sampled verification existed (no
             ``verify_temperature`` key) reads as greedy, which is what it was
+        hold_anchor: whether the generation-0 anchor was a condition of the hit. False for a
+            file from before the anchor existed, which is what it was
     """
 
     path: str
@@ -137,6 +139,12 @@ class AttackRecord:
     surrogate_quality: dict | None = None
     config: dict = field(default_factory=dict)
     verification_tag: str = ""
+    hold_anchor: bool = False
+
+    @property
+    def run_tag(self) -> str:
+        """Verification tag plus anchor tag, as the file name carries them (`utils.naming.run_tag`)."""
+        return self.verification_tag + anchor_tag(self.hold_anchor)
 
     @property
     def attackable(self) -> list:
@@ -229,6 +237,7 @@ def load_record(path: str) -> AttackRecord:
             top_k=int(config.get("verify_top_k", 0)),
             num_samples=int(config.get("verify_samples", 1)),
         ),
+        hold_anchor=bool(report.get("hold_anchor", False)),
     )
 
 
@@ -237,7 +246,7 @@ def load_records(
     specifier_name: str = "",
     surrogate_method: str = "",
     real_data_fraction: float | None = None,
-    verification: str | None = None,
+    run_tag: str | None = None,
 ) -> list:
     """Reads every vulnerability result under `results_dir`, optionally filtered.
 
@@ -246,9 +255,11 @@ def load_records(
         specifier_name (str): keep only this model's runs, e.g. "Qwen2.5-Coder-0.5B-Instruct"
         surrogate_method (str): keep only "none" (direct) or "logit" (transfer)
         real_data_fraction (float | None): keep only this mixture
-        verification (str | None): keep only runs whose behavioural checks decoded this way, as
-            a `utils.naming.verification_tag` ("" for greedy). None keeps every run, which mixes
-            greedy and sampled claims of the same generation — a figure should always pass one
+        run_tag (str | None): keep only runs with this verification-plus-anchor tag, as
+            `utils.naming.run_tag` spells it ("" for greedy without the anchor). A generation-0
+            run never holds the anchor, so it is matched on the verification part alone. None
+            keeps every run, which mixes different claims about the same generation — a figure
+            should always pass one
 
     Returns:
         list: AttackRecords sorted by (model, mixture, method, generation)
@@ -268,8 +279,10 @@ def load_records(
             record.real_data_fraction - real_data_fraction
         ) > 1e-9:
             continue
-        if verification is not None and record.verification_tag != verification:
-            continue
+        if run_tag is not None:
+            wanted = run_tag if record.generation > 0 else run_tag.replace(anchor_tag(True), "")
+            if record.run_tag != wanted:
+                continue
         records.append(record)
     records.sort(
         key=lambda r: (r.specifier_name, r.real_data_fraction, r.surrogate_method, r.generation)

@@ -194,6 +194,8 @@ def plot(files: list, plots_path: str, usetex: bool) -> None:
         figure, axis = plt.subplots(figsize=(7, 5))
         for method, marker in (("none", "o"), ("logit", "^")):
             for tag, color in (("", "tab:blue"), (None, "tab:red")):
+                # greedy against sampled verification; anchor-held and two-sided runs are drawn
+                # together here, with the anchor rule noted in the label when both exist
                 sel = [r for r in records if r.surrogate_method == method
                        and str(r.generation) in payload["generations"]
                        and ((r.verification_tag == "") if tag == "" else (r.verification_tag != ""))]

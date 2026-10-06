@@ -234,3 +234,58 @@ def find_verification_tag(name: str) -> str:
     """
     match = _VERIFICATION_TAG.search(name)
     return match.group(0) if match else ""
+
+
+# ──────────────────────────── the anchor condition of the attack ────────────────────────────
+ANCHOR_TAG: str = "_anchor"
+
+
+def anchor_tag(hold_anchor: bool) -> str:
+    """Result-name tag for an attack whose hit rule also holds the generation-0 anchor correct.
+
+    run_attack.py's hit used to be "target wrong, baseline correct"; with the anchor held it is
+    "target wrong, baseline correct, generation 0 correct" — a stricter claim about the *same*
+    generation, so the two must not share a file. Empty when the anchor is not held, which is what
+    every result written before the anchor existed was. A generation-0 attack never holds the
+    anchor (it is the target), so its name carries no tag either way.
+
+    Args:
+        hold_anchor (bool): whether the anchor was a condition of the hit
+
+    Returns:
+        str: "_anchor" or ""
+    """
+    return ANCHOR_TAG if hold_anchor else ""
+
+
+def anchor_held_from_argv(argv: list) -> bool:
+    """Whether a run_attack.py command line holds the anchor: true unless --no_anchor/-na is in it."""
+    return not any(token in ("-na", "--no_anchor") for token in argv)
+
+
+def find_anchor_tag(name: str) -> str:
+    """The anchor tag inside an artifact name, "" when it carries none."""
+    return ANCHOR_TAG if ANCHOR_TAG in name else ""
+
+
+def run_tag(temperature: float = VERIFY_TEMPERATURE, top_p: float = VERIFY_TOP_P,
+            top_k: int = VERIFY_TOP_K, num_samples: int = VERIFY_SAMPLES,
+            hold_anchor: bool = True, generation: int = 1) -> str:
+    """Verification tag plus anchor tag, as they appear together in a result name.
+
+    Args:
+        generation (int): the attacked generation; generation 0 never carries the anchor tag
+    """
+    return verification_tag(temperature, top_p, top_k, num_samples) + anchor_tag(
+        hold_anchor and generation > 0
+    )
+
+
+def default_run_tag() -> str:
+    """The tag a run_attack.py invocation with no decoding or anchor flags puts on a gen > 0 file."""
+    return run_tag()
+
+
+def find_run_tag(name: str) -> str:
+    """`find_verification_tag` and `find_anchor_tag` of a name, concatenated."""
+    return find_verification_tag(name) + find_anchor_tag(name)

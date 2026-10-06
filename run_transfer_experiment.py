@@ -18,7 +18,7 @@ import psutil
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix, mixture_tag, verification_tag
+from utils.naming import anchor_tag, mixture_suffix, mixture_tag, verification_tag
 
 # The experiment is one-directional and that is the whole point: run A is collapsed, a generation
 # of it is probed, a suffix is optimized against it, and only then is run B collapsed and the
@@ -83,7 +83,7 @@ def attack_results_file(
         path,
         "attack_results",
         f"attack_gen{generation}_{specifier_name}{mixture_tag(real_data_fraction)}"
-        f"{verification_tag()}.json",
+        f"{verification_tag()}{anchor_tag(generation > 0)}.json",
     )
 
 

@@ -5,6 +5,11 @@ of the claim: truncated sampling in the recursive training loop manufactures the
 the decoding at inference decides whether it is exploitable. Every experiment below measures one
 side of that, and the security margin ties the two together.
 
+**[run_paper.sh](../run_paper.sh) runs all of this in order**, with logging, resumability and a
+status table; `./run_paper.sh --dry-run` prints every command it would issue. This document is the
+per-experiment reference behind it — read it to understand what a phase measures, and use the
+script to actually run them.
+
 Conventions used throughout:
 
 - `$PY` is the repo venv, `./venv/bin/python`. The shell sweeps resolve `python` from `PATH`, so
@@ -15,10 +20,17 @@ Conventions used throughout:
   their own root.
 - Pin GPUs with `CUDA_VISIBLE_DEVICES`. The attacks shard `(task, restart)` units over every
   visible GPU; everything else here runs on one.
-- Result-file names are the only interface between stages. The verification decoding is part of
-  them: a greedy attack run writes `attack_gen{g}_{model}{_rdfX}_vuln[...].json`, a sampled one
-  inserts `_T0.7p0.8k20x5` after `_vuln` (`utils.naming.verification_tag`). Figures pick one with
-  `-vf`.
+- Result-file names are the only interface between stages. The verification decoding and the hit
+  rule are part of them: a greedy attack run writes `attack_gen{g}_{model}{_rdfX}_vuln[...].json`,
+  a sampled one inserts `_T0.7p0.8k20x5` after `_vuln` (`utils.naming.verification_tag`), and a
+  run that holds the generation-0 anchor appends `_anchor` (`utils.naming.anchor_tag`; never on a
+  generation-0 file, where the anchor is the target). The defaults give
+  `..._vuln_T0.7p0.8k20x5_anchor[...].json`. Figures pick one combination with `-vf`.
+- The hit rule is three-sided by default: the target emits the insecure code, and both the
+  pristine baseline *and* the generation-0 anchor keep emitting the secure one. A suffix that also
+  breaks generation 0 says the first fine-tune was fragile, not that collapse progressed into
+  something exploitable. `-na` / `--no_anchor` after the `--` restores the two-sided rule, which is
+  what every result from before 2026-10-02 used.
 
 ```bash
 PY=./venv/bin/python
@@ -73,7 +85,11 @@ model was not going to write, and the sequence margin is the number to read for 
 The same search, verified two ways. Greedy verification (`-vt 0`) is the argmax-flip claim and
 the realistic one for temperature-0 code deployments. The default sampled verification is a
 majority over five completions at Qwen's shipped decoding, the deployment-realistic claim for
-everyone else. They write different files and are swept separately.
+everyone else. They write different files and are swept separately. Both hold the anchor unless
+`-na` is passed, and the anchor is loaded as a real model (shared with the logit surrogate's own
+copy of generation 0 in transfer mode, one extra checkpoint in direct mode), gated on the clean
+prompt, held in the objective with the baseline's hinge and anchor terms, and decoded in every
+check.
 
 ```bash
 # direct attack (-m none) and logit-surrogate transfer attack (-m logit), both verdicts
@@ -91,7 +107,9 @@ before the `--` to redo generations whose file exists.
 
 Verification decoding knobs, all tagged into the file name when sampling: `-vt` temperature,
 `-vtp` top-p, `-vtk` top-k, `-vs` samples per check (keep it odd). A deployment at a different
-setting is one more sweep, e.g. `-- -vt 1.0 -vtp 1.0 -vtk 0 -vs 9`.
+setting is one more sweep, e.g. `-- -vt 1.0 -vtp 1.0 -vtk 0 -vs 9`. The two-sided rule for
+comparison with the older results is `-- -na`, and the old greedy files are reproduced exactly by
+`-- -vt 0 -na`.
 
 ### 2b. Margin-aware search
 
@@ -149,6 +167,65 @@ curve. If the surrogate attack is used on a non-default root, recalibrate it the
 (`utils/evaluate_perplexity.py --calibrate`, then `-sf calibrated`), since the data-space
 surrogate models the default truncation.
 
+## 3b. The two attribution controls
+
+Neither experiment needs new code; the first needed one guard lifted in run_baseline.py.
+
+### The non-collapsed control lineage (`-rdf 1.0`)
+
+Same generations, same seed, same corpus size and therefore the same optimizer-step count as a
+collapse run, with every generation after the first trained on the human corpus instead of the
+previous generation's output. Nothing collapses, so a margin shift or an attackable window that
+appears here too belongs to *iterated fine-tuning*, not to training on self-generated data.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 $PY run_baseline.py -ng 10 -bs 512 -msz 0.5b -rdf 1.0 -p $RUN
+CUDA_VISIBLE_DEVICES=0   $PY run_margin.py   -msz 0.5b -rdf 1.0 -n 9 -p $RUN
+./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf 1.0 -m none  --vuln
+./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf 1.0 -m logit --vuln
+$PY run_margin.py --plot $RUN/attack_results/margin_*.json -pp $RUN/plots
+```
+
+Leave `--seed` at its default so the lineage matches the collapse runs it is compared against.
+Artifacts are tagged `_rdf1` and so never collide with a collapse run.
+
+Two things to state in the paper rather than paper over:
+
+- **It is the same human corpus repeated, not a fresh draw per generation.** `mix_real_data` draws
+  the real slice from the sample generation 0 trained on, and at fraction 1.0 that draw takes all
+  of it, so every generation sees the identical rows in a different order. That is the control for
+  the training-budget confound, which is the one that threatens the claim; a genuinely fresh draw
+  per generation would need a real pool larger than one generation's corpus.
+- **It still generates a synthetic corpus every generation and then discards it**, so the run costs
+  about as much GPU time as a collapse run for half the useful work.
+
+### The surrogate factor ablation
+
+Already supported: `--surrogate_factor` takes any number, and `utils.naming.factor_mode_tag` gives
+each one its own file (`_n1`, `_n1.5`, ...), so the rungs do not overwrite each other or the
+default. The rung that matters is `n = 1`, where the surrogate is the generation-0 checkpoint used
+unchanged — if it finds as many hits as the extrapolated surrogate, the extrapolation adds nothing
+and the result reduces to known base-to-fine-tune transfer.
+
+```bash
+for n in 1 1.25 1.5 2 2.5 3; do
+  ./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf 0.5 -m logit --vuln -- -sf $n
+done
+./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf 0.5 -m logit --vuln -- -sf auto
+./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf 0.5 -m logit --vuln -- -sf calibrated
+./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf 0.5 -m logit --vuln -- -sf 1 -na
+```
+
+No `-sf` is the `n = g + 1` indexing rule and writes the untagged name, so the default sweep from
+section 2 is already one point of this curve.
+
+**At `n = 1` the surrogate and the anchor are the same model**, so the surrogate-agreement
+statistics are degenerate: a hit requires the anchor to stay correct, which is the surrogate
+staying correct, so `n_predicted`, `precision` and `recall` are 0 by construction (verified on a
+scratch run). Report the hit rate from that rung, not its surrogate quality, and run the last
+command above as its twin: with `--no_anchor` the `n = 1` rung measures plain forward transfer from
+generation 0, which is the baseline the extrapolation has to beat.
+
 ## 4. Decoding-conditional exploitability
 
 ### 4a. Survival of the hits against temperature
@@ -157,8 +234,8 @@ Every verified hit of one attack file, re-decoded at several temperatures with p
 judged by the attack's own criterion. Temperature 0 is the greedy point on the same curve.
 
 ```bash
-RF=$RUN/attack_results/attack_gen2_Qwen2.5-Coder-0.5B-Instruct_rdf0.5_vuln.json               # greedy run
-RS=$RUN/attack_results/attack_gen2_Qwen2.5-Coder-0.5B-Instruct_rdf0.5_vuln_T0.7p0.8k20x5.json  # sampled run
+RF=$RUN/attack_results/attack_gen2_Qwen2.5-Coder-0.5B-Instruct_rdf0.5_vuln.json                      # greedy, no anchor
+RS=$RUN/attack_results/attack_gen2_Qwen2.5-Coder-0.5B-Instruct_rdf0.5_vuln_T0.7p0.8k20x5_anchor.json  # sampled, anchor held
 CUDA_VISIBLE_DEVICES=0 $PY -m utils.survival_sweep -rf $RF -msz 0.5b -rdf 0.5 -p $RUN \
     -T 0,0.3,0.5,0.7,1.0 -ns 16 --plot
 CUDA_VISIBLE_DEVICES=0 $PY -m utils.survival_sweep -rf $RS -msz 0.5b -rdf 0.5 -p $RUN \
@@ -201,8 +278,9 @@ The arguments after `--` tell the script which attack files to re-score and draw
 uses the sampled default tag. The plots can also be drawn directly:
 
 ```bash
-$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -m none -vf ''              # greedy runs
-$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -m none -vf _T0.7p0.8k20x5  # sampled runs
+$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -m none -vf ''                     # greedy, no anchor
+$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -m none -vf _T0.7p0.8k20x5         # sampled, no anchor
+$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -m none -vf _T0.7p0.8k20x5_anchor  # sampled, anchor held (default)
 ```
 
 ## 5. The exploitability window
@@ -212,7 +290,7 @@ targets, hits and margins against generation come from
 
 ```bash
 $PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -f attack_success,target_matrix -vf ''
-$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -f attack_success,target_matrix -vf _T0.7p0.8k20x5
+$PY run_vuln_plots.py -rp $RUN/attack_results -pp $RUN/plots -f attack_success,target_matrix -vf _T0.7p0.8k20x5_anchor
 $PY run_margin.py --plot $RUN/attack_results/margin_*.json -pp $RUN/plots
 ```
 
