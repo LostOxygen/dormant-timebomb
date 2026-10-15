@@ -278,6 +278,23 @@ print(anchor_tag(anchor_held_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; th
     echo "error: could not resolve the anchor tag from the passthrough arguments" >&2
     exit 2
 fi
+# the sixth tag: which objective the search optimized. Same mechanism
+if ! OBJECTIVE_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import objective_tag, sink_objective_from_argv
+print(objective_tag(sink_objective_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the objective tag from the passthrough arguments" >&2
+    exit 2
+fi
+# the seventh tag: whether the logit surrogate was rescaled to the anchor's entropy. A surrogate
+# property like the factor, so it sits beside FACTOR_TAG in the name rather than in the hit rule
+if ! ENTROPY_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import entropy_match_from_argv, entropy_tag
+print(entropy_tag(entropy_match_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the entropy tag from the passthrough arguments" >&2
+    exit 2
+fi
 
 SPECIFIER_NAME="${MODEL_SPECIFIER##*/}"
 RESULTS_DIR="$PATH_ROOT/attack_results"
@@ -309,6 +326,12 @@ if [[ -n "$DECODING_TAG" ]]; then
     echo "##   verification : sampled, files tagged $DECODING_TAG"
 else
     echo "##   verification : greedy (untagged result files)"
+fi
+if [[ -n "$OBJECTIVE_TAG" ]]; then
+    echo "##   objective    : sink-conditional (files tagged $OBJECTIVE_TAG)"
+fi
+if [[ -n "$ENTROPY_TAG" ]]; then
+    echo "##   surrogate    : rescaled to the generation-0 anchor's entropy (files tagged $ENTROPY_TAG)"
 fi
 if [[ -n "$ANCHOR_TAG" ]]; then
     echo "##   hit rule     : target wrong, baseline and generation-0 anchor correct (files tagged $ANCHOR_TAG)"
@@ -365,11 +388,11 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     fi
     if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
         run_method="none"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}.json"
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${FACTOR_TAG}_${SURROGATE_METHOD}_surrogate.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate.json"
         factor_label="n = $((gen + 1))"
         if [[ -n "$FACTOR_TAG" ]]; then
             factor_label="n from -sf $SURROGATE_FACTOR, at most $((gen + 1))"
@@ -382,9 +405,9 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     # generation inside an auto sweep measured no factor, so its log is not filed as if it had
     log_tag=""
     if [[ "$run_method" != "none" ]]; then
-        log_tag="$FACTOR_TAG"
+        log_tag="${FACTOR_TAG}${ENTROPY_TAG}"
     fi
-    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${log_tag}_${run_method}.log"
+    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${log_tag}_${run_method}.log"
 
     echo
     echo "== $label =="

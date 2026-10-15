@@ -13,6 +13,7 @@ outputs/
 plots/
 .vscode
 runs/
+paper_logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

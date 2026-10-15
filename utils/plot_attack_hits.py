@@ -43,7 +43,7 @@ import matplotlib.pyplot as plt
 
 from utils.colors import TColors
 from utils.models import add_model_arguments, resolve_model_specifier
-from utils.naming import factor_mode_tag, mixture_tag
+from utils.naming import entropy_tag, factor_mode_tag, mixture_tag
 
 # from the palette run_baseline.py plots with (Tableau's colorblind-safe ten). Verified for this
 # pair rather than assumed: OKLab dE is 37.9 at normal vision and 38.2 / 29.5 / 33.7 under
@@ -88,7 +88,8 @@ def result_file(
         method (str): "none" for the direct attack, otherwise the surrogate method
         tag (str): the mixture tag, "" at --real_data_fraction 0
         factor_tag (str): the factor rule's tag — "_nauto", "_ncal" or "_n<value>" — and "" for a
-            sweep that took n from the generation index
+            sweep that took n from the generation index, with the entropy tag "_em" appended when
+            the surrogate was rescaled to the anchor's entropy
 
     Returns:
         str: the path the result file would have
@@ -464,6 +465,7 @@ def main(
     methods: str = "logit",
     real_data_fraction: float = 0.0,
     surrogate_factor: str = "",
+    entropy_match: bool = False,
     no_usetex: bool = False,
 ) -> None:
     """Reads the attack results of one run and plots the success rates over its generations.
@@ -480,6 +482,9 @@ def main(
         surrogate_factor (str): the --surrogate_factor the sweep passed to run_attack.py. Only its
             *mode* matters here: "auto" results are filed under their own names, every other form
             under the plain ones
+        entropy_match (bool): the sweep rescaled its logit surrogate to the generation-0 anchor's
+            entropy, so its files carry "_em". A run with it and one without are two different
+            surrogates for the same generation, hence two different figures
         no_usetex (bool): render without LaTeX, for a machine with no TeX install
 
     Returns:
@@ -492,7 +497,8 @@ def main(
     specifier_name = specifier.split("/")[-1]
     results_dir = os.path.join(path, "attack_results")
     tag = mixture_tag(real_data_fraction)
-    factor_tag = factor_mode_tag(surrogate_factor)
+    # the surrogate's identity in the name: the factor rule, then the entropy rescaling
+    factor_tag = factor_mode_tag(surrogate_factor) + entropy_tag(entropy_match)
     generations = range(start_generation, num_generations + 1)
 
     selected = ["none"] + [m.strip() for m in methods.split(",") if m.strip()]
@@ -608,6 +614,13 @@ if __name__ == "__main__":
         default=0.0,
         help="the --real_data_fraction the collapse run used. Part of the result file names, so "
         "a mixed run needs it here to be found at all (default: 0.0)",
+    )
+    parser.add_argument(
+        "--entropy_match",
+        "-em",
+        action="store_true",
+        help="read the sweep that rescaled its logit surrogate to the generation-0 anchor's "
+        "entropy (files tagged _em) instead of the one that did not",
     )
     parser.add_argument(
         "--surrogate_factor",

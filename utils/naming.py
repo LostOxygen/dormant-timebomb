@@ -103,6 +103,10 @@ def factor_mode_tag(surrogate_factor: float | str) -> str:
       is not known when the name is resolved (the name is fixed before a model is loaded, the probe
       runs much later). The tag therefore records the policy and the chosen value goes inside the
       file, as ``surrogate_factor`` with the whole ladder under ``surrogate_factor_probe``.
+    * ``"sink"`` -> ``_nsink``. run_attack.py only: the factor is solved from the affine law of
+      the surrogate's decision margin (``utils`` has no model access, so the value is computed
+      there and only the policy is named here), which places the surrogate on the security
+      boundary of the selected targets rather than on a perplexity match.
     * ``"calibrated"`` -> ``_ncal``. The value comes from the run's own calibration file, so it is
       a property of that file rather than of the command line, and tagging it by value would make
       the name change when the calibration is refitted.
@@ -125,6 +129,8 @@ def factor_mode_tag(surrogate_factor: float | str) -> str:
         token = surrogate_factor.strip().lower()
         if token == "auto":
             return "_nauto"
+        if token == "sink":
+            return "_nsink"
         if token == "calibrated":
             return "_ncal"
         try:
@@ -268,16 +274,82 @@ def find_anchor_tag(name: str) -> str:
     return ANCHOR_TAG if ANCHOR_TAG in name else ""
 
 
+ENTROPY_TAG: str = "_em"
+
+
+def entropy_tag(entropy_match: bool) -> str:
+    """Artifact-name tag for a logit surrogate rescaled to the generation-0 anchor's entropy.
+
+    ``--entropy_match`` changes what the surrogate *is* — same direction, different sharpness —
+    so a run with it and one without are two approximations of the same generation and must not
+    share a file. It sits next to the factor tag rather than in `run_tag`, because like the
+    factor it describes the surrogate and not the hit rule, and it is empty for a direct attack,
+    which has no surrogate to rescale.
+
+    Args:
+        entropy_match (bool): whether --entropy_match was set
+
+    Returns:
+        str: "_em" or ""
+    """
+    return ENTROPY_TAG if entropy_match else ""
+
+
+def entropy_match_from_argv(argv: list) -> bool:
+    """Whether a run_attack.py command line sets --entropy_match/-em."""
+    return any(token in ("-em", "--entropy_match") for token in argv)
+
+
+def find_entropy_tag(name: str) -> str:
+    """The entropy tag inside an artifact name, "" when it carries none."""
+    return ENTROPY_TAG if ENTROPY_TAG in name else ""
+
+
+OBJECTIVE_TAG: str = "_sinkobj"
+
+
+def objective_tag(sink_objective: bool) -> str:
+    """Result-name tag for an attack optimized with run_attack.py's sink-conditional objective.
+
+    The default objective drives the mean cross-entropy of the whole insecure implementation; the
+    sink-conditional one drives the decision margin at the position where the two references
+    diverge. Same hit rule, same decoding, different search, so a cell run both ways must not
+    share a file. Empty for the default objective, which keeps every existing result readable
+    under its name.
+
+    Args:
+        sink_objective (bool): whether --sink_objective was set
+
+    Returns:
+        str: "_sinkobj" or ""
+    """
+    return OBJECTIVE_TAG if sink_objective else ""
+
+
+def sink_objective_from_argv(argv: list) -> bool:
+    """Whether a run_attack.py command line sets --sink_objective/-so."""
+    return any(token in ("-so", "--sink_objective") for token in argv)
+
+
+def find_objective_tag(name: str) -> str:
+    """The objective tag inside an artifact name, "" when it carries none."""
+    return OBJECTIVE_TAG if OBJECTIVE_TAG in name else ""
+
+
 def run_tag(temperature: float = VERIFY_TEMPERATURE, top_p: float = VERIFY_TOP_P,
             top_k: int = VERIFY_TOP_K, num_samples: int = VERIFY_SAMPLES,
-            hold_anchor: bool = True, generation: int = 1) -> str:
-    """Verification tag plus anchor tag, as they appear together in a result name.
+            hold_anchor: bool = True, generation: int = 1,
+            sink_objective: bool = False) -> str:
+    """Verification tag plus anchor tag plus objective tag, as they appear together in a name.
 
     Args:
         generation (int): the attacked generation; generation 0 never carries the anchor tag
+        sink_objective (bool): whether the sink-conditional objective was used
     """
-    return verification_tag(temperature, top_p, top_k, num_samples) + anchor_tag(
-        hold_anchor and generation > 0
+    return (
+        verification_tag(temperature, top_p, top_k, num_samples)
+        + anchor_tag(hold_anchor and generation > 0)
+        + objective_tag(sink_objective)
     )
 
 
@@ -287,5 +359,5 @@ def default_run_tag() -> str:
 
 
 def find_run_tag(name: str) -> str:
-    """`find_verification_tag` and `find_anchor_tag` of a name, concatenated."""
-    return find_verification_tag(name) + find_anchor_tag(name)
+    """`find_verification_tag`, `find_anchor_tag` and `find_objective_tag` of a name, concatenated."""
+    return find_verification_tag(name) + find_anchor_tag(name) + find_objective_tag(name)

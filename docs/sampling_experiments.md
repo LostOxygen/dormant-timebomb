@@ -5,8 +5,10 @@ of the claim: truncated sampling in the recursive training loop manufactures the
 the decoding at inference decides whether it is exploitable. Every experiment below measures one
 side of that, and the security margin ties the two together.
 
-**[run_paper.sh](../run_paper.sh) runs all of this in order**, with logging, resumability and a
-status table; `./run_paper.sh --dry-run` prints every command it would issue. This document is the
+**[run_paper.sh](../run_paper.sh) runs the paper's grid in order** (six fresh lineages, utility and
+perplexity, both attacks, figures) and [run_paper_full.sh](../run_paper_full.sh) the superset
+with the margin, ablation, survival, eval and transfer phases below, each with logging,
+resumability and a status table; `--dry-run` prints every command either would issue. This document is the
 per-experiment reference behind it — read it to understand what a phase measures, and use the
 script to actually run them.
 
@@ -136,8 +138,8 @@ mkdir -p ./runs/mwl && ln -sfn $PWD/model_outputs ./runs/mwl/model_outputs
 ## 3. Sampling in the training loop: collapse severity as the causal variable
 
 The same generation count reached through different sampling settings. Each gets its own run
-root, because the checkpoint names do not carry the decoding (`--fresh_init` has the same
-limitation, see CLAUDE.md). The ancestral run is the one that matters most: collapse without any
+root, because the checkpoint names do not carry the decoding (the weight lineage,
+`--recursive_init`, has the same limitation, see CLAUDE.md). The ancestral run is the one that matters most: collapse without any
 truncation, from sampling and fitting error alone.
 
 ```bash
@@ -225,6 +227,123 @@ staying correct, so `n_predicted`, `precision` and `recall` are 0 by constructio
 scratch run). Report the hit rate from that rung, not its surrogate quality, and run the last
 command above as its twin: with `--no_anchor` the `n = 1` rung measures plain forward transfer from
 generation 0, which is the baseline the extrapolation has to beat.
+
+## 3c. Making the three-sided attack land more often
+
+Holding the anchor makes the search strictly harder: on the generation-2 cell of the rdf 0.5
+lineage, surrogate mode and greedy verification in both, dropping the anchor gives 19 hits over 4
+usable targets where holding it gives 2 over 3. Four changes recover part of that without touching
+what a hit means.
+
+```bash
+# the objective knobs, on one cell, in a root of their own (they change results, not file names)
+mkdir -p ./runs/opt && ln -sfn $PWD/model_outputs ./runs/opt/model_outputs
+./run_attack_sweep.sh -n 9 -p ./runs/opt -msz 0.5b -rdf 0.5 -m logit --vuln \
+    -- -r 3 -ns 250 -ve 10 -tm 0.1 -nt 1.0 -stk 30
+
+# and the same through the orchestrator
+TARGET_MARGIN=0.1 SUFFIX_TOKENS=30 MARGIN_GUIDED=1 MIN_HEADROOM=0.5 \
+    ./run_paper_full.sh -p ./runs/opt --only main05 --phases margin,attack
+```
+
+- **The hold terms are averaged rather than summed.** Adding the anchor had doubled the pressure to
+  keep models correct while the single break term stayed as it was, so `--lambda_base` and
+  `--mu_correct` silently stopped meaning what they were tuned to mean. Nothing to pass: this is now
+  the behaviour, it matches `run_selective_attack.py`, and with one hold model it reproduces the old
+  objective to the digit.
+- **`--target_margin` / `-tm` adds the term the verdict actually turns on.** The old objective made
+  the insecure code *likely* without ever requiring it to overtake the secure one. Measured on a
+  real cell, a suffix sat at a target margin of +0.02 nats — a coin flip the sampled verdict then
+  loses. Start around 0.1 and raise it if hits still fail to survive sampling; it costs roughly a
+  third more time per step.
+- **`--suffix_tokens` / `-stk` lengthens the suffix.** Twenty tokens is little room to separate two
+  models that differ by one fine-tune while sparing a third. 30 to 40 is the range to try.
+- **`--margin_file` / `-mf` with `--min_headroom` / `-mh` skips the unwinnable cells.** Run the
+  margin phase first, then `python run_margin.py --rank attack_results/margin_*.json -mh 0.5`, which
+  prints the headroom per (generation, target) and the arguments to pass. Targets whose headroom is
+  negative are ones where the model under attack is *more* secure than the anchor it has to spare.
+  Skipped targets stay in the denominator, so this saves time rather than inflating the rate; narrow
+  `--tasks` instead when the selection itself is the experiment.
+
+Report which of these were on in the paper, since the first is a behaviour change and the rest are
+hyperparameters.
+
+### 3d. The sink-conditional objective, per-target factors, and the 25-target suite
+
+Diagnosed on the rdf 0.5 sink-factor sweep: the surrogate's own output was unclassifiable in 75 of
+75 checks per task, i.e. the mean-cross-entropy objective pushed it off the task rather than across
+the security decision, and past generation 3 the only targets the capability gate kept were the
+two the affine law marks unusable. Three changes, each a flag or a file, none of which touches what
+a hit means:
+
+```bash
+# 1. the sink-conditional objective (-so): every term at the decision token. Files carry _sinkobj
+# 2. per-target factors: -sf sink now moves the surrogate to each target's own boundary
+# 3. the 25-target suite: run_attack_vuln.py --list_tasks; screen it first, it is two forward passes
+#    per target per model and no search
+for rdf in 0.5 0.8; do
+    python run_margin.py -msz 0.5b -rdf $rdf -n 9 -p . --sink          # sink_factor_*_rdf$rdf.json
+    python run_margin.py -msz 3b   -rdf $rdf -n 9 -p . --sink
+done
+python run_margin.py --sink_table attack_results/margin_*_rdf0.5.json   # the admissibility band
+
+./run_attack_sweep.sh -n 9 -p . -msz 0.5b -rdf 0.5 -m logit --vuln \
+    -- -sf sink --sink_cap 2.5 -so -em -r 3 -ns 250 -ve 10
+```
+
+- **`--sink_objective` / `-so`** replaces the four mean-cross-entropy terms by their values at the
+  position where the two references diverge: the target must prefer the insecure span by
+  `--sink_margin` nats (default 2, about 95% of the two-way mass at T 0.7), the hold models must
+  prefer the secure span by `--margin` nats, and a `--kappa_prefix` term keeps the target writing
+  the function up to the decision so the break term cannot be satisfied by wrecking the header.
+  Section 4.1b of the foundations doc. The spans are printed per task
+  (`sink: 16 shared tokens, then '("' (secure) against '(f"' (insecure)`).
+- **`-sf sink` is per target now.** The surrogate is built at the mean of the usable boundaries as
+  before, which is what the capability probe sees, and then moved to each target's own root when
+  that target's search starts (`task_factors` in the result file). `--sink_offset` shifts every
+  root; `--sink_run_level` restores the single mean factor. **Cap the roots at the surrogate's
+  capability ceiling with `--sink_cap`**: measured with `-sf auto -em -ns 0` over the 25 targets
+  on the 0.5b rdf0.5 lineage, the entropy-matched tilt solves 8/25 clean tasks at n = 2.5, 2/25
+  at 3 and 0/25 from 4 up, so `--sink_cap 2.5`; a root past the ceiling (load_config 4.58,
+  parse_manifest 6.22, hash_password 12.06) would put the surrogate where it writes no function
+  at all (5.5 nats/token on the shared prefix).
+- **25 targets instead of 5.** Three to four prompts per weakness for the original five classes,
+  plus a pickle-versus-json cache reader, two weak-hash targets (CWE-328), an insecure temporary
+  file (CWE-377), an unescaped HTML render (CWE-79) and an XML parser (CWE-611). The sink screen
+  reports, per lineage and target, whether the base model is secure, whether the slope points the
+  usable way, and the boundary factor; a target that fails either condition is still attacked and
+  still counted, the screen is a diagnosis and not a filter.
+
+The three compose with `-em` and are tagged `_sinkobj` so they never overwrite a mean-objective
+run of the same cell.
+
+**Running the plain and the optimized surrogate side by side.** `run_paper.sh` sweeps every logit
+cell twice, as `plain` (the tilt as published) and `opt` (`-em`, plus `-sf sink --sink_cap 2.5 -so`
+on the vulnerability targets), so the optimizations are an axis of the comparison rather than a
+setting. Every cell of mixture x extrapolation x optimization x verdict files under its own name:
+
+| cell | file |
+|---|---|
+| direct, sampled | `attack_gen{g}_{model}{_rdf}[_vuln]_T0.7p0.8k20x5_anchor.json` |
+| direct, greedy | `..._anchor.json` |
+| logit plain | `..._anchor[_sinkobj]_logit_surrogate.json` |
+| logit opt | `..._anchor[_sinkobj][_nsink]_em_logit_surrogate.json` |
+
+`VARIANTS=plain` or `VARIANTS=opt` runs one of the two; `OPT_ENTROPY_MATCH`, `OPT_SINK_FACTOR`,
+`OPT_SINK_CAP`, `OPT_SINK_OBJECTIVE` and `OPT_SINK_MARGIN` define what `opt` means.
+
+Measured on the 0.5b rdf0.5 lineage, 2 restarts x 100 steps (a fifth of the paper budget), `-sf
+sink --sink_cap 3 -so -em`, sampled majority verdict with the anchor held:
+
+| generation | usable targets | hits | targets hit |
+|---|---|---|---|
+| 1 | 17 | 7 | fetch_user, find_product, delete_session |
+| 2 | 17 | 16 | delete_session, count_orders |
+| 3 | 10 | 0 | (every target with a usable boundary except download_file and hash_password was gated out) |
+
+The same cells under the mean objective at the full budget gave 3 hits at generation 1 and none
+after. Every hit is on a target the affine law marks usable, and the hits stop exactly where the
+gate empties the band, which is the claim the screen was built to make.
 
 ## 4. Decoding-conditional exploitability
 

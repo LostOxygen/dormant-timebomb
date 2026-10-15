@@ -47,8 +47,86 @@ CALIBRATION_FILE: str = "surrogate_top_p_bs{block_size}_{specifier_name}.json"
 FACTOR_CALIBRATION_FILE: str = "surrogate_factor_bs{block_size}_{specifier_name}{tag}.json"
 
 
+def logit_entropy(logits: Tensor) -> Tensor:
+    """Shannon entropy, in nats, of ``softmax(logits)`` along the last dimension.
+
+    Forbidden tokens carry -inf, whose probability is 0 and whose ``p log p`` is ``0 * -inf``;
+    that is 0 in the limit and NaN in floating point, so the product is taken only where the
+    probability is non-zero.
+
+    Args:
+        logits (Tensor): (..., vocabulary)
+
+    Returns:
+        Tensor: (...) entropies in nats
+    """
+    log_p = torch.log_softmax(logits.to(torch.float32), dim=-1)
+    p = log_p.exp()
+    return torch.special.entr(p).sum(dim=-1)
+
+
+def entropy_matched_scale(
+    logits: Tensor, target_entropy: Tensor, iterations: int = 12
+) -> Tensor:
+    """The temperature ``tau`` for which ``softmax(logits / tau)`` has `target_entropy`.
+
+    **Why a second scale is needed at all.** The extrapolation factor scales the *difference*
+    between the two anchors, which sets the direction of travel, but it cannot set sharpness
+    independently: as the factor grows the tilt tends to a point mass on the argmax of the
+    likelihood ratio, so its entropy falls toward zero. Measured on this repo's 0.5B lineage the
+    real collapsed models go the other way, from 0.26 nats at the base model to 0.42 by
+    generation 9 — they *flatten*. A tilt large enough to model a late generation's direction is
+    therefore far too sharp to model its distribution, which is the whole of the capability
+    ceiling that makes the surrogate stop writing valid code. Dividing by a temperature restores
+    the missing degree of freedom: the factor keeps the direction, this keeps the sharpness.
+
+    **The solve is a bisection, deliberately.** Entropy is strictly decreasing in the inverse
+    temperature, so the root is bracketed and bisection cannot miss it. Newton is the obvious
+    alternative and has a closed-form derivative here, ``dH/dbeta = -beta * Var_p(l)``, but that
+    variance collapses toward zero exactly where the tilt concentrates, which makes the step
+    diverge: tried on random logits it returned 0.015 for a true temperature of 3.0 on one row
+    out of four, and drove the entropy of a genuinely flat target to 0. Bisection over the log
+    inverse temperature costs a fixed dozen softmaxes and cannot do that.
+
+    The result is meant to be used **detached**: gradients should flow through the division, not
+    through the solve, exactly as they do through a normalization constant.
+
+    Args:
+        logits (Tensor): (..., vocabulary), the tilted logits to be rescaled
+        target_entropy (Tensor): (...), the entropy each row should end up with, in nats
+        iterations (int): bisection steps over ``log beta`` in ``[-3 ln 10, 3 ln 10]``; 12 leaves
+            the bracket at 0.0017 in ``log beta``, i.e. the temperature within 0.2%, which is far
+            below anything the search can resolve. Each step is one softmax over the vocabulary
+            for every row, and on the loss path the rows are every candidate at every target
+            position, so the count is the cost: 24 halvings doubled the candidate-scoring time
+            of the whole objective, 12 adds about a third
+
+    Returns:
+        Tensor: (...) temperatures, strictly positive. A row whose target lies outside the
+            reachable range converges to the closest endpoint rather than failing
+    """
+    flat = logits.to(torch.float32)
+    span = 3.0 * math.log(10.0)
+    low = torch.full_like(target_entropy, -span)
+    high = torch.full_like(target_entropy, span)
+    for _ in range(iterations):
+        mid = 0.5 * (low + high)
+        # entr(p) = -p log p with entr(0) = 0, so forbidden (-inf) tokens need no guard
+        entropy = torch.special.entr(torch.softmax(flat * mid.exp().unsqueeze(-1), dim=-1)).sum(
+            dim=-1
+        )
+        # entropy falls as beta rises, so a row that is still too flat needs a larger beta
+        too_flat = entropy > target_entropy
+        low = torch.where(too_flat, mid, low)
+        high = torch.where(too_flat, high, mid)
+    return torch.exp(-0.5 * (low + high))
+
+
 def extrapolate_logits(
-    base_scores: Tensor, collapsed_logits: Tensor, factor: float
+    base_scores: Tensor,
+    collapsed_logits: Tensor,
+    factor: float,
+    match_entropy: bool = False,
 ) -> Tensor:
     """
     The logit-space extrapolation ``base + n * (collapsed - base)``, in float32.
@@ -73,6 +151,12 @@ def extrapolate_logits(
             the arithmetic, since -inf + n * (finite + inf) evaluates to NaN
         collapsed_logits (Tensor): logits of the generation-0 collapsed model, same shape
         factor (float): the factor n, i.e. generation + 1
+        match_entropy (bool): rescale the tilt so its entropy equals the generation-0 model's at
+            the same position, which keeps the factor setting direction only and stops the
+            surrogate sharpening into a point mass as the factor grows. The target is the
+            *anchor's* entropy rather than the attacked generation's, because the anchor is
+            observable to the attacker and the real generation is not; it is a floor rather than
+            a match, since the real trajectory keeps flattening past the anchor
 
     Returns:
         Tensor: the extrapolated logits in float32, with forbidden tokens and any NaN out of
@@ -87,9 +171,16 @@ def extrapolate_logits(
     extrapolated = safe_base + factor * (collapsed_f32 - safe_base)
 
     # a NaN must not be mapped onto a mid-distribution logit, where it would be sampleable
-    return extrapolated.masked_fill(
+    extrapolated = extrapolated.masked_fill(
         forbidden | torch.isnan(extrapolated), float("-inf")
     )
+    if not match_entropy:
+        return extrapolated
+
+    # the anchor's own entropy at this position is the target, and it costs no extra forward pass
+    target = logit_entropy(collapsed_f32.masked_fill(forbidden, float("-inf")))
+    tau = entropy_matched_scale(extrapolated.detach(), target.detach())
+    return extrapolated / tau.unsqueeze(-1).clamp(min=1e-6)
 
 
 def dataset_suffix(method: str) -> str:

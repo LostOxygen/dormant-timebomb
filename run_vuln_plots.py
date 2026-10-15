@@ -585,6 +585,17 @@ def main() -> None:
                         "never drawn together")
     parser.add_argument("--no_usetex", dest="usetex", action="store_false",
                         help="render without LaTeX, for machines without a TeX install")
+    parser.add_argument(
+        "--entropy_match",
+        "-em",
+        type=str,
+        default="any",
+        choices=("any", "on", "off"),
+        help="keep only the runs whose logit surrogate was rescaled to the generation-0 anchor's "
+        "entropy ('on', files tagged _em), only those where it was not ('off'), or both ('any', "
+        "the default). Two surrogates of one generation in one panel is rarely what you want, so "
+        "pass 'on' and 'off' for the two figures instead",
+    )
     parser.add_argument("--show", action="store_true", help="also open the figures")
     args = parser.parse_args()
 
@@ -598,6 +609,7 @@ def main() -> None:
         args.results_path,
         specifier_name=args.model_specifier_name,
         run_tag=args.verification,
+        entropy_match={"any": None, "on": True, "off": False}[args.entropy_match],
     )
     if not records:
         raise SystemExit(

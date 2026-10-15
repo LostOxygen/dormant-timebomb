@@ -159,6 +159,7 @@ def main(
     load_in_4bit: bool = False,
     gradient_checkpointing: bool = False,
     perplexity_load_in_4bit: bool = False,
+    recursive_init: bool = False,
     fresh_init: bool = False,
     training_gpus: int = 0,
     master_port: int = 29500,
@@ -210,10 +211,14 @@ def main(
             keeping them. Only useful for models that do not otherwise fit
         perplexity_load_in_4bit (bool): quantize the model that scores the perplexity. This adds
             quantization noise to the plotted statistic, so it is off by default
-        fresh_init (bool): re-initialise every generation from the pristine base model instead of
-            continuing to fine-tune the previous generation's adapter. Only the *data* is then
-            recursive, which is the "replace" setting of the model collapse literature. Off by
-            default, i.e. the weights are recursive too — see utils/train_generation.py
+        recursive_init (bool): keep fine-tuning the previous generation's adapter instead of
+            re-initialising every generation from the pristine base model. Off by default: only
+            the *data* recurs, the "replace" setting of the model collapse literature. On, one
+            adapter accumulates num_generations * training_epochs epochs, which at a high
+            --real_data_fraction is mostly the same human rows again and again — a memorisation
+            route to degradation that self-training does not cause. That is why it is the
+            ablation. See utils/train_generation.py
+        fresh_init (bool): the old spelling of the default; accepted and ignored
         training_gpus (int): how many of the visible GPUs to train one generation on, as data
             parallel ranks under torchrun. 0 uses all of them, 1 forces single GPU training
         master_port (int): torchrun rendezvous port. Only needs changing when two pipelines run
@@ -270,8 +275,11 @@ def main(
     # by. The two modes produce different collapse curves from the same data, so a plot without
     # this in its name is not attributable to either of them — and plots/ is not under --path, so
     # two runs would otherwise overwrite each other's figure even with separate output paths
-    init_suffix = "_freshinit" if fresh_init else "_recursive"
-    init_label = "fresh weights" if fresh_init else "recursive weights"
+    init_suffix = "_recursive" if recursive_init else "_freshinit"
+    init_label = "recursive weights (ablation)" if recursive_init else "fresh weights"
+    if fresh_init:
+        print(f"## {TColors.WARNING}--fresh_init is the default now and does nothing"
+              f"{TColors.ENDC}; --recursive_init selects the ablation")
 
     if not 0.0 <= real_data_fraction <= 1.0:
         raise SystemExit(
@@ -308,6 +316,21 @@ def main(
     # for generation 0 — see utils/naming.py for why generation 0 is deliberately shared
     data_suffix = mixture_tag(real_data_fraction)
     run_suffix = f"{init_suffix}{data_suffix}"
+    # the checkpoint and corpus names do not carry the weight lineage, so a fresh-init run in a
+    # root that already holds a recursive lineage of the same mixture would overwrite its
+    # checkpoints while the recursive perplexity cache kept describing them. Refuse, unless this
+    # run only evaluates what is there
+    other_suffix = ("_freshinit" if recursive_init else "_recursive") + data_suffix
+    other_cache = DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{other_suffix}.pt"
+    if not skip_training and os.path.exists(other_cache):
+        raise SystemExit(
+            f"{TColors.FAIL}{DATASET_PATH} already holds a "
+            f"{'fresh-init' if recursive_init else 'recursive'} lineage for this mixture"
+            f"{TColors.ENDC} ({other_cache}). The checkpoint names do not carry the weight "
+            f"lineage, so this run would overwrite those models. Use another --path"
+            + ("" if recursive_init else ", or --recursive_init to continue that lineage")
+            + "."
+        )
     # no underscores or backslashes: usetex renders the title, and a bare % is a LaTeX comment
     run_label = f"{init_label}, real data fraction {real_data_fraction:g}"
 
@@ -442,7 +465,8 @@ def main(
     # the data recursion is the collapse and is always on; this is the weight lineage
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Weight lineage{TColors.ENDC}: {init_label} "
-        f"({'--fresh_init' if fresh_init else 'previous generation is fine-tuned further'})"
+        f"({'--recursive_init: previous generation is fine-tuned further' if recursive_init
+            else 'every generation starts from the pristine base'})"
     )
     # how much of the collapse loop is fed back into itself, i.e. how fast the models degrade
     if real_data_fraction > 0:
@@ -617,8 +641,8 @@ def main(
                 train_command.append("--load_in_4bit")
             if gradient_checkpointing:
                 train_command.append("--gradient_checkpointing")
-            if fresh_init:
-                train_command.append("--fresh_init")
+            if recursive_init:
+                train_command.append("--recursive_init")
 
             training = subprocess.run(train_command, check=False)
             if training.returncode != 0:
@@ -836,7 +860,7 @@ def main(
         )
     else:
         # load the perplexity dict and all_perplexities list from the files. -ho therefore
-        # needs the same --fresh_init and --real_data_fraction the run was produced with, and
+        # needs the same --recursive_init and --real_data_fraction the run was produced with, and
         # says so rather than replotting whichever configuration happens to be cached
         cached_dict = (
             DATASET_PATH
@@ -845,8 +869,8 @@ def main(
         if not os.path.exists(cached_dict):
             raise FileNotFoundError(
                 f"{cached_dict} does not exist. --histogram_only replots the cache of a run "
-                f"with the same --block_size, --model_specifier, --fresh_init "
-                f"({'set' if fresh_init else 'not set'} here) and --real_data_fraction "
+                f"with the same --block_size, --model_specifier, --recursive_init "
+                f"({'set' if recursive_init else 'not set'} here) and --real_data_fraction "
                 f"({real_data_fraction:g} here)"
             )
         perplexity_dict = torch.load(cached_dict)
@@ -1126,15 +1150,19 @@ if __name__ == "__main__":
         "the very statistic that is plotted, so it is off by default",
     )
     parser.add_argument(
-        "--fresh_init",
-        "-fi",
+        "--recursive_init",
+        "-ri",
         action="store_true",
-        help="re-initialise every generation from the pristine base model instead of continuing "
-        "to fine-tune the previous generation's adapter, so that only the *data* is recursive "
-        "(the 'replace' setting of the model collapse literature). Without it a run reaches the "
-        "last generation with one adapter that has been trained for num_generations * "
-        "training_epochs epochs, and -lr_r/-lr_a only take effect at generation 0",
+        help="ABLATION: keep fine-tuning the previous generation's adapter instead of "
+        "re-initialising every generation from the pristine base model. The default is the "
+        "'replace' setting of the model collapse literature, where only the data recurs; with "
+        "this flag one adapter reaches the last generation with num_generations * "
+        "training_epochs epochs on it, mostly the same human rows at a high "
+        "--real_data_fraction, and -lr_r/-lr_a only take effect at generation 0. Artifacts are "
+        "suffixed _recursive instead of _freshinit; use a separate --path, the checkpoint names "
+        "do not carry the lineage",
     )
+    parser.add_argument("--fresh_init", "-fi", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--training_gpus",
         "-tg",

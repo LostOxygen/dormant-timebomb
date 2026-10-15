@@ -146,6 +146,14 @@ print(anchor_tag(anchor_held_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; th
     echo "error: could not resolve the anchor tag from the passthrough arguments" >&2
     exit 2
 fi
+# and which objective the search optimized (-- -so tags the attack files _sinkobj)
+if ! OBJECTIVE_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import objective_tag, sink_objective_from_argv
+print(objective_tag(sink_objective_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the objective tag from the passthrough arguments" >&2
+    exit 2
+fi
 
 run() {
     echo "   \$ $*"
@@ -230,7 +238,7 @@ score_suffixes() {
         anchor_for_gen=""
     fi
     if [[ "$source" == "optimized" ]]; then
-        attack_tag="${DECODING_TAG}${anchor_for_gen}"
+        attack_tag="${DECODING_TAG}${anchor_for_gen}${OBJECTIVE_TAG}"
     fi
     out="$RESULTS_DIR/suffix_verification_gen${generation}_${name}${tag}${attack_tag}_${source}_${mode}.json"
 

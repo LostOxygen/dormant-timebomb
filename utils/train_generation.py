@@ -38,7 +38,8 @@ Args:
     lora_alpha (int): LoRA alpha.
     load_in_4bit (bool): Quantize the model for training.
     gradient_checkpointing (bool): Recompute activations in the backward pass.
-    fresh_init (bool): Start from the base model instead of the previous generation's adapter.
+    recursive_init (bool): Continue the previous generation's adapter instead of starting a new
+        one on the base model. Off by default, so only the data recurs across generations.
     path (str): The path where the datasets and models are stored.
 
 Returns:
@@ -78,7 +79,9 @@ parser.add_argument("--lora_rank", "-lr_r", type=int, default=16)
 parser.add_argument("--lora_alpha", "-lr_a", type=int, default=16)
 parser.add_argument("--load_in_4bit", "-q4", action="store_true")
 parser.add_argument("--gradient_checkpointing", "-gc", action="store_true")
-parser.add_argument("--fresh_init", "-fi", action="store_true")
+parser.add_argument("--recursive_init", "-ri", action="store_true")
+# the old spelling of what is now the default; accepted so a stored command line keeps running
+parser.add_argument("--fresh_init", "-fi", action="store_true", help=argparse.SUPPRESS)
 parser.add_argument("--path", "-p", type=str, default="")
 # the seed of the whole collapse trajectory. It is a CLI argument rather than a constant so that
 # two runs of run_baseline.py can produce *different* collapsed models from identical
@@ -103,7 +106,7 @@ lora_rank = args.lora_rank
 lora_alpha = args.lora_alpha
 load_in_4bit = args.load_in_4bit
 gradient_checkpointing = args.gradient_checkpointing
-fresh_init = args.fresh_init
+recursive_init = args.recursive_init
 path = args.path
 seed = args.seed
 real_data_fraction = args.real_data_fraction
@@ -152,15 +155,16 @@ if is_main:
 #
 #   data    generation g always trains on the corpus that model_{g-1} generated. This is the
 #           collapse mechanism and is not optional
-#   weights with --fresh_init the pristine base model is reloaded every generation and a new
-#           adapter is initialised on it, so the only thing carried across generations is the
-#           data. Without it, model_{g-1}'s trained adapter is loaded and *keeps being optimised*
+#   weights by default the pristine base model is reloaded every generation and a new adapter
+#           is initialised on it, so the only thing carried across generations is the data (the
+#           'replace' setting of the collapse literature). With --recursive_init, the ablation,
+#           model_{g-1}'s trained adapter is loaded and *keeps being optimised*
 #           — unsloth's get_peft_model finds an existing adapter whose config matches and passes
 #           straight through ("Already have LoRA adapters! We shall skip this step"), so a run
 #           reaches the last generation with one adapter that has seen num_generations *
 #           training_epochs epochs. --lora_rank / --lora_alpha then only take effect at
 #           generation 0, since later generations inherit the saved config
-if fresh_init or generation == 0:
+if not recursive_init or generation == 0:
     checkpoint = model_specifier
 else:
     checkpoint = (

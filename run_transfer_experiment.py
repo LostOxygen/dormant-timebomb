@@ -1098,7 +1098,7 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="extra arguments appended verbatim to both run_baseline.py invocations, e.g. "
-        "\"-tbs 8 -gas 4 -fi\". Do not pass -rdf, -ms or -msz here — use --real_data_fraction and "
+        "\"-tbs 8 -gas 4 -ri\". Do not pass -rdf, -ms or -msz here — use --real_data_fraction and "
         "--model_size/--model_specifier, which the checkpoint-name resolution in the later stages "
         "also reads",
     )

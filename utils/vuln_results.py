@@ -26,7 +26,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from utils.naming import anchor_tag, verification_tag
+from utils.naming import anchor_tag, objective_tag, verification_tag
 
 # statuses, mirrored from run_attack.WRONG_STATUSES / run_attack_vuln so this module stays
 # import-light. A mismatch would be caught by check_status_vocabulary() below
@@ -140,11 +140,15 @@ class AttackRecord:
     config: dict = field(default_factory=dict)
     verification_tag: str = ""
     hold_anchor: bool = False
+    sink_objective: bool = False
+    entropy_match: bool = False
 
     @property
     def run_tag(self) -> str:
-        """Verification tag plus anchor tag, as the file name carries them (`utils.naming.run_tag`)."""
-        return self.verification_tag + anchor_tag(self.hold_anchor)
+        """Verification, anchor and objective tags, as the file name carries them
+        (`utils.naming.run_tag`)."""
+        return (self.verification_tag + anchor_tag(self.hold_anchor)
+                + objective_tag(self.sink_objective))
 
     @property
     def attackable(self) -> list:
@@ -238,6 +242,8 @@ def load_record(path: str) -> AttackRecord:
             num_samples=int(config.get("verify_samples", 1)),
         ),
         hold_anchor=bool(report.get("hold_anchor", False)),
+        sink_objective=bool(config.get("sink_objective", False)),
+        entropy_match=bool(report.get("entropy_match") or False),
     )
 
 
@@ -247,6 +253,7 @@ def load_records(
     surrogate_method: str = "",
     real_data_fraction: float | None = None,
     run_tag: str | None = None,
+    entropy_match: bool | None = None,
 ) -> list:
     """Reads every vulnerability result under `results_dir`, optionally filtered.
 
@@ -260,6 +267,9 @@ def load_records(
             run never holds the anchor, so it is matched on the verification part alone. None
             keeps every run, which mixes different claims about the same generation — a figure
             should always pass one
+        entropy_match (bool | None): keep only runs whose logit surrogate was (True) or was not
+            (False) rescaled to the anchor's entropy. None keeps both, which puts two different
+            surrogates for one generation in the same panel
 
     Returns:
         list: AttackRecords sorted by (model, mixture, method, generation)
@@ -283,6 +293,8 @@ def load_records(
             wanted = run_tag if record.generation > 0 else run_tag.replace(anchor_tag(True), "")
             if record.run_tag != wanted:
                 continue
+        if entropy_match is not None and record.entropy_match != entropy_match:
+            continue
         records.append(record)
     records.sort(
         key=lambda r: (r.specifier_name, r.real_data_fraction, r.surrogate_method, r.generation)

@@ -397,6 +397,7 @@ def main(
     gradient_accumulation_steps: int = 4,
     load_in_4bit: bool = False,
     gradient_checkpointing: bool = False,
+    recursive_init: bool = False,
     fresh_init: bool = False,
     training_gpus: int = 0,
     master_port: int = 29500,
@@ -498,7 +499,7 @@ def main(
         f"({(num_direct + num_priming) / max(1, len(human_corpus)):.2%} of the corpus)"
     )
     print(f"## Real data frac. : {real_data_fraction:g}   weight lineage: "
-          f"{'fresh' if fresh_init else 'recursive'}")
+          f"{'recursive (ablation)' if recursive_init else 'fresh'}")
     print(f"## Sharding across : {len(devices)} GPU(s) {devices}")
     print(f"## Path            : {path or '.'}")
     print("#" * 78 + "\n")
@@ -645,8 +646,8 @@ def main(
                 train_command.append("--load_in_4bit")
             if gradient_checkpointing:
                 train_command.append("--gradient_checkpointing")
-            if fresh_init:
-                train_command.append("--fresh_init")
+            if recursive_init:
+                train_command.append("--recursive_init")
 
             training = subprocess.run(train_command, check=False)
             if training.returncode != 0:
@@ -973,7 +974,10 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_accumulation_steps", "-gas", type=int, default=4)
     parser.add_argument("--load_in_4bit", "-q4", action="store_true")
     parser.add_argument("--gradient_checkpointing", "-gc", action="store_true")
-    parser.add_argument("--fresh_init", "-fi", action="store_true")
+    parser.add_argument("--recursive_init", "-ri", action="store_true",
+                        help="ablation: continue the previous generation's adapter instead of "
+                        "re-initialising from the base model each generation")
+    parser.add_argument("--fresh_init", "-fi", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--training_gpus", "-tg", type=int, default=0)
     parser.add_argument("--master_port", "-mp", type=int, default=29500)
     parser.add_argument("--path", "-p", type=str, default="")
