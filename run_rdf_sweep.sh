@@ -16,13 +16,14 @@
 #
 # Why one --path is enough for the whole sweep
 # --------------------------------------------
-# The mixture is part of every artifact name from generation 1 onward (`_rdf{value}`), so ten
-# mixtures coexist under one --path without overwriting each other. Generation 0 is the exception
-# and deliberately so: it trains on the human corpus by definition, so model_0 and the corpus it
-# generates are byte-identical for every value and are left unsuffixed to be shared — see
-# utils/naming.py. Which means a plain sweep retrains an identical generation 0 ten times.
-# --reuse-gen0 passes -cfg 1 to every run whose shared generation 0 is already on disk, so it is
-# trained once and reused. The condition is that artifacts exist, not that this is not the first
+# The mixture is part of every artifact name (`_rdf{value}`), generation 0 included, so ten
+# mixtures coexist under one --path without overwriting each other; only the base model's own
+# corpus (generated_dataset_base), which generation 0 trains on, is shared — see utils/naming.py.
+# Under the --human_generation_zero ablation generation 0 trains on the human corpus alone, so
+# model_0 and its corpus are byte-identical for every value and are left unsuffixed to be shared,
+# which means a plain ablation sweep retrains an identical generation 0 ten times. --reuse-gen0
+# selects that ablation (it passes -hg0 to every run) and passes -cfg 1 to every run whose shared
+# generation 0 is already on disk, so it is trained once and reused. The condition is that artifacts exist, not that this is not the first
 # value: on an empty root the first run trains generation 0 and the rest continue from generation 1,
 # while on a root that already holds one every run reuses it — including under --force, which
 # re-runs values but is not a request to retrain the generation they share. Delete model_0 (or drop
@@ -75,10 +76,13 @@ Options:
       --to T                last fraction, inclusive (default: 0.9). Must be below 1.0, which
                             run_baseline.py refuses: nothing would collapse
       --step S              ladder step (default: 0.1)
-      --reuse-gen0          train the shared, mixture-independent generation 0 once and continue
-                            from generation 1 (-cfg 1) whenever it is already on disk; skipped
-                            automatically while it is not. An existing generation 0 is reused
-                            as-is, --force included, so delete it to rebuild it
+      --reuse-gen0          ABLATION (-hg0 on every run): generation 0 trains on the human
+                            corpus alone and is shared across values, so it is trained once
+                            and every later run continues from generation 1 (-cfg 1) whenever
+                            it is already on disk; skipped automatically while it is not. An
+                            existing generation 0 is reused as-is, --force included, so delete
+                            it to rebuild it. By default generation 0 trains on the mixture like
+                            every later generation and is not shared
       --force               re-run values whose final checkpoint already exists
       --dry-run             print the commands and the ladder without running anything
   -h, --help                this message
@@ -120,9 +124,9 @@ if ! [[ "$NUM_GENERATIONS" =~ ^[0-9]+$ ]]; then
     echo "error: -n/--num-generations must be a non-negative integer" >&2
     exit 2
 fi
-# generation 0 is the mixture-independent one, so a one-generation run is the same run at every
-# value of the ladder — see utils/naming.py's mixture_suffix
-if (( NUM_GENERATIONS < 2 )); then
+# under the shared-generation-0 ablation a one-generation run is the same run at every value of
+# the ladder — see utils/naming.py's mixture_suffix. By default generation 0 is mixed too
+if (( NUM_GENERATIONS < 2 )) && (( REUSE_GEN0 )); then
     echo "error: -n $NUM_GENERATIONS leaves only generation 0, which trains on the human corpus" \
          "under every --real_data_fraction and is shared between them. There would be nothing" \
          "for the sweep to vary; use -n 2 or more." >&2
@@ -173,6 +177,7 @@ from utils.naming import mixture_suffix, mixture_tag
 
 start, stop, step = (float(a) for a in sys.argv[1:4])
 last_generation = int(sys.argv[4])
+human_generation_zero = sys.argv[5] == "1"
 if step <= 0:
     raise SystemExit("error: --step must be positive")
 if start < 0:
@@ -190,9 +195,9 @@ value, limit, increment = round(start * scale), round(stop * scale), round(step 
 while value <= limit:
     fraction = value / scale
     print(f"{fraction:g}", mixture_tag(fraction),
-          mixture_suffix(fraction, last_generation), sep=":")
+          mixture_suffix(fraction, last_generation, human_generation_zero), sep=":")
     value += increment' \
-        "$FROM_FRACTION" "$TO_FRACTION" "$STEP_FRACTION" "$LAST_GENERATION")"; then
+        "$FROM_FRACTION" "$TO_FRACTION" "$STEP_FRACTION" "$LAST_GENERATION" "$REUSE_GEN0")"; then
     exit 2
 fi
 
@@ -332,6 +337,7 @@ for (( i = 0; i < ${#FRACTIONS[@]}; i++ )); do
     # run that failed half way does not turn the rest of the sweep into runs continuing from
     # nothing
     if (( REUSE_GEN0 )); then
+        cmd+=(-hg0)
         if [[ -d "$GEN0_CHECKPOINT" && -d "$GEN0_CORPUS" ]]; then
             cmd+=(-cfg 1)
             echo "   reusing the shared generation 0 (-cfg 1)"

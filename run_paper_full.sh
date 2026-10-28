@@ -205,6 +205,9 @@ LINEAGES=(
   "seed3|$ROOT/runs/seed3|0.5|0.7|0.8|20|3337|fresh|variance: primary cell, third seed"
 )
 init_flag() { [[ "$1" == "recursive" ]] && echo "--recursive_init" || true; }
+# the recursive roots predate 2026-10-22, when generation 0 still trained on the human corpus
+# alone and was shared across mixtures; every consumer of those roots needs the old rule
+gen0_flag() { [[ "$1" == "recursive" ]] && echo "--human_generation_zero" || true; }
 
 # --only names the lineage to work on, so it also decides which cell the single-cell phases
 # (ablation, survival) use. Without this they would keep running on the default primary, which is
@@ -369,7 +372,7 @@ phase_collapse() {
         run "collapse_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_baseline.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" \
             -rdf "$rdf" -tp "$temp" -tpp "$top_p" -tpk "$top_k" -sd "$seed" -p "$path" \
-            $(init_flag "$init")
+            $(init_flag "$init") $(gen0_flag "$init")
     done
 }
 
@@ -381,10 +384,10 @@ phase_utility() {
         wants_lineage "$name" || continue
         run "perplexity_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_perplexity \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" -rdf "$rdf" -p "$path" \
-            --calibrate $(usetex_flag_py)
+            --calibrate $(gen0_flag "$init") $(usetex_flag_py)
         run "correctness_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_correctness \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" -rdf "$rdf" -p "$path" \
-            $(usetex_flag_py)
+            $(gen0_flag "$init") $(usetex_flag_py)
     done
 }
 
@@ -409,14 +412,14 @@ phase_margin() {
         wants_lineage "$name" || continue
         run "margin_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" run_margin.py \
             -msz "$MODEL_SIZE" -rdf "$rdf" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -p "$path" \
-            $(sink_measure_flag)
+            $(sink_measure_flag) $(gen0_flag "$init")
     done
 }
 
 # The attacks. Four sweeps per lineage: direct (white-box upper bound) and logit-surrogate
 # transfer (the threat model), each under the sampled-majority verdict and the greedy one. The
-# anchor is held in all of them, which is the default — a hit needs the target broken while both
-# the pristine baseline and the generation-0 anchor keep writing the secure variant.
+# hit rule is the threat model's: a hit needs the target broken while the pristine baseline keeps
+# writing the secure variant. Pass -ha in the passthrough to also hold the generation-0 anchor.
 phase_attack() {
     for record in "${LINEAGES[@]}"; do
         IFS='|' read -r name path rdf _t _p _k _s init _desc <<< "$record"
@@ -425,12 +428,12 @@ phase_attack() {
             run "attack_${name}_${method}_sampled" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
                 ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
                 -msz "$MODEL_SIZE" -rdf "$rdf" -m "$method" --vuln $(force_flag) \
-                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" \
+                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" $(gen0_flag "$init") \
                 $(search_opts) $(surrogate_opts "$method") $(margin_opts "$path" "$rdf")
             run "attack_${name}_${method}_greedy" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
                 ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
                 -msz "$MODEL_SIZE" -rdf "$rdf" -m "$method" --vuln $(force_flag) \
-                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -vt 0 \
+                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -vt 0 $(gen0_flag "$init") \
                 $(search_opts) $(surrogate_opts "$method") $(margin_opts "$path" "$rdf")
         done
     done
@@ -462,20 +465,21 @@ phase_ablation() {
             -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf "$policy"
     done
 
-    # 2. plain forward transfer. At -sf 1 the surrogate *is* the anchor, so under the three-sided
-    #    hit rule the surrogate can never have predicted its own break and the agreement numbers
-    #    are 0 by construction. This twin drops the anchor and measures what a suffix optimized on
-    #    generation 0 reaches on generation n — the baseline the extrapolation has to beat.
+    # 2. plain forward transfer: what a suffix optimized on generation 0 reaches on generation n,
+    #    the baseline the extrapolation has to beat. At -sf 1 the surrogate *is* generation 0, so
+    #    with -ha the surrogate could never have predicted its own break and the agreement numbers
+    #    would be 0 by construction — which is why this rung never holds the anchor.
     run "ablation_forward_transfer" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
         ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
         -msz "$MODEL_SIZE" -rdf "$rdf" -m logit --vuln $(force_flag) \
-        -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf 1 -na
+        -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf 1
 
-    # 3. the two-sided hit rule, for comparison with every result predating the anchor condition.
-    run "ablation_no_anchor" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
+    # 3. the three-sided hit rule: the stricter claim that the suffix is specific to *later*
+    #    collapse rather than to any descendant of the base model. Files are tagged _anchor.
+    run "ablation_hold_anchor" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
         ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
         -msz "$MODEL_SIZE" -rdf "$rdf" -m none --vuln $(force_flag) \
-        -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -na
+        -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -ha
 
     # 4. the margin-aware search, in its own root (--max_wrong_loss is not part of the file name,
     #    so it would otherwise overwrite the plain run of the same cell). The root shares the
@@ -550,7 +554,7 @@ phase_eval() {
             -n "$GENERATIONS" -p "$ROOT" -b "$BLOCK_SIZE" --models "$MODEL_SIZE" \
             --rdf "$mixtures" --phases temperature \
             --temperature 0.7 --num-samples "$SURVIVAL_SAMPLES" \
-            $(force_flag) $(usetex_flag_sh) -- -vt 0 -na
+            $(force_flag) $(usetex_flag_sh) -- -vt 0
     fi
 }
 

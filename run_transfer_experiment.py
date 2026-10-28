@@ -41,6 +41,7 @@ def collapsed_checkpoint(
     block_size: int,
     specifier_name: str,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> str:
     """Path of the merged fp16 checkpoint run_baseline.py writes for one generation.
 
@@ -63,7 +64,7 @@ def collapsed_checkpoint(
         path,
         "model_outputs",
         f"model_{generation}_bs{block_size}_{specifier_name}"
-        + mixture_suffix(real_data_fraction, generation)
+        + mixture_suffix(real_data_fraction, generation, human_generation_zero)
         + "_fp16",
     )
 
@@ -135,6 +136,7 @@ def baseline_command(
     engine: str,
     extra: str,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> list:
     """Builds the run_baseline.py argv for one collapse run.
 
@@ -164,6 +166,8 @@ def baseline_command(
         "--path",
         path,
     ]
+    if human_generation_zero:
+        command.append("--human_generation_zero")
     if extra:
         command.extend(extra.split())
     return command
@@ -185,6 +189,7 @@ def attack_command(
     seed: int,
     extra: str,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> list:
     """Builds the run_attack.py argv for the search against run A.
 
@@ -228,6 +233,8 @@ def attack_command(
         command.extend(["--tasks", tasks])
     if stop_on_success:
         command.append("--stop_on_success")
+    if human_generation_zero:
+        command.append("--human_generation_zero")
     if extra:
         command.extend(extra.split())
     return command
@@ -247,6 +254,7 @@ def verify_command(
     probe_only: bool = False,
     tasks: str = "",
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> list:
     """Builds the utils.verify_transfer argv for one target run.
 
@@ -285,6 +293,8 @@ def verify_command(
             command.extend(["--tasks", tasks])
     else:
         command.extend(["--suffix_file", suffix_file])
+    if human_generation_zero:
+        command.append("--human_generation_zero")
     return command
 
 
@@ -302,6 +312,7 @@ def choose_generation(
     exec_timeout: float,
     force: bool,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> int:
     """Picks the latest generation at which *run A* can still solve enough tasks unaided.
 
@@ -343,6 +354,7 @@ def choose_generation(
                     max_new_tokens, repetition_penalty, exec_timeout,
                     probe_only=True, tasks=tasks,
                     real_data_fraction=real_data_fraction,
+                    human_generation_zero=human_generation_zero,
                 ),
                 f"capability probe of run A generation {generation}",
             )
@@ -436,6 +448,7 @@ def sweep_run(
     exec_timeout: float,
     force: bool,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> dict:
     """Verifies the frozen suffixes against one run at every generation, and loads the results.
 
@@ -467,6 +480,7 @@ def sweep_run(
                     f"run {label.upper()} (seed {seed}) generation {generation}",
                     max_new_tokens, repetition_penalty, exec_timeout,
                     real_data_fraction=real_data_fraction,
+                    human_generation_zero=human_generation_zero,
                 ),
                 f"verification of run {label.upper()} generation {generation}",
             )
@@ -605,6 +619,7 @@ def main(
     baseline_extra: str = "",
     attack_extra: str = "",
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     model_specifier: str = "",
     model_size: str = "",
 ) -> None:
@@ -641,6 +656,8 @@ def main(
         real_data_fraction (float): --real_data_fraction for *both* collapse runs, and therefore
             part of the checkpoint names every later stage resolves. Held identical across the two
             runs on purpose: the seed is meant to be the only difference between them
+        human_generation_zero (bool): --human_generation_zero for both runs and every stage
+            that resolves their checkpoints (ablation: a human-only, shared generation 0)
         model_specifier (str): base model of *both* collapse runs, forwarded to every stage
         model_size (str): parameter count off the Qwen2.5-Coder ladder ("0.5b" ... "32b"),
             shorthand for the matching model_specifier. Like the mixture, this is deliberately one
@@ -716,7 +733,8 @@ def main(
         # the last generation's checkpoint is the marker for "this run finished", independently of
         # which generation is eventually attacked
         final_checkpoint = collapsed_checkpoint(
-            path, num_generations - 1, block_size, specifier_name, real_data_fraction
+            path, num_generations - 1, block_size, specifier_name, real_data_fraction,
+            human_generation_zero,
         )
         print_stage(index, 6, f"collapse run {label}", f"seed {seed}")
         if os.path.isdir(final_checkpoint) and not force:
@@ -725,7 +743,7 @@ def main(
             run_stage(
                 baseline_command(
                     path, seed, model_specifier, num_generations, block_size, dataset_size,
-                    engine, baseline_extra, real_data_fraction,
+                    engine, baseline_extra, real_data_fraction, human_generation_zero,
                 ),
                 f"collapse run {label}",
             )
@@ -739,7 +757,7 @@ def main(
         collapsed_generation = choose_generation(
             path_a, seed_a, model_specifier, num_generations, block_size, tasks, report_dir,
             min_usable_tasks, max_new_tokens, repetition_penalty, exec_timeout, force,
-            real_data_fraction,
+            real_data_fraction, human_generation_zero,
         )
     else:
         print(
@@ -768,6 +786,7 @@ def main(
                 num_steps,
                 verify_every, max_new_tokens, repetition_penalty, exec_timeout,
                 stop_on_success, attack_seed, attack_extra, real_data_fraction,
+                human_generation_zero,
             ),
             "attack against run A",
         )
@@ -811,6 +830,7 @@ def main(
         sweeps[label] = sweep_run(
             label, path, seed, model_specifier, swept, block_size, suffix_file, report_dir,
             max_new_tokens, repetition_penalty, exec_timeout, force, real_data_fraction,
+            human_generation_zero,
         )
 
     # ── the report ─────────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1110,15 @@ if __name__ == "__main__":
         "onward, so passing it here is also what lets the attack and the verifications find them — "
         "prefer it over putting -rdf in --baseline_extra, which the later stages cannot see "
         "(default: 0.0)",
+    )
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="ABLATION, for both collapse runs and forwarded to every later stage: train "
+        "generation 0 on the human corpus alone (the pre-2026-10-22 rule). Like the mixture, "
+        "it is a real flag rather than something for --baseline_extra because the checkpoint "
+        "names depend on it",
     )
     add_model_arguments(parser, role="the base model of both collapse runs")
     parser.add_argument(

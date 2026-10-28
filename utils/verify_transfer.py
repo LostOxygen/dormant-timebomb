@@ -107,6 +107,7 @@ parser.add_argument("--label", "-l", type=str, default="target")
 # the --real_data_fraction the target run was collapsed with; part of its checkpoint names from
 # generation 1 onward, so it is needed to find them
 parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
+parser.add_argument("--human_generation_zero", "-hg0", action="store_true")
 args = parser.parse_args()
 
 # run_attack.resolve_collapsed_dir reads the module global rather than taking a root, so the same
@@ -122,6 +123,7 @@ collapsed_dir = args.collapsed_model_path or resolve_collapsed_dir(
     specifier_name,
     args.block_size or None,
     real_data_fraction=args.real_data_fraction,
+    human_generation_zero=args.human_generation_zero,
 )
 baseline_dir = args.baseline_model_path or args.model_specifier
 

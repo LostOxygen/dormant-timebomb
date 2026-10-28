@@ -44,12 +44,35 @@ RESULT_GLOB: str = "attack_gen*_vuln*.json"
 # plotting entry point uses. Drift is *detected* rather than assumed away: unknown_targets() names
 # anything that appears in a result file and is missing here, so a sixth target shows up as a
 # warning instead of silently losing its label
+# one entry per AttackTask in run_attack_vuln.py, in the suite's order; the figures use the order
+# for their rows and the label for their legends. Kept as a literal rather than imported, since
+# run_attack_vuln pulls torch in and this module is loaded by the plotting scripts
 TARGET_CWE: dict = {
     "fetch_user": "CWE-89",
     "generate_token": "CWE-338",
     "run_ping": "CWE-78",
     "load_config": "CWE-502",
     "fetch_json": "CWE-295",
+    "find_product": "CWE-89",
+    "delete_session": "CWE-89",
+    "count_orders": "CWE-89",
+    "make_session_id": "CWE-338",
+    "generate_api_key": "CWE-338",
+    "new_otp": "CWE-338",
+    "dns_lookup": "CWE-78",
+    "list_directory": "CWE-78",
+    "disk_usage": "CWE-78",
+    "parse_manifest": "CWE-502",
+    "load_settings": "CWE-502",
+    "read_cache": "CWE-502",
+    "download_file": "CWE-295",
+    "post_event": "CWE-295",
+    "check_health": "CWE-295",
+    "hash_password": "CWE-328",
+    "file_digest": "CWE-328",
+    "make_temp_path": "CWE-377",
+    "render_comment": "CWE-79",
+    "parse_xml": "CWE-611",
 }
 _SIZE_PATTERN = re.compile(r"-(\d+(?:\.\d+)?B)-", re.IGNORECASE)
 
@@ -267,9 +290,11 @@ def load_records(
             run never holds the anchor, so it is matched on the verification part alone. None
             keeps every run, which mixes different claims about the same generation — a figure
             should always pass one
-        entropy_match (bool | None): keep only runs whose logit surrogate was (True) or was not
-            (False) rescaled to the anchor's entropy. None keeps both, which puts two different
-            surrogates for one generation in the same panel
+        entropy_match (bool | None): keep only the *surrogate* runs whose logit surrogate was
+            (True) or was not (False) rescaled to the anchor's entropy. None keeps both, which
+            puts two different surrogates for one generation in the same panel. Direct runs have
+            no surrogate to rescale, so they survive either filter and stay in the figure as the
+            white-box reference both families are read against
 
     Returns:
         list: AttackRecords sorted by (model, mixture, method, generation)
@@ -293,7 +318,8 @@ def load_records(
             wanted = run_tag if record.generation > 0 else run_tag.replace(anchor_tag(True), "")
             if record.run_tag != wanted:
                 continue
-        if entropy_match is not None and record.entropy_match != entropy_match:
+        if (entropy_match is not None and record.surrogate_method != "none"
+                and record.entropy_match != entropy_match):
             continue
         records.append(record)
     records.sort(

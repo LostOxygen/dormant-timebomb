@@ -43,7 +43,7 @@ import matplotlib.pyplot as plt
 
 from utils.colors import TColors
 from utils.models import add_model_arguments, resolve_model_specifier
-from utils.naming import entropy_tag, factor_mode_tag, mixture_tag
+from utils.naming import ANCHOR_TAG, entropy_tag, factor_mode_tag, mixture_tag
 
 # from the palette run_baseline.py plots with (Tableau's colorblind-safe ten). Verified for this
 # pair rather than assumed: OKLab dE is 37.9 at normal vision and 38.2 / 29.5 / 33.7 under
@@ -52,6 +52,22 @@ SERIES_COLORS: dict[str, str] = {
     "none": "#006BA4",  # dark blue — direct attack on the real checkpoint
     "logit": "#FF800E",  # orange — the logit surrogate
     "lora": "#A9373B",  # dark red — the weight-space surrogate, only when asked for
+}
+# the per-target matrix, mirroring run_vuln_plots.OUTCOME_COLORS so the correctness and the
+# vulnerability grids read the same way. The two exclusions are opposites and must not be pooled:
+# a broken target means a wrong answer would measure collapse rather than the attack, a broken
+# baseline means there was no correct answer to flip
+OUTCOME_COLORS: dict[str, str] = {
+    "hit": "#006BA4",
+    "no-hit": "#D9D9D9",
+    "baseline-broken": "#FFBC79",
+    "target-broken": "#595959",
+}
+OUTCOME_LABELS: dict[str, str] = {
+    "hit": "wrong code elicited",
+    "no-hit": "attacked, no hit",
+    "baseline-broken": "excluded: baseline already wrong",
+    "target-broken": "excluded: target model broken",
 }
 SERIES_LABELS: dict[str, str] = {
     "none": "direct (real checkpoint)",
@@ -70,6 +86,7 @@ def result_file(
     method: str,
     tag: str,
     factor_tag: str = "",
+    run_tag: str = "",
 ) -> str:
     """Rebuilds the name run_attack.py writes for one (generation, method) cell.
 
@@ -90,13 +107,18 @@ def result_file(
         factor_tag (str): the factor rule's tag — "_nauto", "_ncal" or "_n<value>" — and "" for a
             sweep that took n from the generation index, with the entropy tag "_em" appended when
             the surrogate was rescaled to the anchor's entropy
+        run_tag (str): the hit rule, as `utils.naming.run_tag` spells it — the verification tag
+            and "_anchor" when the generation-0 anchor was held. It sits between the mixture and
+            the surrogate part, exactly where run_attack.py puts it, and is dropped at generation
+            0, which never holds an anchor
 
     Returns:
         str: the path the result file would have
     """
+    rule = run_tag if generation > 0 else run_tag.replace(ANCHOR_TAG, "")
     suffix = "" if method == "none" else f"{factor_tag}_{method}_surrogate"
     return os.path.join(
-        results_dir, f"attack_gen{generation}_{specifier_name}{tag}{suffix}.json"
+        results_dir, f"attack_gen{generation}_{specifier_name}{tag}{rule}{suffix}.json"
     )
 
 
@@ -119,6 +141,21 @@ def read_cell(path: str) -> dict | None:
     probe = data.get("capability_probe", {})
     usable = set(probe.get("usable", []))
     per_task = {task["task"]: len(task.get("successes", [])) for task in data.get("results", [])}
+    # the per-target outcome, for the matrix figure. The gate's own clean verdicts decide which
+    # exclusion a non-usable target gets, in the same precedence vuln_results.exclusion uses
+    clean = probe.get("per_task", {})
+    targets = {}
+    # the gate's own verdicts are present even when it aborted the run before any search, so an
+    # aborted generation shows its exclusions rather than an unexplained blank column
+    for name in {t["task"] for t in data.get("results", [])} | set(usable) | set(clean):
+        verdicts = clean.get(name, {})
+        if name in usable:
+            outcome = "hit" if per_task.get(name, 0) > 0 else "no-hit"
+        elif verdicts.get("baseline_status", "pass") != "pass":
+            outcome = "baseline-broken"
+        else:
+            outcome = "target-broken"
+        targets[name] = {"outcome": outcome, "n_hits": per_task.get(name, 0)}
     # only usable tasks can carry a success: the others were excluded before the search, and a
     # "hit" on a task the collapsed model already failed measures collapse, not the attack
     broken = [name for name in usable if per_task.get(name, 0) > 0]
@@ -131,6 +168,7 @@ def read_cell(path: str) -> dict | None:
         "n_broken": len(broken),
         "n_hits": sum(count for name, count in per_task.items() if name in usable),
         "rate": len(broken) / len(usable) if usable else None,
+        "targets": targets,
         "factor": data.get("surrogate_factor"),
         "checkpoint": os.path.basename(data.get("collapsed_model", "")),
         # the search budget behind the count, for the comparability warning
@@ -146,6 +184,7 @@ def collect(
     methods: list[str],
     tag: str,
     factor_tag: str = "",
+    run_tag: str = "",
 ) -> dict[str, dict[int, dict]]:
     """Reads every (method, generation) cell that exists on disk.
 
@@ -156,6 +195,7 @@ def collect(
         methods (list[str]): "none" plus the surrogate methods to plot
         tag (str): the mixture tag
         factor_tag (str): the factor rule's tag, on the surrogate cells only
+        run_tag (str): the hit rule the sweep filed its results under
 
     Returns:
         dict: method -> generation -> the dict read_cell returned
@@ -165,7 +205,7 @@ def collect(
         for generation in generations:
             cell = read_cell(
                 result_file(
-                    results_dir, generation, specifier_name, method, tag, factor_tag
+                    results_dir, generation, specifier_name, method, tag, factor_tag, run_tag
                 )
             )
             if cell is not None:
@@ -326,6 +366,77 @@ def style(usetex: bool) -> None:
     )
 
 
+def plot_target_matrix(
+    cells: dict[str, dict[int, dict]],
+    generations: range,
+    plot_stem: str,
+    title: str,
+) -> None:
+    """Per-target outcome grid, one panel per method, and writes it as .png and .pdf.
+
+    The counts figure says how many adversarial inputs a generation yielded; this one says *which
+    targets* yielded them and, for the rest, which side of the criterion was missing. Reading the
+    exclusions is the point: a column of grey is a generation the gate emptied, which is a
+    statement about collapse rather than about the attack, and the per-generation denominator in
+    the other figure cannot distinguish the two exclusions from each other.
+
+    Args:
+        cells (dict): the structure collect() returned
+        generations (range): the generation indices covered
+        plot_stem (str): output path without the extension
+        title (str): figure title
+    """
+    methods = [m for m in cells if cells[m]]
+    if not methods:
+        return
+    targets = sorted({name for method in methods for cell in cells[method].values()
+                      for name in cell["targets"]})
+    if not targets:
+        return
+    shown = [g for g in generations if any(g in cells[m] for m in methods)]
+    figure, axes = plt.subplots(
+        len(methods), 1, squeeze=False,
+        figsize=(max(6.0, 0.8 * len(shown) + 3.5),
+                 0.45 * len(targets) * len(methods) + 2.4),
+    )
+    for row, method in enumerate(methods):
+        axis = axes[row][0]
+        for y, target in enumerate(targets):
+            for x, generation in enumerate(shown):
+                cell = cells[method].get(generation)
+                entry = None if cell is None else cell["targets"].get(target)
+                if entry is None:
+                    continue
+                axis.add_patch(
+                    plt.Rectangle((x - 0.5, y - 0.5), 1, 1,
+                                  facecolor=OUTCOME_COLORS[entry["outcome"]],
+                                  edgecolor="white", linewidth=2)
+                )
+                if entry["outcome"] == "hit":
+                    axis.text(x, y, str(entry["n_hits"]), ha="center", va="center",
+                              color="white", fontsize=11)
+        axis.set_xlim(-0.5, len(shown) - 0.5)
+        axis.set_ylim(len(targets) - 0.5, -0.5)
+        axis.set_xticks(range(len(shown)))
+        axis.set_xticklabels(shown)
+        axis.set_yticks(range(len(targets)))
+        axis.set_yticklabels([t.replace("_", " ") for t in targets])
+        axis.set_xlabel("collapse generation")
+        axis.set_title(SERIES_LABELS.get(method, method))
+        axis.grid(False)
+
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=OUTCOME_COLORS[key])
+               for key in OUTCOME_LABELS]
+    figure.legend(handles, list(OUTCOME_LABELS.values()), loc="lower center", ncol=2,
+                  frameon=False)
+    figure.suptitle(title)
+    figure.tight_layout(rect=(0, 0.1, 1, 0.97))
+    os.makedirs(os.path.dirname(plot_stem) or ".", exist_ok=True)
+    figure.savefig(f"{plot_stem}.pdf")
+    figure.savefig(f"{plot_stem}.png", dpi=200)
+    plt.close(figure)
+
+
 def plot(
     cells: dict[str, dict[int, dict]],
     generations: range,
@@ -466,6 +577,8 @@ def main(
     real_data_fraction: float = 0.0,
     surrogate_factor: str = "",
     entropy_match: bool = False,
+    verification: str = "",
+    plots_path: str = "plots",
     no_usetex: bool = False,
 ) -> None:
     """Reads the attack results of one run and plots the success rates over its generations.
@@ -485,6 +598,11 @@ def main(
         entropy_match (bool): the sweep rescaled its logit surrogate to the generation-0 anchor's
             entropy, so its files carry "_em". A run with it and one without are two different
             surrogates for the same generation, hence two different figures
+        verification (str): the hit rule the sweep filed its results under, as
+            `utils.naming.run_tag` spells it: "" for greedy without the anchor, "_anchor" for
+            greedy with it, "_T0.7p0.8k20x5_anchor" for the sampled majority. A wrong value here
+            is a figure with no curves, since nothing on disk matches the name it builds
+        plots_path (str): directory the figure is written to
         no_usetex (bool): render without LaTeX, for a machine with no TeX install
 
     Returns:
@@ -518,12 +636,15 @@ def main(
     if factor_tag:
         print(f"##   factor:  measured per generation (files tagged {factor_tag})")
 
-    cells = collect(results_dir, generations, specifier_name, selected, tag, factor_tag)
+    cells = collect(
+        results_dir, generations, specifier_name, selected, tag, factor_tag, verification
+    )
     if not any(cells.values()):
         raise SystemExit(
             f"no result files under {results_dir} matched "
             f"attack_gen<{start_generation}..{num_generations}>_{specifier_name}{tag}"
-            f"{factor_tag}*.json — check --path, --model_size/--model_specifier, "
+            f"{verification}{factor_tag}*.json — check --path, --verification (the hit rule is "
+            f"part of the name), --model_size/--model_specifier, "
             f"--real_data_fraction (the mixture is part of the name) and --surrogate_factor (an "
             f"sweep under any rule other than n = g + 1 marks its surrogate files)"
         )
@@ -549,9 +670,11 @@ def main(
     # the two curves were searched against different proxies depending on this, so it belongs
     # beside the mixture rather than only in the file name
     factor_note = ", measured factor" if factor_tag else ""
-    # plots/ sits outside --path, exactly like the perplexity figures, so everything that
-    # distinguishes two runs has to be in the file name
-    stem = f"plots/attack_hits_bs{block_size}_{specifier_name}{tag}{factor_tag}"
+    # everything that distinguishes two runs has to be in the file name: the mixture, the
+    # surrogate family, and the hit rule — six plot steps of one grid otherwise write one file
+    stem = os.path.join(
+        plots_path, f"attack_hits_bs{block_size}_{specifier_name}{tag}{verification}{factor_tag}"
+    )
     # no underscores in the title either: usetex renders it
     label = specifier_name.replace("_", " ")
     plot(
@@ -560,9 +683,20 @@ def main(
         plot_stem=stem,
         title=f"Adversarial inputs found per generation\n({label}, {mixture}{factor_note})",
     )
+    matrix_stem = os.path.join(
+        plots_path, f"attack_targets_bs{block_size}_{specifier_name}{tag}{verification}"
+        f"{factor_tag}"
+    )
+    plot_target_matrix(
+        cells,
+        generations,
+        plot_stem=matrix_stem,
+        title=f"Per-target outcome\n({label}, {mixture}{factor_note})",
+    )
     print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Saved the figure under: "
-        f"{TColors.HEADER}{stem}.<png,pdf>{TColors.ENDC}\n"
+        f"## {TColors.OKBLUE}{TColors.BOLD}Saved the figures under: "
+        f"{TColors.HEADER}{stem}.<png,pdf>{TColors.ENDC} and "
+        f"{TColors.HEADER}{matrix_stem}.<png,pdf>{TColors.ENDC}\n"
     )
 
 
@@ -630,6 +764,23 @@ if __name__ == "__main__":
         help="the --surrogate_factor the sweep ran with. Only the *rule* is used, to rebuild the "
         "marker run_attack.py put in the name: 'auto' -> _nauto, 'calibrated' -> _ncal, a number "
         "-> _n<value>, and the default n = g + 1 -> no marker (default: '')",
+    )
+    parser.add_argument(
+        "--verification",
+        "-vf",
+        type=str,
+        default="",
+        help="the hit rule the sweep filed its results under, as utils.naming.run_tag spells it: "
+        "'' for greedy without the anchor, '_anchor' for greedy with it, "
+        "'_T0.7p0.8k20x5_anchor' for the sampled majority. Part of the result file names, so a "
+        "wrong value finds nothing (default: '')",
+    )
+    parser.add_argument(
+        "--plots_path",
+        "-pp",
+        type=str,
+        default="plots",
+        help="directory to write the figure to (default: plots/, beside the repo)",
     )
     parser.add_argument(
         "--no_usetex",

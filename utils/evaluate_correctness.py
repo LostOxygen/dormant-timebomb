@@ -389,11 +389,13 @@ def main(
     generation_batch_size: int = 16,
     exec_timeout: float = 10.0,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     model_size: str = "",
     model_specifier: str = "",
     load_in_4bit: bool = False,
     plot_only: bool = False,
     no_usetex: bool = False,
+    plots_path: str = "plots",
     path: str = "",
 ) -> None:
     """Scores every collapse checkpoint on the benchmark and plots pass@1 over the generations.
@@ -406,6 +408,8 @@ def main(
         generation_batch_size (int): problems per generate() call
         exec_timeout (float): wall-clock limit per candidate
         real_data_fraction (float): the mixture the run used, part of the checkpoint names
+        human_generation_zero (bool): the run's ablation flag, under which generation 0 is
+            shared across mixtures and carries no suffix
         model_size (str): parameter count off the Qwen2.5-Coder ladder
         model_specifier (str): the base model the run collapsed
         load_in_4bit (bool): quantize the models under test
@@ -430,7 +434,7 @@ def main(
     # says the same thing whichever of the two flags named the model
     size_label = model_size_label(specifier) or "off the ladder"
     tag = mixture_tag(real_data_fraction)
-    stem = f"plots/test_correctness_bs{block_size}_{name}{tag}"
+    stem = os.path.join(plots_path, f"test_correctness_bs{block_size}_{name}{tag}")
 
     print(
         f"\n## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Correctness of the produced code"
@@ -479,7 +483,8 @@ def main(
     results = []
     for generation in range(num_generations):
         checkpoint = resolve_checkpoint(
-            generation, block_size, name, mixture_suffix(real_data_fraction, generation)
+            generation, block_size, name,
+            mixture_suffix(real_data_fraction, generation, human_generation_zero),
         )
         if not checkpoint:
             print(f"##   {TColors.WARNING}generation {generation}: no checkpoint{TColors.ENDC}")
@@ -538,8 +543,10 @@ if __name__ == "__main__":
     parser.add_argument("--exec_timeout", "-et", type=float, default=10.0,
                         help="wall-clock limit per executed candidate (default: 10.0)")
     parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0,
-                        help="the mixture the collapse run used; part of the checkpoint names "
-                        "from generation 1 on (default: 0.0)")
+                        help="the mixture the collapse run used; part of the checkpoint names, "
+                        "generation 0 included (default: 0.0)")
+    parser.add_argument("--human_generation_zero", "-hg0", action="store_true",
+                        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone")
     parser.add_argument("--load_in_4bit", "-q4", action="store_true",
                         help="quantize the models under test. Off by default, so the measured "
                         "pass rate is the checkpoint's and not the quantization's")
@@ -547,6 +554,10 @@ if __name__ == "__main__":
                         help="replot from the cached verdicts without loading a model")
     parser.add_argument("--no_usetex", action="store_true",
                         help="render without LaTeX, for a machine with no TeX install")
+    parser.add_argument("--plots_path", "-pp", type=str, default="plots",
+                        help="directory the figure is written to (default: plots/ beside the "
+                        "repo, where every figure of this pipeline has always gone; a "
+                        "self-contained run root wants its own)")
     parser.add_argument("--path", "-p", type=str, default="",
                         help="root holding generated_datasets/ and model_outputs/ "
                         "(default: current directory)")

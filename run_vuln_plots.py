@@ -111,9 +111,23 @@ def read_json_glob(results_path: str, pattern: str) -> list:
     return payloads
 
 
+def run_suffix(args) -> str:
+    """What distinguishes this invocation's figures from another invocation's.
+
+    The hit rule and the surrogate family. Without them every verdict and every variant of one
+    grid writes the same file names and only the last survives — which is exactly what happened
+    to the 2026-10-19 run, where six plot steps left one figure each. ``-em any`` and ``-em off``
+    share a suffix on purpose: "off" is the plain family, the name every figure drawn before the
+    entropy tag existed already has.
+    """
+    return args.verification + ("_em" if args.entropy_match == "on" else "")
+
+
 def stem(args, figure: str, tag: str = "") -> str:
     """Output path of a figure, following the repo's artifact naming."""
-    return os.path.join(args.plots_path, f"vuln_{figure}_bs{args.block_size}{tag}")
+    return os.path.join(
+        args.plots_path, f"vuln_{figure}_bs{args.block_size}{tag}{run_suffix(args)}"
+    )
 
 
 # ─────────────────────────────── E1: the attack works ─────────────────────────────────────
@@ -559,6 +573,15 @@ FIGURES: dict = {
     "rdf_window": figure_rdf_window,
     "ppl_roc": figure_ppl_roc,
 }
+# what a figure needs when it comes back empty, so a skip says which input is missing rather than
+# "not yet": the direct-method figures are empty under -em on/off selections that leave no direct
+# records, and three figures read the evaluation pipeline's output, not the attack's
+SKIP_REASONS: dict = {
+    "attack_success": "needs direct (-m none) attack results",
+    "controls": "needs utils/verify_suffixes.py output (run_vuln_eval.sh controls phase)",
+    "temperature": "needs utils/verify_suffixes.py output (run_vuln_eval.sh temperature phase)",
+    "ppl_roc": "needs utils/suffix_perplexity.py output (run_vuln_eval.sh perplexity phase)",
+}
 
 
 def main() -> None:
@@ -629,8 +652,8 @@ def main() -> None:
     for name in requested:
         drawn = FIGURES[name](records, args)
         if not drawn:
-            print(f"##   {name:16s} {TColors.WARNING}skipped{TColors.ENDC}: its input is not "
-                  f"in {args.results_path} yet")
+            print(f"##   {name:16s} {TColors.WARNING}skipped{TColors.ENDC}: "
+                  f"{SKIP_REASONS.get(name, 'its input is not in ' + args.results_path + ' yet')}")
             continue
         for figure, path in drawn:
             save_figure(figure, path, show=args.show)

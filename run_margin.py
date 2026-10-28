@@ -737,6 +737,8 @@ def main() -> None:
                         help="measure generations 0..N (default: 9)")
     parser.add_argument("--block_size", "-bs", type=int, default=512)
     parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
+    parser.add_argument("--human_generation_zero", "-hg0", action="store_true",
+                        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone")
     parser.add_argument("--path", "-p", type=str, default="",
                         help="run root holding model_outputs/ and attack_results/")
     parser.add_argument("--baseline_model_path", "-bmp", type=str, default="")
@@ -941,6 +943,7 @@ def main() -> None:
             model_dir = resolve_collapsed_dir(
                 generation, specifier_name, args.block_size,
                 real_data_fraction=args.real_data_fraction,
+                human_generation_zero=args.human_generation_zero,
             )
         except FileNotFoundError as exc:
             print(f"##   {TColors.WARNING}generation {generation} skipped{TColors.ENDC}: {exc}")

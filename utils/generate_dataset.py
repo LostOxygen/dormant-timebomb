@@ -60,7 +60,8 @@ import shutil
 import torch
 
 from utils.colors import TColors
-from utils.naming import mixture_suffix
+from utils.models import resolve_model_specifier
+from utils.naming import generation_label, mixture_suffix
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -359,7 +360,18 @@ if __name__ == "__main__":
         "-g",
         type=int,
         default=0,
-        help="sets the current generation",
+        help="the generation whose model is sampled. -1 samples the pristine base model "
+        "(--model_specifier) and files the corpus as generated_dataset_base, the corpus "
+        "generation 0 trains on by default",
+    )
+    parser.add_argument(
+        "--model_specifier",
+        "-ms",
+        type=str,
+        default="",
+        help="the Hugging Face id of the base model, sampled directly at --generation -1. "
+        "--specifier_name is only the short name the artifacts are filed under (default: the "
+        "repo's default base model)",
     )
     parser.add_argument(
         "--shard_id",
@@ -446,6 +458,13 @@ if __name__ == "__main__":
         help="the run's --real_data_fraction. Used only to name the checkpoint this samples from "
         "and the shard it writes; nothing about the sampling itself depends on it (default: 0.0)",
     )
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="the run's --human_generation_zero: generation 0 is then shared across mixtures and "
+        "its checkpoint and shard carry no mixture suffix",
+    )
     args = parser.parse_args()
 
     # arguments
@@ -453,6 +472,8 @@ if __name__ == "__main__":
     specifier_name = args.specifier_name
     dataset_batch_size = args.dataset_batch_size
     generation = args.generation
+    model_specifier = resolve_model_specifier("", args.model_specifier)
+    human_generation_zero = args.human_generation_zero
     shard_id = args.shard_id
     seed = args.seed
     engine = args.engine
@@ -525,8 +546,8 @@ if __name__ == "__main__":
         os.makedirs(MODEL_PATH, exist_ok=True)
 
     print(
-        f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation}{TColors.ENDC} "
-        f"(shard {shard_id}, engine: {engine})"
+        f"## {TColors.OKBLUE}{TColors.BOLD}Generate Dataset {generation_label(generation)}"
+        f"{TColors.ENDC} (shard {shard_id}, engine: {engine})"
     )
 
     # vLLM cannot load a bare LoRA adapter directory as a model, so it samples from the merged
@@ -534,11 +555,17 @@ if __name__ == "__main__":
     # weights: the merge dequantizes the base and folds B @ A into it, so this is not a different
     # model
     # the checkpoint being sampled from and the shard being written both belong to `generation`, so
-    # unlike the training worker this one needs a single suffix. It is empty for generation 0, whose
-    # model every --real_data_fraction shares
-    gen_suffix = mixture_suffix(real_data_fraction, generation)
+    # unlike the training worker this one needs a single suffix. It is empty for the base corpus
+    # (generation -1), which is the same text under every --real_data_fraction, and for
+    # generation 0 under --human_generation_zero
+    gen_suffix = mixture_suffix(real_data_fraction, generation, human_generation_zero)
+    label = generation_label(generation)
 
-    if engine == "vllm":
+    if generation < 0:
+        # the pristine base model, by its Hugging Face id: both engines load one directly, and
+        # there is no adapter to merge
+        checkpoint = model_specifier
+    elif engine == "vllm":
         checkpoint = (
             f"{MODEL_PATH}model_{generation}_bs{block_size}_{specifier_name}{gen_suffix}_fp16"
         )
@@ -572,5 +599,5 @@ if __name__ == "__main__":
 
     new_dataset.save_to_disk(
         DATASET_PATH
-        + f"subdataset_{generation}_bs{block_size}_{specifier_name}{gen_suffix}_shard{shard_id}"
+        + f"subdataset_{label}_bs{block_size}_{specifier_name}{gen_suffix}_shard{shard_id}"
     )

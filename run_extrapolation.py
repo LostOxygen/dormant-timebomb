@@ -148,6 +148,7 @@ def main(
     surrogate_top_p: float = 0.0,
     dataset_size: int = 0,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
@@ -186,10 +187,10 @@ def main(
         surrogate_top_p (float): p_1 of the data-space surrogate. 0.0 reads it from the
             calibration that calibrate_surrogate.py wrote
         real_data_fraction (float): the --real_data_fraction of the run_baseline.py run this
-            stage's histogram is compared against. It does not change what this stage computes —
-            the surrogate is built from model_0, which every mixture shares — it only namespaces
-            this stage's own artifacts so a mixed run's numbers are not filed under, or replotted
-            as, an unmixed run's
+            stage's histogram is compared against. It picks the model_0 anchor the surrogate is
+            built from — that mixture's own generation 0 — and namespaces this stage's artifacts
+        human_generation_zero (bool): the run's ablation flag, under which generation 0 is
+            shared across mixtures and carries no suffix
         temperature (float): sampling temperature of the generation. Has to match
             run_baseline.py, otherwise the extrapolated histograms are compared against a
             baseline that was sampled differently
@@ -222,11 +223,10 @@ def main(
     # directories. Empty at 0, so an existing pure self-training run keeps exactly the names it
     # always had and -ho/-st keep finding them.
     #
-    # Note what this does *not* reach: no model path depends on it. This stage only ever loads
-    # model_0_bs{bs}_{name}, and generation 0 trains on the human corpus under every mixture, so
-    # that checkpoint is shared — the same reason run_attack.py's surrogate anchor takes no
-    # fraction. The per-generation datasets below are named with mixture_suffix() instead, which
-    # returns "" for generation 0 for the same reason; see utils/naming.py
+    # It also picks the model_0 anchor this stage loads: generation 0 trains on the mixture like
+    # every later generation, so the anchor is that mixture's own checkpoint (shared and untagged
+    # only under --human_generation_zero). The per-generation datasets below are named with
+    # mixture_suffix() instead; see utils/naming.py
     data_suffix = mixture_tag(real_data_fraction)
     # the factor rule's tag, and the reason it exists: --surrogate_factor changes what every
     # corpus this stage generates *contains*, so a calibrated run and a default one would
@@ -404,10 +404,9 @@ def main(
     if real_data_fraction > 0:
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Real data fraction{TColors.ENDC}: "
-            f"{real_data_fraction:g} — names this stage's artifacts only. The extrapolation is "
-            f"built from model_0, which every mixture shares, so it approximates the untempered "
-            f"self-training trajectory and is only a like-for-like comparison against an "
-            f"-rdf 0 run of run_baseline.py"
+            f"{real_data_fraction:g} — the surrogate is built from this mixture's own model_0"
+            + (" (shared across mixtures: --human_generation_zero)" if human_generation_zero
+               else "")
         )
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Number of Generations{TColors.ENDC}: {num_generations}"
@@ -578,9 +577,10 @@ def main(
             # the corpus this generation produces is named after the generation that produced it,
             # which is what makes utils/calculate_perplexity.py find it again: that worker reads
             # generation i's corpus as generated_dataset_{i - 1} + mixture_suffix(fraction, i - 1).
-            # Generation 0 is therefore untagged on both sides — n = 1 reproduces the real model_0
-            # anchor, which every mixture shares, so its corpus is shared too
-            gen_mix = mixture_suffix(real_data_fraction, gen_id)
+            # Generation 0 is tagged on both sides too (n = 1 reproduces the mixture's own model_0
+            # anchor), except under --human_generation_zero, where every mixture shares it
+            gen_mix = mixture_suffix(real_data_fraction, gen_id, human_generation_zero)
+            anchor_mix = mixture_suffix(real_data_fraction, 0, human_generation_zero)
 
             # ───────────────────── build the alpha scaled adapter (lora only) ────────────────
             # a LoRA layer adds (alpha / r) * B @ A to the frozen base weight, so scaling alpha
@@ -602,7 +602,8 @@ def main(
                     f"{MODEL_PATH}model_scaled_n{gen_factor:g}_bs{block_size}_{specifier_name}"
                 )
                 build_scaled_adapter(
-                    adapter_path=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
+                    adapter_path=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}"
+                    f"{anchor_mix}",
                     factor=gen_factor,
                     output_path=adapter_path,
                 )
@@ -673,6 +674,7 @@ def main(
                         "--real_data_fraction",
                         str(real_data_fraction),
                     ]
+                    + (["--human_generation_zero"] if human_generation_zero else [])
                     + (["--load_in_4bit"] if load_in_4bit else []),
                 )
                 process_list.append(process)
@@ -783,6 +785,7 @@ def main(
                     "--real_data_fraction",
                     str(real_data_fraction),
                 ]
+                + (["--human_generation_zero"] if human_generation_zero else [])
                 + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
             )
             process_list.append(process)
@@ -1050,12 +1053,17 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="the --real_data_fraction of the run_baseline.py run this stage is compared against, "
-        "in [0, 1). It namespaces this stage's own artifacts only — the generated corpora of "
-        "generations 1+, the perplexity cache and the figure — so a comparison against a mixed run "
-        "is not filed under, or replotted as, an unmixed one. It does not change what is computed: "
-        "the surrogate is built from model_0, which every mixture shares, so this stage always "
-        "approximates the untempered self-training trajectory and is only a like-for-like "
-        "comparison against an -rdf 0 baseline (default: 0.0)",
+        "in [0, 1). It picks the model_0 anchor the surrogate is built from — that mixture's own "
+        "generation 0, since generation 0 trains on the mixture like every later generation — "
+        "and namespaces this stage's own artifacts (the generated corpora, the perplexity cache "
+        "and the figure) so a mixed run's numbers are not filed under an unmixed run's "
+        "(default: 0.0)",
+    )
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone",
     )
     parser.add_argument(
         "--temperature",

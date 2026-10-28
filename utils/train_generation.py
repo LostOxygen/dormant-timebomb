@@ -89,9 +89,11 @@ parser.add_argument("--path", "-p", type=str, default="")
 parser.add_argument("--seed", "-sd", type=int, default=1337)
 # the run's --real_data_fraction, needed here only to name artifacts: this worker reads
 # model_{generation - 1} and train/val_dataset_{generation} and writes model_{generation}, and those
-# do not all carry the same suffix (generation 0 is never mixed). The mixing itself happens in the
-# orchestrator, which hands over the splits already composed
+# do not all carry the same suffix under --human_generation_zero (whose generation 0 is shared
+# across mixtures). The mixing itself happens in the orchestrator, which hands over the splits
+# already composed
 parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
+parser.add_argument("--human_generation_zero", "-hg0", action="store_true")
 args = parser.parse_args()
 
 block_size = args.block_size
@@ -110,11 +112,13 @@ recursive_init = args.recursive_init
 path = args.path
 seed = args.seed
 real_data_fraction = args.real_data_fraction
+human_generation_zero = args.human_generation_zero
 
 # the suffix of what this generation writes, and of what the previous one wrote. They differ at
-# generation 1, whose input model_0 is shared across mixtures while its output model_1 is not
-gen_suffix = mixture_suffix(real_data_fraction, generation)
-prev_suffix = mixture_suffix(real_data_fraction, generation - 1)
+# generation 1 under --human_generation_zero, whose input model_0 is shared across mixtures while
+# its output model_1 is not
+gen_suffix = mixture_suffix(real_data_fraction, generation, human_generation_zero)
+prev_suffix = mixture_suffix(real_data_fraction, generation - 1, human_generation_zero)
 
 # torchrun sets these; running the script bare is a world size of 1
 world_size = int(os.environ.get("WORLD_SIZE", "1"))

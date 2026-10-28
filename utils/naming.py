@@ -58,31 +58,83 @@ def poison_specifier_name(specifier_name: str, tag: str) -> str:
     return specifier_name if not tag else f"{specifier_name}_{tag}"
 
 
-def mixture_suffix(real_data_fraction: float, generation: int) -> str:
+BASE_CORPUS_LABEL = "base"
+HUMAN_GEN0_TAG = "_hg0"
+
+
+def generation_label(generation: int) -> str:
+    """Name component of a corpus generation: ``"base"`` for the pristine model's own corpus.
+
+    Generation -1 is the corpus the *base* model generates, which generation 0 trains on under
+    the default (mixed) rule. It is produced before any adapter exists, so the ``-1`` index
+    renders as ``base`` in every artifact name rather than as a literal ``-1``.
+
+    Args:
+        generation (int): generation index, -1 for the base model's corpus
+
+    Returns:
+        str: "base" below 0, otherwise the index as a string
+    """
+    return BASE_CORPUS_LABEL if generation < 0 else str(generation)
+
+
+def gen_zero_tag(human_generation_zero: bool) -> str:
+    """Run-level tag of the generation-0 data rule.
+
+    Empty under the default (generation 0 trains on the same mixture as every later generation),
+    ``_hg0`` under the ablation ``--human_generation_zero`` (generation 0 trains on the human
+    corpus alone, the rule every run before 2026-10-22 used). Like the weight-lineage tag it
+    reaches only the run-level artifacts of run_baseline.py; the checkpoints are kept apart by
+    the root, see run_baseline.py's preflight.
+
+    Args:
+        human_generation_zero (bool): the --human_generation_zero flag
+
+    Returns:
+        str: "" by default, "_hg0" under the ablation
+    """
+    return HUMAN_GEN0_TAG if human_generation_zero else ""
+
+
+def mixture_suffix(
+    real_data_fraction: float, generation: int, human_generation_zero: bool = False
+) -> str:
     """Per-generation artifact suffix for a --real_data_fraction run.
 
-    Empty for generation 0, and that is not an inconsistency to tidy away. Generation 0 trains on
-    the human corpus by definition — run_baseline.py only mixes from generation 1 onward — so
-    model_0, the corpus model_0 generates, and every human-corpus dataset are byte-identical for
-    every value of the fraction. Leaving them unsuffixed means one --path holds a single shared
-    generation 0 that every mixture reuses instead of retraining an identical copy per value, and
-    it means the stages that only ever read generation 0 (run_extrapolation.py,
-    utils/calibrate_surrogate.py, and run_attack.py's surrogate anchor) resolve their *checkpoint*
-    without knowing the mixture. run_extrapolation.py does take a --real_data_fraction, but only to
-    namespace the artifacts it writes — the model it loads is still the shared model_0.
+    Every generation from 0 up trains on the mixture, so every generation's model and corpus
+    carry the tag (since 2026-10-22). Generation 0 is the attacker's own fine-tune of the base
+    model under the threat model, and it has to be one step of the *same* map the deployer's
+    lineage iterates: ``corpus_0 = (1 - f) sample(M_base) + f sample(H)``, exactly as
+    ``corpus_g = (1 - f) sample(M_{g-1}) + f sample(H)`` for every later ``g``. With a human-only
+    generation 0 the delta the surrogate extrapolates, ``l_0 - l_base``, was a fine-tune on human
+    code rather than a collapse step.
 
-    Callers therefore pass the generation of the artifact being named, which for a
-    previous-generation input is `generation - 1` — see utils/train_generation.py, which reads
-    model_{g-1} and writes model_{g} and needs a different answer for each.
+    Two exceptions return "":
+
+    * ``generation < 0`` names the corpus the pristine base model generates (``generated_dataset_base``),
+      which is the same text under every mixture and is therefore shared
+    * ``human_generation_zero`` (the ablation and the pre-2026-10-22 rule) trains generation 0 on
+      the human corpus alone, so model_0 and its corpus are byte-identical under every fraction and
+      stay unsuffixed, one shared generation 0 per root. Every consumer that reads a root produced
+      under that rule has to be given the same flag, or it looks for ``model_0_..._rdf{x}`` and
+      finds nothing
+
+    Callers pass the generation of the artifact being named, which for a previous-generation input
+    is ``generation - 1`` — see utils/train_generation.py, which reads model_{g-1} and writes
+    model_{g}.
 
     Args:
         real_data_fraction (float): the --real_data_fraction the run was given
-        generation (int): generation index of the artifact being named
+        generation (int): generation index of the artifact being named, -1 for the base corpus
+        human_generation_zero (bool): the --human_generation_zero ablation
 
     Returns:
-        str: "" for generation 0 or fraction 0, otherwise "_rdf{value}"
+        str: "" for the base corpus, for fraction 0, or for generation 0 under the ablation;
+            otherwise "_rdf{value}"
     """
-    return "" if generation <= 0 else mixture_tag(real_data_fraction)
+    if generation < 0 or (human_generation_zero and generation == 0):
+        return ""
+    return mixture_tag(real_data_fraction)
 
 
 def factor_mode_tag(surrogate_factor: float | str) -> str:
@@ -249,11 +301,12 @@ ANCHOR_TAG: str = "_anchor"
 def anchor_tag(hold_anchor: bool) -> str:
     """Result-name tag for an attack whose hit rule also holds the generation-0 anchor correct.
 
-    run_attack.py's hit used to be "target wrong, baseline correct"; with the anchor held it is
-    "target wrong, baseline correct, generation 0 correct" — a stricter claim about the *same*
-    generation, so the two must not share a file. Empty when the anchor is not held, which is what
-    every result written before the anchor existed was. A generation-0 attack never holds the
-    anchor (it is the target), so its name carries no tag either way.
+    The hit rule is "target wrong, baseline correct": the attacker's own generation-0 fine-tune is
+    the *instrument* that builds the surrogate, not a model the suffix has to spare. Holding it
+    correct as well is the stricter, optional claim (``--hold_anchor``), and a stricter claim about
+    the same generation must not share a file with the default one, hence the tag. Empty by
+    default. A generation-0 attack never holds the anchor (it is the target), so its name carries
+    no tag either way.
 
     Args:
         hold_anchor (bool): whether the anchor was a condition of the hit
@@ -265,8 +318,12 @@ def anchor_tag(hold_anchor: bool) -> str:
 
 
 def anchor_held_from_argv(argv: list) -> bool:
-    """Whether a run_attack.py command line holds the anchor: true unless --no_anchor/-na is in it."""
-    return not any(token in ("-na", "--no_anchor") for token in argv)
+    """Whether a run_attack.py command line holds the anchor: only with --hold_anchor/-ha.
+
+    ``--no_anchor``/``-na`` is the default now and is accepted as a no-op, so a stored command
+    line from before the flip still resolves to the same name it always did.
+    """
+    return any(token in ("-ha", "--hold_anchor") for token in argv)
 
 
 def find_anchor_tag(name: str) -> str:
@@ -338,7 +395,7 @@ def find_objective_tag(name: str) -> str:
 
 def run_tag(temperature: float = VERIFY_TEMPERATURE, top_p: float = VERIFY_TOP_P,
             top_k: int = VERIFY_TOP_K, num_samples: int = VERIFY_SAMPLES,
-            hold_anchor: bool = True, generation: int = 1,
+            hold_anchor: bool = False, generation: int = 1,
             sink_objective: bool = False) -> str:
     """Verification tag plus anchor tag plus objective tag, as they appear together in a name.
 

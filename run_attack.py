@@ -59,16 +59,23 @@ never becomes a hit. The term is a hinge on the target's own decision margin,
 measures, and it costs one extra forward/backward per step on the model under attack. 0 disables it
 and reproduces the previous objective.
 
-The anchor is held, not only the baseline. The generation-0 collapsed model is what the attacker
-builds the surrogate from, and a suffix that breaks it as well as the target says only that the
-first fine-tune was fragile — not that collapse *progressed* into something exploitable. So by
-default the hit rule is three-sided: the target emits the wrong code, and both the pristine
-baseline and the generation-0 anchor keep emitting the correct one. The anchor is loaded as a
-real model, probed by the capability gate (a task it already fails is not attackable), held in the
-objective with the same hinge and anchor terms as the baseline, and decoded in every behavioural
-check. ``--no_anchor`` restores the two-sided rule; a generation-0 attack never holds it, since the
-anchor is the target there. Files of anchor-held runs carry ``_anchor``
-(``utils.naming.anchor_tag``), so the two claims never share a file.
+Only the pristine baseline is held correct. The hit rule is two-sided: the target emits the wrong
+code and the pristine baseline keeps emitting the correct one. That follows from the threat model.
+The attacker holds the foundational model and can fine-tune it *once*; the resulting generation-0
+model is the **instrument** that builds the surrogate, not a deployment the suffix has to spare.
+What the attack claims is that one observable fine-tune is enough to approximate where the
+trajectory is going and to find inputs that work on models further along it — and a suffix that
+also breaks the attacker's own instrument does not weaken that claim, because nobody deploys the
+instrument.
+
+``--hold_anchor``/``-ha`` adds the generation-0 model to the hold set as an optional, stricter
+claim: that the suffix is specific to *later* collapse rather than to any descendant of the base
+model. It then becomes a real model next to the baseline — probed by the capability gate (a task it
+already fails is not attackable), held in the objective with the same hinge and hold-toward terms,
+and decoded in every behavioural check — and the files carry ``_anchor``
+(``utils.naming.anchor_tag``), so the two claims never share a file. ``--no_anchor``/``-na`` is the
+default now and is accepted as a no-op. A generation-0 attack never holds the anchor, since the
+anchor is the target there.
 
 Transfer mode (``--surrogate_method``)
 -------------------------------------
@@ -1006,7 +1013,7 @@ class CapabilityReport:
     usable: list[str] = field(default_factory=list)
     n_probed: int = 0
     capability: float = 0.0
-    threshold: float = 0.0
+    threshold: int = 1  # minimum number of attackable tasks (--min_usable_tasks)
     aborted: bool = False
     reason: str = ""
     skipped: bool = False
@@ -1158,9 +1165,10 @@ class ContrastiveGCG:
     So the success criterion is the same in both modes:
 
         baseline   must stay correct  — the suffix must be benign against the pristine model
-        anchor     must stay correct  — and against the generation-0 model the surrogate is
-                                        built from (when one is given; see `hold_anchor`)
         collapsed  must break         — the suffix must elicit wrong code from the real model
+        anchor     must stay correct  — only under `--hold_anchor`. By default the generation-0
+                                        model is the attacker's own instrument, not a model the
+                                        suffix has to spare
     """
 
     def __init__(
@@ -1602,27 +1610,30 @@ class ContrastiveGCG:
         )
 
     # ── upfront capability gate ──
-    def capability_gate(self, tasks: list[AttackTask], min_capability: float) -> CapabilityReport:
+    def capability_gate(self, tasks: list[AttackTask], min_usable_tasks: int = 1) -> CapabilityReport:
         """Probes both models on the clean, suffix-free prompts before any optimization.
 
         Runs once per invocation, ahead of the search, and answers a prerequisite question: would
         the collapsed model have produced *correct* code without the adversarial input? Only tasks
         where it would can support the claim that the adversarial input flipped a correct answer
-        into a wrong one. If the collapsed model solves fewer than `min_capability` of the probed
-        tasks it has lost code generation as such, and the whole run is aborted — a "hit" against
-        a model that fails everything anyway measures collapse, not the attack.
+        into a wrong one. The run is aborted only when fewer than `min_usable_tasks` tasks are
+        attackable — by default, when there is not a single one — whatever the size of the suite:
+        a "hit" against a model that fails everything anyway measures collapse, not the attack,
+        but a model that still solves one task is a model that can be attacked on it. The
+        capability *ratio* is still computed and reported; it no longer decides anything here
+        (the `-sf auto` probe keeps its own fraction, `--min_capability`).
 
         The verdicts are cached so `run_task` reuses them as its control instead of decoding the
         clean prompts a second time.
 
         Args:
             tasks (list[AttackTask]): the tasks selected on the CLI
-            min_capability (float): fraction of tasks the collapsed model must solve, in [0, 1]
+            min_usable_tasks (int): how many attackable tasks the run needs to proceed
 
         Returns:
             CapabilityReport: per-task verdicts, the capability ratio, and the abort decision
         """
-        report = CapabilityReport(threshold=min_capability)
+        report = CapabilityReport(threshold=min_usable_tasks)
         self._controls = {}
 
         if self.cfg.no_exec:
@@ -1691,20 +1702,25 @@ class ContrastiveGCG:
             return report
 
         report.capability = len(report.collapsed_solved) / report.n_probed
-        if report.capability < min_capability:
+        if len(report.usable) < min_usable_tasks:
             report.aborted = True
-            report.reason = (
-                f"the collapsed model solved {len(report.collapsed_solved)}/{report.n_probed} "
-                f"clean tasks ({report.capability:.0%}), below the required "
-                f"{min_capability:.0%} — it is no longer capable of generating correct code, so "
-                f"any wrong output cannot be attributed to an adversarial input"
-            )
-        elif not report.usable:
-            report.aborted = True
-            report.reason = (
-                "no task is attackable: every task the collapsed model solves is one the "
-                "baseline model" + (" or the anchor" if self.hold_anchor else "") + " does not"
-            )
+            if not report.collapsed_solved:
+                report.reason = (
+                    f"the collapsed model solved 0/{report.n_probed} clean tasks — it is no "
+                    f"longer capable of generating correct code, so any wrong output cannot be "
+                    f"attributed to an adversarial input"
+                )
+            elif not report.usable:
+                report.reason = (
+                    "no task is attackable: every task the collapsed model solves is one the "
+                    "baseline model" + (" or the anchor" if self.hold_anchor else "")
+                    + " does not"
+                )
+            else:
+                report.reason = (
+                    f"only {len(report.usable)} attackable task(s), below the required "
+                    f"{min_usable_tasks}"
+                )
         return report
 
     # ── surrogate accounting ──
@@ -2384,6 +2400,7 @@ def resolve_collapsed_dir(
     block_size: int | None,
     prefer_adapter: bool = False,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
 ) -> str:
     """Locates the collapsed checkpoint directory written by ``run_baseline.py``.
 
@@ -2392,11 +2409,12 @@ def resolve_collapsed_dir(
     With `block_size` given the exact name is used, otherwise the directory is globbed and an
     unambiguous match is required.
 
-    A run trained with ``--real_data_fraction`` names its generations from 1 onward
+    A run trained with ``--real_data_fraction`` names every generation, 0 included,
     ``model_{g}_bs{bs}_{name}_rdf{value}[_fp16]``, so the same fraction has to be given here for
-    them to be found. Generation 0 is unaffected either way — it trains on the human corpus under
-    every mixture, so ``mixture_suffix`` returns "" for it and the surrogate anchor resolves to the
-    one shared checkpoint without the caller special-casing anything.
+    them to be found — the surrogate anchor too, since generation 0 trains on the mixture like
+    every later generation (since 2026-10-22). Under ``--human_generation_zero``, the ablation
+    and the rule of every older root, generation 0 is the one checkpoint every mixture shares
+    and ``mixture_suffix`` returns "" for it.
 
     Args:
         generation (int): collapse generation index
@@ -2405,6 +2423,7 @@ def resolve_collapsed_dir(
         prefer_adapter (bool): look for the LoRA adapter directory before the merged fp16 one.
             The `lora` surrogate needs the adapter, since it works by scaling its alpha
         real_data_fraction (float): the --real_data_fraction the run was trained with
+        human_generation_zero (bool): the run's --human_generation_zero ablation
 
     Returns:
         str: path to a merged fp16 directory, or to the LoRA adapter directory as a fallback
@@ -2415,7 +2434,7 @@ def resolve_collapsed_dir(
         RuntimeError: several block sizes matched
     """
     order = ("", "_fp16") if prefer_adapter else ("_fp16", "")
-    mixture = mixture_suffix(real_data_fraction, generation)
+    mixture = mixture_suffix(real_data_fraction, generation, human_generation_zero)
 
     if block_size is not None:
         exact = os.path.join(
@@ -2428,6 +2447,8 @@ def resolve_collapsed_dir(
         raise FileNotFoundError(
             f"no checkpoint for generation {generation} at {exact}[_fp16] — check "
             f"--block_size / --model_specifier / --real_data_fraction / --path"
+            + ("" if generation or human_generation_zero else " (a root produced before "
+               "2026-10-22 shares generation 0 across mixtures: pass --human_generation_zero)")
         )
 
     # the mixture is part of the pattern rather than something filtered out afterwards, which is
@@ -2809,6 +2830,7 @@ def main(
     random_control_trials: int = 0,
     random_control_match: str = "tokens",
     min_capability: float = 0.6,
+    min_usable_tasks: int = 1,
     skip_capability_check: bool = False,
     seed: int = 1337,
     list_tasks: bool = False,
@@ -2821,8 +2843,9 @@ def main(
     sink_cap: float = 0.0,
     sink_run_level: bool = False,
     entropy_match: bool = False,
-    hold_anchor: bool = True,
+    hold_anchor: bool = False,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     attack_gpus: int = 0,
     shard_units: str = "",
     handoff_file: str = "",
@@ -2886,8 +2909,10 @@ def main(
             attackable task before the search — the run's null hypothesis. 0 disables it
         random_control_match (str): what "the same length" means for those suffixes, "tokens"
             (the search's own unit) or "chars"
-        min_capability (float): fraction of clean tasks the collapsed model must still solve
-            before the attack is allowed to start
+        min_capability (float): fraction of clean tasks the ``-sf auto`` probe requires of a
+            surrogate rung; it no longer gates the run
+        min_usable_tasks (int): how many attackable tasks the capability gate needs before the
+            attack is allowed to start. 1 means "at least one", whatever the size of the suite
         skip_capability_check (bool): do not abort the run when the capability gate fails
         seed (int): RNG seed
         list_tasks (bool): print the available tasks and exit
@@ -2923,13 +2948,18 @@ def main(
         sink_run_level (bool): under ``--surrogate_factor sink``, build one surrogate at the mean
             of the usable boundaries for every target, as before, instead of switching the
             surrogate to each target's own boundary when its search starts
-        hold_anchor (bool): hold the generation-0 collapsed model correct as a third condition of
-            the hit, next to the baseline. Ignored for a generation-0 attack, where it is the
-            target. Anchor-held runs are filed under a name with ``_anchor``
+        hold_anchor (bool): also hold the generation-0 collapsed model correct, as a third
+            condition of the hit next to the baseline. Off by default: that model is the
+            attacker's own fine-tune, the instrument the surrogate is built from, and holding it
+            is the stricter optional claim that the suffix is specific to later collapse. Ignored
+            for a generation-0 attack, where it is the target. Anchor-held runs are filed under a
+            name with ``_anchor``
         first_collapsed_path (str): explicit path to the generation-0 collapsed model the
             surrogate is built from (default: resolved from the model outputs)
         real_data_fraction (float): the --real_data_fraction run_baseline.py was given, which is
-            part of the checkpoint names from generation 1 onward. Only used to find them
+            part of the checkpoint names, generation 0 included. Only used to find them
+        human_generation_zero (bool): the run's --human_generation_zero ablation, under which
+            generation 0 is shared across mixtures and carries no suffix
         attack_gpus (int): how many of the visible GPUs to shard the (task, restart) units over.
             0 uses all of them, 1 keeps the search in this process
         shard_units (str): worker mode — the ``task:restart`` units this process is to run. Set by
@@ -3006,6 +3036,7 @@ def main(
         specifier_name,
         block_size,
         real_data_fraction=real_data_fraction,
+        human_generation_zero=human_generation_zero,
     )
 
     # ── transfer mode setup ──
@@ -3119,10 +3150,16 @@ def main(
         factor = float(surrogate_factor)
     first_collapsed_dir = ""
     if transfer:
-        # generation 0 needs no fraction: it is the same checkpoint under every mixture, and
-        # mixture_suffix returns "" for it in any case
+        # the anchor is this mixture's own generation 0: the attacker's fine-tune trains on the
+        # same mixture as the lineage it approximates (shared across mixtures only under
+        # --human_generation_zero, where mixture_suffix returns "" for it)
         first_collapsed_dir = first_collapsed_path or resolve_collapsed_dir(
-            0, specifier_name, block_size, prefer_adapter=(surrogate_method == "lora")
+            0,
+            specifier_name,
+            block_size,
+            prefer_adapter=(surrogate_method == "lora"),
+            real_data_fraction=real_data_fraction,
+            human_generation_zero=human_generation_zero,
         )
         if os.path.abspath(first_collapsed_dir) == os.path.abspath(collapsed_dir):
             raise SystemExit(
@@ -3139,7 +3176,13 @@ def main(
     anchor_held = hold_anchor and collapsed_generation > 0
     anchor_dir = ""
     if anchor_held:
-        anchor_dir = first_collapsed_path or resolve_collapsed_dir(0, specifier_name, block_size)
+        anchor_dir = first_collapsed_path or resolve_collapsed_dir(
+            0,
+            specifier_name,
+            block_size,
+            real_data_fraction=real_data_fraction,
+            human_generation_zero=human_generation_zero,
+        )
 
     selected = [t for t in TASKS if not tasks or t.name in tasks.split(",")]
     if not selected:
@@ -3325,15 +3368,19 @@ def main(
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Anchor (generation 0){TColors.ENDC}: "
             + (
-                f"held correct, {anchor_dir}" if anchor_held
-                else "not held — " + (
-                    "it is the target" if collapsed_generation == 0 else "--no_anchor"
+                f"held correct, {anchor_dir} (--hold_anchor)" if anchor_held
+                else (
+                    "it is the target" if collapsed_generation == 0
+                    else "not held — the attacker's own fine-tune, the surrogate's instrument"
                 )
             )
         )
         print(
-            f"## {TColors.OKBLUE}{TColors.BOLD}Min. Collapsed Capability{TColors.ENDC}: "
-            f"{min_capability:.0%}" + (" (not enforced)" if skip_capability_check else "")
+            f"## {TColors.OKBLUE}{TColors.BOLD}Capability gate{TColors.ENDC}: at least "
+            f"{min_usable_tasks} attackable task(s)"
+            + (" (not enforced)" if skip_capability_check else "")
+            + (f"; the -sf auto probe wants {min_capability:.0%} of the clean tasks"
+               if auto_factor else "")
         )
         print(f"## {TColors.OKBLUE}{TColors.BOLD}Results Path{TColors.ENDC}: {RESULTS_PATH}")
         print(_hr() + "\n")
@@ -3527,7 +3574,7 @@ def main(
         print(
             "##   clean prompts, no adversarial input — can the collapsed model still solve them?"
         )
-        capability = attack.capability_gate(selected, min_capability)
+        capability = attack.capability_gate(selected, min_usable_tasks)
 
     if worker:
         pass
@@ -3537,7 +3584,8 @@ def main(
         print(
             f"##   collapsed model capability: "
             f"{len(capability.collapsed_solved)}/{capability.n_probed} tasks "
-            f"({capability.capability:.0%}), required >= {min_capability:.0%}"
+            f"({capability.capability:.0%}); attackable: {len(capability.usable)}, "
+            f"required >= {min_usable_tasks}"
         )
         if capability.invalid_tasks:
             print("##   invalid tasks (bad references): " + ", ".join(capability.invalid_tasks))
@@ -3578,7 +3626,7 @@ def main(
             )
             print(
                 f"## {TColors.OKCYAN}Attack an earlier collapse generation (lower "
-                f"--collapsed_generation), lower --min_capability, or pass "
+                f"--collapsed_generation), lower --min_usable_tasks, or pass "
                 f"--skip_capability_check to override.{TColors.ENDC}\n"
             )
             proceed = False
@@ -4020,8 +4068,8 @@ def main(
                 "surrogate_factor_probe": factor_probe or None,
                 "surrogate_model": surrogate_description if transfer else None,
                 "first_collapsed_model": first_collapsed_dir or None,
-                # the anchor as a condition of the hit: its checkpoint, or null for the two-sided
-                # rule (--no_anchor, or a generation-0 attack)
+                # the anchor as a condition of the hit: its checkpoint under --hold_anchor, or
+                # null for the default two-sided rule (and for a generation-0 attack)
                 "anchor_model": anchor_dir or None,
                 "hold_anchor": anchor_held,
                 "entropy_match": entropy_match if transfer else None,
@@ -4156,13 +4204,20 @@ if __name__ == "__main__":
         "model_scaled_n<n>_* directory ('lora' method only)",
     )
     parser.add_argument(
-        "--no_anchor",
-        "-na",
-        dest="hold_anchor",
-        action="store_false",
-        help="drop the generation-0 anchor from the hit rule, i.e. require only 'target wrong, "
-        "baseline correct' as before. By default the anchor is loaded as a real model, gated, "
-        "held in the objective and decoded in every check, and the result file is tagged _anchor",
+        "--hold_anchor",
+        "-ha",
+        action="store_true",
+        help="also require the generation-0 model to keep writing the correct code, i.e. the "
+        "three-sided rule 'target wrong, baseline correct, generation 0 correct'. Off by "
+        "default, because that model is the attacker's own fine-tune and the instrument the "
+        "surrogate is built from rather than a deployment the suffix has to spare; holding it is "
+        "the stricter claim that the suffix is specific to *later* collapse. With it the anchor "
+        "is loaded as a real model, gated, held in the objective and decoded in every check, and "
+        "the result file is tagged _anchor",
+    )
+    parser.add_argument(
+        # the default now; accepted so a stored command line keeps running
+        "--no_anchor", "-na", dest="_no_anchor", action="store_true", help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--entropy_match",
@@ -4257,9 +4312,15 @@ if __name__ == "__main__":
         type=float,
         default=0.0,
         help="the --real_data_fraction run_baseline.py was given. A mixed run names its "
-        "checkpoints model_{gen}_bs{bs}_{name}_rdf{value}[_fp16] from generation 1 onward, so the "
-        "same value is needed here to find them. Nothing about the attack itself changes; the "
-        "generation-0 surrogate anchor is shared across mixtures and needs no value (default: 0.0)",
+        "checkpoints model_{gen}_bs{bs}_{name}_rdf{value}[_fp16], generation 0 included, so the "
+        "same value is needed here to find them — the surrogate anchor is this mixture's own "
+        "generation 0. Nothing about the attack itself changes (default: 0.0)",
+    )
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone",
     )
     parser.add_argument(
         "--path",
@@ -4533,9 +4594,20 @@ if __name__ == "__main__":
         "-mcap",
         type=float,
         default=0.2,
-        help="fraction of clean (suffix-free) tasks the collapsed model must still solve before "
-        "the attack starts; below this the model is considered incapable of generating code "
-        "and the run is stopped (default: 0.2)",
+        help="fraction of clean (suffix-free) tasks a surrogate rung must solve for "
+        "--surrogate_factor auto to accept it. It no longer gates the run itself; see "
+        "--min_usable_tasks (default: 0.2)",
+    )
+    parser.add_argument(
+        "--min_usable_tasks",
+        "-mut",
+        type=int,
+        default=1,
+        help="how many attackable tasks the capability gate needs before the attack starts, "
+        "whatever the size of the suite. A task is attackable when the collapsed model and the "
+        "baseline both solve its clean prompt. Below this the run is stopped, because a hit "
+        "against a model that already fails everything measures collapse rather than the attack "
+        "(default: 1, i.e. at least one)",
     )
     parser.add_argument(
         "--skip_capability_check",
@@ -4578,4 +4650,8 @@ if __name__ == "__main__":
         settings.update({key: getattr(args, key) for key in forwarded})
         main(**settings)
     else:
-        main(**vars(args))
+        parsed = vars(args)
+        # --no_anchor is the default now and is parsed only so an old command line still runs;
+        # main() has no parameter for it
+        parsed.pop("_no_anchor", None)
+        main(**parsed)

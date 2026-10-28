@@ -25,13 +25,17 @@ Conventions used throughout:
 - Result-file names are the only interface between stages. The verification decoding and the hit
   rule are part of them: a greedy attack run writes `attack_gen{g}_{model}{_rdfX}_vuln[...].json`,
   a sampled one inserts `_T0.7p0.8k20x5` after `_vuln` (`utils.naming.verification_tag`), and a
-  run that holds the generation-0 anchor appends `_anchor` (`utils.naming.anchor_tag`; never on a
-  generation-0 file, where the anchor is the target). The defaults give
-  `..._vuln_T0.7p0.8k20x5_anchor[...].json`. Figures pick one combination with `-vf`.
+  run that *also* holds the generation-0 anchor (`-ha`) appends `_anchor`
+  (`utils.naming.anchor_tag`; never on a generation-0 file, where the anchor is the target). The
+  defaults give `..._vuln_T0.7p0.8k20x5[...].json`. Figures pick one combination with `-vf`, and
+  results from 2026-10-02 to 2026-10-19 carry `_anchor` because the anchor was the default then.
 - The hit rule is three-sided by default: the target emits the insecure code, and both the
-  pristine baseline *and* the generation-0 anchor keep emitting the secure one. A suffix that also
+  pristine baseline keeps emitting the secure one. Under `-ha` the generation-0 anchor must keep
+  emitting it too. A suffix that also
   breaks generation 0 says the first fine-tune was fragile, not that collapse progressed into
-  something exploitable. `-na` / `--no_anchor` after the `--` restores the two-sided rule, which is
+  something exploitable. `-ha` / `--hold_anchor` after the `--` adds the third condition; the two-sided rule is the default
+and is the one that follows from the threat model, since the generation-0 model is the attacker's
+own instrument. The old `-na` is accepted as a no-op, and the two-sided rule is
   what every result from before 2026-10-02 used.
 
 ```bash
@@ -87,8 +91,8 @@ model was not going to write, and the sequence margin is the number to read for 
 The same search, verified two ways. Greedy verification (`-vt 0`) is the argmax-flip claim and
 the realistic one for temperature-0 code deployments. The default sampled verification is a
 majority over five completions at Qwen's shipped decoding, the deployment-realistic claim for
-everyone else. They write different files and are swept separately. Both hold the anchor unless
-`-na` is passed, and the anchor is loaded as a real model (shared with the logit surrogate's own
+everyone else. They write different files and are swept separately. Neither holds the anchor
+unless `-ha` is passed; with it the anchor is loaded as a real model (shared with the logit surrogate's own
 copy of generation 0 in transfer mode, one extra checkpoint in direct mode), gated on the clean
 prompt, held in the objective with the baseline's hinge and anchor terms, and decoded in every
 check.
@@ -225,7 +229,7 @@ section 2 is already one point of this curve.
 statistics are degenerate: a hit requires the anchor to stay correct, which is the surrogate
 staying correct, so `n_predicted`, `precision` and `recall` are 0 by construction (verified on a
 scratch run). Report the hit rate from that rung, not its surrogate quality, and run the last
-command above as its twin: with `--no_anchor` the `n = 1` rung measures plain forward transfer from
+command above as its twin: without `--hold_anchor` the `n = 1` rung measures plain forward transfer from
 generation 0, which is the baseline the extrapolation has to beat.
 
 ## 3c. Making the three-sided attack land more often
@@ -324,16 +328,19 @@ setting. Every cell of mixture x extrapolation x optimization x verdict files un
 
 | cell | file |
 |---|---|
-| direct, sampled | `attack_gen{g}_{model}{_rdf}[_vuln]_T0.7p0.8k20x5_anchor.json` |
-| direct, greedy | `..._anchor.json` |
-| logit plain | `..._anchor[_sinkobj]_logit_surrogate.json` |
-| logit opt | `..._anchor[_sinkobj][_nsink]_em_logit_surrogate.json` |
+| direct, sampled | `attack_gen{g}_{model}{_rdf}[_vuln]_T0.7p0.8k20x5.json` |
+| direct, greedy | `attack_gen{g}_{model}{_rdf}[_vuln].json` |
+| logit plain | `...[_sinkobj]_logit_surrogate.json` |
+| logit opt | `...[_sinkobj][_nsink]_em_logit_surrogate.json` |
+
+`HOLD_ANCHOR=1` adds `-ha` to every sweep and `_anchor` to every one of those names.
 
 `VARIANTS=plain` or `VARIANTS=opt` runs one of the two; `OPT_ENTROPY_MATCH`, `OPT_SINK_FACTOR`,
 `OPT_SINK_CAP`, `OPT_SINK_OBJECTIVE` and `OPT_SINK_MARGIN` define what `opt` means.
 
 Measured on the 0.5b rdf0.5 lineage, 2 restarts x 100 steps (a fifth of the paper budget), `-sf
-sink --sink_cap 3 -so -em`, sampled majority verdict with the anchor held:
+sink --sink_cap 3 -so -em`, sampled majority verdict with the anchor held (the default at the
+time; the anchor is opt-in since 2026-10-19):
 
 | generation | usable targets | hits | targets hit |
 |---|---|---|---|

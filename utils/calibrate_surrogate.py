@@ -38,6 +38,7 @@ from transformers import AutoConfig
 
 from utils.colors import TColors
 from utils.extrapolation import calibration_file
+from utils.naming import mixture_suffix
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.utils import clear_inherited_max_length
 from utils.perplexity import sample_perplexities
@@ -218,6 +219,8 @@ def main(
     block_size: int = 512,
     model_specifier: str = "",
     model_size: str = "",
+    real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     num_samples: int = 128,
     dataset_size: int = 0,
     generation_batch_size: int = 32,
@@ -248,6 +251,10 @@ def main(
             the fitted p_1 is only meaningful against the statistic the histograms are plotted
             with
         path (str): root directory of generated_datasets/ and model_outputs/
+        real_data_fraction (float): the mixture the collapse run used; it names generation 0,
+            the reference this fits against
+        human_generation_zero (bool): the run's ablation flag, under which generation 0 is
+            shared across mixtures and carries no suffix
 
     Returns:
         None
@@ -310,7 +317,10 @@ def main(
         tokenizer.pad_token = tokenizer.eos_token
 
     # ── the target: real generation 1, produced by the real collapsed model ──
-    collapsed_path = f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}"
+    collapsed_path = (
+        f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}"
+        f"{mixture_suffix(real_data_fraction, 0, human_generation_zero)}"
+    )
     if not os.path.isdir(collapsed_path):
         raise FileNotFoundError(
             f"{collapsed_path} does not exist. run_baseline.py has to be run first with the "
@@ -514,6 +524,20 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="root directory of generated_datasets/ and model_outputs/",
+    )
+    parser.add_argument(
+        "--real_data_fraction",
+        "-rdf",
+        type=float,
+        default=0.0,
+        help="the mixture the collapse run used. It names the model_0 this calibrates against, "
+        "since generation 0 trains on the mixture like every later generation (default: 0.0)",
+    )
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone",
     )
     args = parser.parse_args()
     main(**vars(args))

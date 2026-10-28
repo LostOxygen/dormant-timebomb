@@ -116,9 +116,10 @@ untagged names every result from before sampled verification has:
   ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln -- -vt 0   # attack_gen{N}_{model}_vuln_logit_surrogate.json
   ./run_attack_sweep.sh -n 9 -p ./runs/x --vuln -- -vt 1 -vs 9   # ..._vuln_T1p0.8k20x9_anchor_logit_surrogate.json
 
-And for the hit rule: by default the generation-0 anchor is held correct next to the baseline and
-the files carry _anchor (generation 0 excepted, it is the target there); -- -na / --no_anchor is the
-old two-sided rule and the untagged name.
+And for the hit rule: by default only the pristine baseline is held correct, which is the threat
+model's rule (the generation-0 model is the attacker's own fine-tune, the instrument the surrogate
+is built from). -- -ha / --hold_anchor adds it to the hold set as the stricter claim and tags the
+files _anchor; -na is the default and is accepted as a no-op.
 EOF
 }
 
@@ -334,9 +335,9 @@ if [[ -n "$ENTROPY_TAG" ]]; then
     echo "##   surrogate    : rescaled to the generation-0 anchor's entropy (files tagged $ENTROPY_TAG)"
 fi
 if [[ -n "$ANCHOR_TAG" ]]; then
-    echo "##   hit rule     : target wrong, baseline and generation-0 anchor correct (files tagged $ANCHOR_TAG)"
+    echo "##   hit rule     : target wrong, baseline and generation-0 anchor correct (--hold_anchor, files tagged $ANCHOR_TAG)"
 else
-    echo "##   hit rule     : target wrong, baseline correct (--no_anchor)"
+    echo "##   hit rule     : target wrong, baseline correct"
 fi
 echo "##   path         : $PATH_ROOT"
 echo "##   logs         : $LOG_DIR"

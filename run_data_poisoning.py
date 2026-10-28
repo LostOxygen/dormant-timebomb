@@ -82,7 +82,7 @@ from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.extrapolation import build_scaled_adapter
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix, poison_specifier_name
+from utils.naming import generation_label, mixture_suffix, poison_specifier_name
 from utils.poison import (
     DEFAULT_PAYLOAD,
     DEFAULT_TRIGGER,
@@ -194,7 +194,9 @@ def build_poisoned_corpus(
         seed (int): RNG seed for the poison set
 
     Returns:
-        tuple: (poisoned_corpus, records) where records is the raw poison list with kind tags
+        tuple: (poisoned_corpus, records, poison_rows) where records is the raw poison list
+            with kind tags and poison_rows the formatted poison rows alone, for a caller that
+            joins them to a corpus other than the human one
     """
     # records built here unless the caller supplies a pre-built set (e.g. the gradient-matching
     # optimiser run_poison_gradmatch.py, whose poison content is optimised rather than templated)
@@ -225,7 +227,7 @@ def build_poisoned_corpus(
     # align the column order to the human corpus so the arrow schemas match for concatenation
     poison_ds = poison_ds.select_columns(human_corpus.column_names)
     poisoned = concatenate_datasets([human_corpus, poison_ds]).shuffle(seed=seed)
-    return poisoned, records
+    return poisoned, records, poison_ds
 
 
 def run_evaluation(
@@ -399,6 +401,7 @@ def main(
     gradient_checkpointing: bool = False,
     recursive_init: bool = False,
     fresh_init: bool = False,
+    human_generation_zero: bool = False,
     training_gpus: int = 0,
     master_port: int = 29500,
     path: str = "",
@@ -407,7 +410,9 @@ def main(
 ) -> None:
     """Runs the dormant data-poisoning attack: collapse a poisoned run and chart when it activates.
 
-    Args mirror run_baseline.py where they overlap (see its docstring); the poison-specific ones:
+    Args mirror run_baseline.py where they overlap (see its docstring), --human_generation_zero
+    included: by default generation 0 trains on the mixture of the base model's own samples and
+    the human corpus, plus the poison; the poison-specific ones:
         trigger (str): the word whose presence in a prompt should trigger the payload
         payload (str): the string the backdoor makes the model emit
         tag (str): artifact-namespace tag appended to the model short name, isolating this run
@@ -514,7 +519,7 @@ def main(
               f"from {poison_records_file}{TColors.ENDC}")
 
     # write the poison set to disk for inspection/reproducibility regardless of what runs next
-    poisoned_corpus, poison_records = build_poisoned_corpus(
+    poisoned_corpus, poison_records, poison_rows = build_poisoned_corpus(
         human_corpus, tokenizer, trigger, payload, num_direct, num_priming, seed,
         condition_on_trigger=condition_on_trigger,
         records=external_records,
@@ -587,20 +592,95 @@ def main(
                 DATASET_PATH + f"base_subdataset_bs{block_size}_{poison_name}_shard{shard_id}"
             )
 
+        def generate_corpus(gen_id: int, gen_suffix: str) -> Dataset:
+            """Samples one response per instruction from model_{gen_id}, merges and returns it.
+
+            ``gen_id`` -1 samples the pristine base model and files the corpus as
+            ``generated_dataset_base``: what generation 0 trains on by default, before the poison.
+            """
+            label = generation_label(gen_id)
+            process_list = []
+            for shard_id, d_id in enumerate(devices):
+                process_list.append(
+                    subprocess.Popen(
+                        [
+                            "env",
+                            f"CUDA_VISIBLE_DEVICES={d_id}",
+                            sys.executable,
+                            "-m", "utils.generate_dataset",
+                            "--block_size", str(block_size),
+                            "--specifier_name", poison_name,
+                            "--model_specifier", model_specifier,
+                            "--dataset_batch_size", str(dataset_batch_size),
+                            "--generation", str(gen_id),
+                            "--shard_id", str(shard_id),
+                            "--engine", engine,
+                            "--gpu_memory_utilization", str(gpu_memory_utilization),
+                            "--temperature", str(temperature),
+                            "--top_p", str(top_p),
+                            "--top_k", str(top_k),
+                            "--path", str(path),
+                            "--seed", str(seed),
+                            "--real_data_fraction", str(real_data_fraction),
+                        ]
+                        + (["--human_generation_zero"] if human_generation_zero else [])
+                    )
+                )
+            for process in process_list:
+                process.wait()
+            failed_shards = [
+                shard for shard, process in enumerate(process_list) if process.returncode != 0
+            ]
+            if failed_shards:
+                raise RuntimeError(
+                    f"dataset generation failed for shard(s) {failed_shards} of generation "
+                    f"{label}; see the subprocess output above"
+                )
+            merged = concatenate_datasets(
+                [
+                    Dataset.load_from_disk(
+                        DATASET_PATH
+                        + f"subdataset_{label}_bs{block_size}_{poison_name}{gen_suffix}"
+                        + f"_shard{shard_id}"
+                    )
+                    for shard_id in range(len(devices))
+                ]
+            )
+            merged.save_to_disk(
+                DATASET_PATH
+                + f"generated_dataset_{label}_bs{block_size}_{poison_name}{gen_suffix}"
+            )
+            return merged
+
+        # the base model's own corpus, what generation 0 trains on by default (run_baseline.py
+        # has the reasoning); the ablation trains generation 0 on human + poison alone
+        human_only_gen0 = human_generation_zero
+        base_corpus = (
+            DATASET_PATH + f"generated_dataset_{generation_label(-1)}_bs{block_size}_{poison_name}"
+        )
+        if not human_only_gen0 and continue_from_generation == 0 and not os.path.isdir(base_corpus):
+            print(f"## {TColors.OKBLUE}{TColors.BOLD}Base corpus{TColors.ENDC}: sampling the "
+                  f"pristine base model once for generation 0's training corpus")
+            generate_corpus(-1, "")
+
         for gen_id in range(num_generations):
             if gen_id < continue_from_generation:
                 continue
 
-            gen_suffix = mixture_suffix(real_data_fraction, gen_id)
-            prev_suffix = mixture_suffix(real_data_fraction, gen_id - 1)
+            gen_suffix = mixture_suffix(real_data_fraction, gen_id, human_generation_zero)
+            prev_suffix = mixture_suffix(real_data_fraction, gen_id - 1, human_generation_zero)
 
-            if gen_id == 0:
-                # the one change from a clean run: generation 0 trains on human + poison
+            if gen_id == 0 and human_only_gen0:
+                # the ablation: generation 0 trains on human + poison
                 dataset = poisoned_corpus
             else:
+                # the previous generation's corpus — the base model's own at generation 0 —
+                # with --real_data_fraction of it swapped back for human rows, exactly as
+                # run_baseline.py does; at generation 0 the poison rides on top of that mixture
                 dataset = Dataset.load_from_disk(
                     DATASET_PATH
-                    + f"generated_dataset_{gen_id - 1}_bs{block_size}_{poison_name}{prev_suffix}"
+                    + f"generated_dataset_{generation_label(gen_id - 1)}_bs{block_size}"
+                    + f"_{poison_name}{prev_suffix}"
                 )
                 dataset = dataset.map(
                     lambda batch: format_prompt(batch, tokenizer), batched=True
@@ -608,6 +688,10 @@ def main(
                 dataset = mix_real_data(
                     dataset, human_corpus, real_data_fraction, seed, gen_id
                 )
+                if gen_id == 0:
+                    dataset = concatenate_datasets(
+                        [dataset, poison_rows.select_columns(dataset.column_names)]
+                    ).shuffle(seed=seed)
 
             dataset_train, dataset_val = make_splits(dataset)
             dataset_train.save_to_disk(
@@ -648,6 +732,8 @@ def main(
                 train_command.append("--gradient_checkpointing")
             if recursive_init:
                 train_command.append("--recursive_init")
+            if human_generation_zero:
+                train_command.append("--human_generation_zero")
 
             training = subprocess.run(train_command, check=False)
             if training.returncode != 0:
@@ -657,56 +743,7 @@ def main(
                 )
 
             # ───────────────── generate this generation's corpus (one worker per GPU) ────────────
-            process_list = []
-            for shard_id, d_id in enumerate(devices):
-                process_list.append(
-                    subprocess.Popen(
-                        [
-                            "env",
-                            f"CUDA_VISIBLE_DEVICES={d_id}",
-                            sys.executable,
-                            "-m", "utils.generate_dataset",
-                            "--block_size", str(block_size),
-                            "--specifier_name", poison_name,
-                            "--dataset_batch_size", str(dataset_batch_size),
-                            "--generation", str(gen_id),
-                            "--shard_id", str(shard_id),
-                            "--engine", engine,
-                            "--gpu_memory_utilization", str(gpu_memory_utilization),
-                            "--temperature", str(temperature),
-                            "--top_p", str(top_p),
-                            "--top_k", str(top_k),
-                            "--path", str(path),
-                            "--seed", str(seed),
-                            "--real_data_fraction", str(real_data_fraction),
-                        ]
-                    )
-                )
-            for process in process_list:
-                process.wait()
-            failed_shards = [
-                shard for shard, process in enumerate(process_list) if process.returncode != 0
-            ]
-            if failed_shards:
-                raise RuntimeError(
-                    f"dataset generation failed for shard(s) {failed_shards} of generation "
-                    f"{gen_id}; see the subprocess output above"
-                )
-
-            merged = concatenate_datasets(
-                [
-                    Dataset.load_from_disk(
-                        DATASET_PATH
-                        + f"subdataset_{gen_id}_bs{block_size}_{poison_name}{gen_suffix}"
-                        + f"_shard{shard_id}"
-                    )
-                    for shard_id in range(len(devices))
-                ]
-            )
-            merged.save_to_disk(
-                DATASET_PATH
-                + f"generated_dataset_{gen_id}_bs{block_size}_{poison_name}{gen_suffix}"
-            )
+            merged = generate_corpus(gen_id, gen_suffix)
             # measure how much of the payload the model just put back into the corpus the next
             # generation will train on — the amplification channel, made observable
             _scan_corpus(gen_id, gen_suffix, merged)
@@ -758,7 +795,7 @@ def main(
     if not predict_only:
         print(f"## {TColors.BOLD}{TColors.HEADER}Scoring real checkpoints{TColors.ENDC}")
         for gen_id in range(num_generations):
-            gen_suffix = mixture_suffix(real_data_fraction, gen_id)
+            gen_suffix = mixture_suffix(real_data_fraction, gen_id, human_generation_zero)
             checkpoint = os.path.join(
                 MODEL_PATH, f"model_{gen_id}_bs{block_size}_{poison_name}{gen_suffix}_fp16"
             )
@@ -779,7 +816,7 @@ def main(
     for gen_id in range(num_generations):
         if gen_id in corpus_payload_rates:
             continue
-        gen_suffix = mixture_suffix(real_data_fraction, gen_id)
+        gen_suffix = mixture_suffix(real_data_fraction, gen_id, human_generation_zero)
         corpus_dir = (
             DATASET_PATH + f"generated_dataset_{gen_id}_bs{block_size}_{poison_name}{gen_suffix}"
         )
@@ -978,6 +1015,9 @@ if __name__ == "__main__":
                         help="ablation: continue the previous generation's adapter instead of "
                         "re-initialising from the base model each generation")
     parser.add_argument("--fresh_init", "-fi", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--human_generation_zero", "-hg0", action="store_true",
+                        help="ablation: train generation 0 on the human corpus (+ poison) alone "
+                        "instead of on the mixture with the base model's own samples")
     parser.add_argument("--training_gpus", "-tg", type=int, default=0)
     parser.add_argument("--master_port", "-mp", type=int, default=29500)
     parser.add_argument("--path", "-p", type=str, default="")

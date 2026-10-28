@@ -463,7 +463,7 @@ def score_tilted(
 
 def measure_baseline(
     generations: range, block_size: int, name: str, real_data_fraction: float,
-    prompts_for, batch_size: int, load_in_4bit: bool,
+    prompts_for, batch_size: int, load_in_4bit: bool, human_generation_zero: bool = False,
 ) -> dict:
     """Scores every real checkpoint the collapse run produced, on every slice.
 
@@ -482,7 +482,7 @@ def measure_baseline(
     """
     results = {split: [] for split in SPLITS}
     for generation in generations:
-        mixture = mixture_suffix(real_data_fraction, generation)
+        mixture = mixture_suffix(real_data_fraction, generation, human_generation_zero)
         path = resolve_checkpoint(generation, block_size, name, mixture)
         if not path:
             print(f"##   {TColors.WARNING}generation {generation}: no checkpoint{TColors.ENDC}")
@@ -508,6 +508,7 @@ def measure_baseline(
 def measure_surrogates(
     generations: range, block_size: int, name: str, method: str, model_specifier: str,
     prompts_for, batch_size: int, load_in_4bit: bool, token_budget: int,
+    anchor_suffix: str = "",
 ) -> dict:
     """Scores stage 2's surrogate for every generation, on every slice.
 
@@ -530,13 +531,16 @@ def measure_surrogates(
         batch_size (int): scoring batch size
         load_in_4bit (bool): quantize the scored models
         token_budget (int): padded tokens per forward pass for the tilt
+        anchor_suffix (str): the mixture suffix of generation 0 — this mixture's own anchor,
+            or "" for the shared one of a --human_generation_zero root
 
     Returns:
         dict: split -> one Measurement per generation whose surrogate could be built
     """
     results = {split: [] for split in SPLITS}
-    # neither anchor carries a mixture tag: generation 0 is shared by every mixture
-    anchor = os.path.join(MODEL_PATH, f"model_0_bs{block_size}_{name}")
+    # the anchor is this mixture's own generation 0 (shared, and untagged, only under
+    # --human_generation_zero); the scaled adapter is a pure function of it and keeps its name
+    anchor = os.path.join(MODEL_PATH, f"model_0_bs{block_size}_{name}{anchor_suffix}")
 
     if method == "logit":
         base_model, tokenizer = load_scoring_model(model_specifier, block_size, load_in_4bit)
@@ -699,7 +703,7 @@ def fit_scale(factors: dict) -> tuple[float, float]:
 def calibrate_factors(
     baseline: list, block_size: int, name: str, model_specifier: str, prompts_for,
     batch_size: int, load_in_4bit: bool, token_budget: int, calibration_rows: int,
-    steps: int, num_generations: int,
+    steps: int, num_generations: int, anchor_suffix: str = "",
 ) -> dict:
     """Fits one factor per generation against the measured checkpoints, plus the scaling law.
 
@@ -725,7 +729,7 @@ def calibrate_factors(
         dict: the calibration, with the fitted factor per generation, the fitted scale, and what
             the default n = g + 1 would have produced instead
     """
-    anchor = os.path.join(MODEL_PATH, f"model_0_bs{block_size}_{name}")
+    anchor = os.path.join(MODEL_PATH, f"model_0_bs{block_size}_{name}{anchor_suffix}")
     base_model, tokenizer = load_scoring_model(model_specifier, block_size, load_in_4bit)
     first_model, _ = load_scoring_model(
         f"{anchor}_fp16" if os.path.isdir(f"{anchor}_fp16") else anchor, block_size, load_in_4bit
@@ -1027,7 +1031,8 @@ def calibration_figure(payload: dict, plot_stem: str, usetex: bool) -> None:
     save_figure(figure, plot_stem)
 
 
-def draw_figures(payload: dict, block_size: int, name: str, tag: str, usetex: bool) -> list:
+def draw_figures(payload: dict, block_size: int, name: str, tag: str, usetex: bool,
+                 plots_path: str = "plots") -> list:
     """Every figure this script produces, out of the cache payload alone.
 
     Shared by the measuring path and by --plot_only, which is what keeps a replot identical to the
@@ -1039,6 +1044,7 @@ def draw_figures(payload: dict, block_size: int, name: str, tag: str, usetex: bo
         name (str): the model short name
         tag (str): the mixture tag
         usetex (bool): render text with LaTeX
+        plots_path (str): directory the figures are written to
 
     Returns:
         list: the stems written, for the caller to report
@@ -1061,7 +1067,7 @@ def draw_figures(payload: dict, block_size: int, name: str, tag: str, usetex: bo
             f"\n## {TColors.OKBLUE}{TColors.BOLD}Plotting the {SPLIT_LABELS[split]} figure"
             f"{TColors.ENDC}"
         )
-        stem = f"plots/{split}_perplexity_bs{block_size}_{name}{tag}"
+        stem = os.path.join(plots_path, f"{split}_perplexity_bs{block_size}_{name}{tag}")
         if split_figure(payload, split, stem, usetex):
             written.append(stem)
 
@@ -1069,7 +1075,7 @@ def draw_figures(payload: dict, block_size: int, name: str, tag: str, usetex: bo
         print(
             f"\n## {TColors.OKBLUE}{TColors.BOLD}Plotting the calibration figure{TColors.ENDC}"
         )
-        stem = f"plots/surrogate_fit_bs{block_size}_{name}{tag}"
+        stem = os.path.join(plots_path, f"surrogate_fit_bs{block_size}_{name}{tag}")
         calibration_figure(payload, stem, usetex)
         written.append(stem)
 
@@ -1089,11 +1095,13 @@ def main(
     calibration_rows: int = 128,
     calibration_steps: int = 6,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     model_size: str = "",
     model_specifier: str = "",
     load_in_4bit: bool = False,
     plot_only: bool = False,
     no_usetex: bool = False,
+    plots_path: str = "plots",
     path: str = "",
 ) -> None:
     """Measures both lineages on both slices of the human data and plots each slice.
@@ -1116,6 +1124,8 @@ def main(
             bisection step costs a fraction of a full pass
         calibration_steps (int): bisection steps per generation
         real_data_fraction (float): the mixture the run used, part of the checkpoint names
+        human_generation_zero (bool): the run's ablation flag, under which generation 0 is
+            shared across mixtures and carries no suffix
         model_size (str): parameter count off the Qwen2.5-Coder ladder
         model_specifier (str): the base model the run collapsed
         load_in_4bit (bool): quantize the scored models
@@ -1162,7 +1172,8 @@ def main(
             )
         with open(cache_file(block_size, name, tag), encoding="utf-8") as handle:
             payload = json.load(handle)
-        written = draw_figures(payload, block_size, name, tag, usetex=not no_usetex)
+        written = draw_figures(payload, block_size, name, tag, usetex=not no_usetex,
+                               plots_path=plots_path)
         for stem in written:
             print(f"##   replotted -> {TColors.HEADER}{stem}.<png,pdf>{TColors.ENDC}")
         print()
@@ -1206,13 +1217,15 @@ def main(
     print(f"\n## {TColors.OKBLUE}{TColors.BOLD}Baseline (real collapse){TColors.ENDC}")
     baseline = measure_baseline(
         generations, block_size, name, real_data_fraction,
-        prompts_for, perplexity_batch_size, load_in_4bit,
+        prompts_for, perplexity_batch_size, load_in_4bit, human_generation_zero,
     )
+    anchor_suffix = mixture_suffix(real_data_fraction, 0, human_generation_zero)
 
     print(f"\n## {TColors.OKBLUE}{TColors.BOLD}Extrapolation ({method} surrogate){TColors.ENDC}")
     surrogates = measure_surrogates(
         generations, block_size, name, method, specifier,
         prompts_for, perplexity_batch_size, load_in_4bit, surrogate_tokens_per_forward,
+        anchor_suffix,
     )
 
     calibration = {}
@@ -1224,7 +1237,7 @@ def main(
         calibration = calibrate_factors(
             baseline["test"], block_size, name, specifier, prompts_for, perplexity_batch_size,
             load_in_4bit, surrogate_tokens_per_forward, calibration_rows, calibration_steps,
-            num_generations,
+            num_generations, anchor_suffix,
         )
         calibration.update(
             {
@@ -1295,7 +1308,8 @@ def main(
                 f"collapse run started from"
             )
 
-    written = draw_figures(payload, block_size, name, tag, usetex=not no_usetex)
+    written = draw_figures(payload, block_size, name, tag, usetex=not no_usetex,
+                           plots_path=plots_path)
     print(
         f"\n## {TColors.OKBLUE}{TColors.BOLD}Saved the figures under:{TColors.ENDC}"
     )
@@ -1349,8 +1363,10 @@ if __name__ == "__main__":
     parser.add_argument("--calibration_steps", "-cs", type=int, default=6,
                         help="bisection steps per generation (default: 6)")
     parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0,
-                        help="the mixture the collapse run used; part of the checkpoint names "
-                        "from generation 1 on (default: 0.0)")
+                        help="the mixture the collapse run used; part of the checkpoint names, "
+                        "generation 0 included (default: 0.0)")
+    parser.add_argument("--human_generation_zero", "-hg0", action="store_true",
+                        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone")
     parser.add_argument("--load_in_4bit", "-q4", action="store_true",
                         help="quantize the scored models. Off by default: a quantized model puts "
                         "quantization noise into the measured perplexity")
@@ -1358,6 +1374,10 @@ if __name__ == "__main__":
                         help="replot from the cached measurements without loading a model")
     parser.add_argument("--no_usetex", action="store_true",
                         help="render without LaTeX, for a machine with no TeX install")
+    parser.add_argument("--plots_path", "-pp", type=str, default="plots",
+                        help="directory the figures are written to (default: plots/ beside the "
+                        "repo, where every figure of this pipeline has always gone; a "
+                        "self-contained run root wants its own)")
     parser.add_argument("--path", "-p", type=str, default="",
                         help="root holding generated_datasets/ and model_outputs/ "
                         "(default: current directory)")

@@ -131,6 +131,13 @@ parser.add_argument(
     "(default: 0.0)",
 )
 parser.add_argument(
+    "--human_generation_zero",
+    "-hg0",
+    action="store_true",
+    help="the run's --human_generation_zero: generation 0's corpus is then shared across mixtures "
+    "and carries no mixture suffix",
+)
+parser.add_argument(
     "--load_in_4bit",
     "-q4",
     action="store_true",
@@ -159,6 +166,7 @@ num_shards = args.num_shards
 dataset_suffix = args.dataset_suffix
 factor_tag = args.factor_tag
 real_data_fraction = args.real_data_fraction
+human_generation_zero = args.human_generation_zero
 load_in_4bit = args.load_in_4bit
 path = args.path
 
@@ -229,12 +237,13 @@ for i in range(num_generations):
         )
     else:
         # the corpus generation i scores was produced by model_{i - 1}, so it is that generation's
-        # suffix that names it — empty at i - 1 == 0, whose model every mixture shares
+        # suffix that names it — empty at i - 1 == 0 only under --human_generation_zero, whose
+        # model every mixture shares
         ppl_dataset = Dataset.load_from_disk(
             DATASET_PATH
             + f"/generated_dataset_{i - 1}_bs{block_size}_{specifier_name}{dataset_suffix}"
             + factor_tag
-            + mixture_suffix(real_data_fraction, i - 1)
+            + mixture_suffix(real_data_fraction, i - 1, human_generation_zero)
         )
 
     # only process this process' share of the dataset. Contiguous shards are used so that

@@ -2,11 +2,19 @@
 #
 # run_paper.sh — the paper's grid, in dependency order, resumable.
 #
-#   1. collapse   three lineages: Qwen2.5-Coder 0.5B at --real_data_fraction 0.0,
-#                 0.5 and 0.8. Fresh initialisation every generation (run_baseline.py's default:
+#   1. collapse   four lineages: Qwen2.5-Coder 0.5B at --real_data_fraction 0.0, 0.5, 0.8
+#                 and 1.0. The last is the NON-COLLAPSING CONTROL: every generation trains on
+#                 human data alone, with the generation count, seed, corpus size and optimizer
+#                 steps of a collapse run, so an attack that works there as well is a property of
+#                 iterated fine-tuning rather than of collapse — the comparison the collapsed
+#                 lineages' hit rates are read against. Fresh initialisation every generation (run_baseline.py's default:
 #                 only the data recurs), Qwen2.5's own decoding (T 0.7, top-p 0.8, top-k 20),
-#                 seed 1337. One root holds all six, since the size and the mixture are in
-#                 every artifact name and generation 0 is shared per size.
+#                 seed 1337. Generation 0 trains on the mixture like every later generation,
+#                 with the base model's own samples standing in for the previous generation's
+#                 corpus (the attacker's one fine-tune is one step of the map the lineage
+#                 iterates; the control's generation 0 is human only, since its mixture takes no
+#                 synthetic rows). One root holds every lineage, since the size and the mixture
+#                 are in every artifact name; only the base corpus is shared per size.
 #   2. utility    every resulting model scored on held-out human code (perplexity, with the
 #                 surrogate calibration the attack's -sf calibrated rung reads) and on HumanEval
 #                 (executed correctness). Both scripts draw their figure; the collapse phase
@@ -14,7 +22,8 @@
 #   3. attack     every model attacked, correctness targets first and then the vulnerability
 #                 targets (--vuln): direct against the real checkpoint and through the logit
 #                 surrogate, under the sampled-majority verdict and the greedy one. The
-#                 generation-0 anchor is held throughout (the sweeps' default).
+#                 hit rule is the threat model's: target wrong, pristine baseline correct.
+#                 HOLD_ANCHOR=1 adds the generation-0 model to the hold set as a stricter claim.
 #   4. plots      the attack figures, per size and hit rule, from the result files only.
 #
 # The commands are the ones documented in docs/sampling_experiments.md; this file adds the
@@ -54,7 +63,7 @@ BLOCK_SIZE="${BLOCK_SIZE:-512}"
 
 # The grid. Space separated; every size is run at every mixture.
 SIZES="${SIZES:-0.5b}"   # the 3B half is off by default; SIZES="0.5b 3b" turns it on
-MIXTURES="${MIXTURES:-0.0 0.5 0.8}"
+MIXTURES="${MIXTURES:-0.0 0.5 0.8 1.0}"   # 1.0 is the non-collapsing control (tagged _rdf1)
 # The collapse decoding and seed, identical for every cell so that size and mixture are the only
 # differences between them.
 TEMPERATURE="${TEMPERATURE:-0.7}"
@@ -82,6 +91,19 @@ VERIFY_EVERY="${VERIFY_EVERY:-10}"
 # with a 5-sample majority, `greedy` the single argmax decode, -vt 0).
 METHODS="${METHODS:-none logit}"
 VERDICTS="${VERDICTS:-sampled greedy}"
+# The hit rule. 0 is the threat model's: the suffix must break the target while the pristine
+# baseline keeps writing the correct code. The generation-0 model is the attacker's own fine-tune,
+# the instrument the surrogate is built from, so it is not something the suffix has to spare.
+# 1 also holds it correct (-ha, files tagged _anchor) — the stricter claim that the suffix is
+# specific to *later* collapse rather than to any descendant of the base model.
+HOLD_ANCHOR="${HOLD_ANCHOR:-0}"
+
+# The generation-0 data rule. 0 is the default: generation 0 trains on the same mixture as every
+# later generation, the base model's own samples standing in for the previous generation's corpus.
+# 1 is the ablation (-hg0, run-level artifacts tagged _hg0): generation 0 trains on the human
+# corpus alone and is shared across mixtures, the rule every run before 2026-10-22 used. The
+# checkpoint names do not carry the rule, so an ablation grid needs its own root (-p).
+HUMAN_GEN0="${HUMAN_GEN0:-0}"
 
 # Surrogate variants. Every logit sweep runs twice, so that the extrapolation's recent
 # optimizations are an axis of the comparison rather than a setting:
@@ -124,7 +146,8 @@ ASSUME_YES=0
 # ─────────────────────────────────── arguments ────────────────────────────────────────────
 usage() {
     cat <<'EOF'
-Collapses three lineages (0.5b at rdf 0.0, 0.5, 0.8; SIZES="0.5b 3b" adds the 3b ones), evaluates and plots their utility and
+Collapses four lineages (0.5b at rdf 0.0, 0.5, 0.8 and the non-collapsing control 1.0;
+SIZES="0.5b 3b" adds the 3b ones), evaluates and plots their utility and
 perplexity, then attacks every model: correctness targets first, then the vulnerability targets.
 
 Options:
@@ -140,7 +163,7 @@ Options:
   -h, --help             this message
 
 Environment overrides: PYTHON SIZES MIXTURES GENERATIONS BLOCK_SIZE TRAIN_GPUS ATTACK_GPUS
-EVAL_GPU RESTARTS NUM_STEPS VERIFY_EVERY METHODS VERDICTS VARIANTS TRAIN_OPTS_05B
+EVAL_GPU RESTARTS NUM_STEPS VERIFY_EVERY METHODS VERDICTS VARIANTS HOLD_ANCHOR TRAIN_OPTS_05B
 TRAIN_OPTS_3B TARGET_MARGIN NU_TARGET SUFFIX_TOKENS OPT_ENTROPY_MATCH OPT_SINK_FACTOR
 OPT_SINK_CAP OPT_SINK_OBJECTIVE OPT_SINK_MARGIN NO_USETEX
 EOF
@@ -255,9 +278,13 @@ run_tag_for() {
     "$PYTHON" -c "
 from utils.naming import run_tag
 greedy = '$verdict' == 'greedy'
-print(run_tag(temperature=0.0 if greedy else 0.7, hold_anchor=True, generation=1,
+print(run_tag(temperature=0.0 if greedy else 0.7, hold_anchor=$HOLD_ANCHOR == 1, generation=1,
               sink_objective=$sink == 1))" 2>/dev/null
 }
+
+anchor_opts() { (( HOLD_ANCHOR )) && echo "-ha" || true; }
+# every script that resolves a checkpoint by generation needs the generation-0 rule
+gen0_opts() { (( HUMAN_GEN0 )) && echo "-hg0" || true; }
 
 # True when `dir` holds at least one vulnerability attack result under the hit rule `tag`. Asked
 # of the loader the figures use, rather than guessed from file names, so the two cannot disagree.
@@ -366,8 +393,9 @@ preflight() {
 # Each phase is a loop over the lineages. The underlying scripts own the "already done" checks,
 # so a phase is cheap to re-enter.
 
-# 1. The collapse lineages. Generation 0 is pure human data under every mixture, so the three
-#    mixtures of one size share it: the first run trains it, the next two find it and start at 1.
+# 1. The collapse lineages. Every mixture has its own generation 0 (trained on the mixture, with
+#    the base model's corpus as its input); the base corpus itself is sampled by the first run of a
+#    size and reused by the rest. The rdf 1.0 control needs none: its generation 0 is human only.
 phase_collapse() {
     for record in "${LINEAGES[@]}"; do
         IFS='|' read -r name size rdf <<< "$record"
@@ -376,7 +404,7 @@ phase_collapse() {
         run "collapse_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_baseline.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
             -tp "$TEMPERATURE" -tpp "$TOP_P" -tpk "$TOP_K" -sd "$SEED" -p "$ROOT" \
-            $(train_opts "$size")
+            $(gen0_opts) $(train_opts "$size")
     done
 }
 
@@ -390,10 +418,10 @@ phase_utility() {
         wants_lineage "$name" || continue
         run "perplexity_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_perplexity \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" -p "$ROOT" \
-            --calibrate $(usetex_flag_py)
+            -pp "$PLOTS_DIR" --calibrate $(gen0_opts) $(usetex_flag_py)
         run "correctness_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_correctness \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" -p "$ROOT" \
-            $(usetex_flag_py)
+            -pp "$PLOTS_DIR" $(gen0_opts) $(usetex_flag_py)
     done
 }
 
@@ -401,12 +429,12 @@ phase_utility() {
 #    the vulnerability targets. Per lineage and mode, one sweep per (method, variant, verdict),
 #    which is the grid the comparison needs — mixture x extrapolation x optimization x verdict.
 #    Every combination files under its own name, so none overwrites another:
-#      direct, sampled      attack_gen{g}_{model}{_rdf}[_vuln]_T0.7p0.8k20x5_anchor.json
-#      direct, greedy       ..._anchor.json                      (no verification tag)
-#      logit plain          ..._anchor[_sinkobj]_logit_surrogate.json
-#      logit opt            ..._anchor[_sinkobj][_nsink]_em_logit_surrogate.json
-#    The anchor is held in all of them (the sweeps' default): a hit needs the target broken while
-#    the pristine baseline and the generation-0 anchor keep writing the correct (secure) code.
+#      direct, sampled      attack_gen{g}_{model}{_rdf}[_vuln]_T0.7p0.8k20x5.json
+#      direct, greedy       attack_gen{g}_{model}{_rdf}[_vuln].json
+#      logit plain          ...[_sinkobj]_logit_surrogate.json
+#      logit opt            ...[_sinkobj][_nsink]_em_logit_surrogate.json
+#    A hit needs the target broken while the pristine baseline keeps writing the correct (secure)
+#    code. HOLD_ANCHOR=1 adds the generation-0 model to that rule and puts _anchor in every name.
 phase_attack() {
     local mode record name size rdf method variant verdict vuln_flag
 
@@ -417,7 +445,8 @@ phase_attack() {
             IFS='|' read -r name size rdf <<< "$record"
             wants_lineage "$name" || continue
             run "sink_screen_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" run_margin.py \
-                -msz "$size" -rdf "$rdf" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -p "$ROOT" --sink
+                -msz "$size" -rdf "$rdf" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -p "$ROOT" --sink \
+                $(gen0_opts)
         done
     fi
 
@@ -436,8 +465,8 @@ phase_attack() {
                             -n "$GENERATIONS" -p "$ROOT" -b "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
                             -m "$method" $vuln_flag $(force_flag) \
                             -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" \
-                            $(verdict_opts "$verdict") $(search_opts) \
-                            $(variant_opts "$mode" "$method" "$variant")
+                            $(verdict_opts "$verdict") $(anchor_opts) $(gen0_opts) \
+                            $(search_opts) $(variant_opts "$mode" "$method" "$variant")
                     done
                 done
             done
@@ -451,6 +480,22 @@ phase_attack() {
 #    averaged into one panel.
 phase_plots() {
     local record name size rdf specifier variant verdict tag method em label
+    # the utility figures first, redrawn from the cached evaluations (-po) so that
+    # `--phases plots` is the whole figure set and not only the attack half. Both scripts import
+    # unsloth at module scope, so they need a visible GPU even to replot
+    for record in "${LINEAGES[@]}"; do
+        IFS='|' read -r name size rdf <<< "$record"
+        wants_lineage "$name" || continue
+        run "plots_perplexity_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" \
+            -m utils.evaluate_perplexity -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" \
+            -msz "$size" -rdf "$rdf" -p "$ROOT" -pp "$PLOTS_DIR" --calibrate -po \
+            $(gen0_opts) $(usetex_flag_py)
+        run "plots_humaneval_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" \
+            -m utils.evaluate_correctness -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" \
+            -msz "$size" -rdf "$rdf" -p "$ROOT" -pp "$PLOTS_DIR" -po $(gen0_opts) \
+            $(usetex_flag_py)
+    done
+
     # the correctness hits of one lineage: direct and surrogate curves in one panel, one figure
     # per variant since plain and optimized are two different surrogates for the same generation
     for record in "${LINEAGES[@]}"; do
@@ -459,9 +504,16 @@ phase_plots() {
         for variant in $(variants_for logit); do
             em=""
             [[ "$variant" == "opt" ]] && (( OPT_ENTROPY_MATCH )) && em="-em"
-            run "plots_correctness_${name}_${variant}" "$PYTHON" -m utils.plot_attack_hits \
-                -p "$ROOT" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
-                -m "$(echo $METHODS | tr ' ' ',')" $em $(usetex_flag_py)
+            for verdict in $VERDICTS; do
+                # the hit rule is part of the result file names, so the figure has to be told
+                # which family to read; correctness sweeps never carry the sink objective
+                tag="$(run_tag_for "$verdict" correctness "$variant")"
+                run "plots_correctness_${name}_${variant}_${verdict}" \
+                    "$PYTHON" -m utils.plot_attack_hits \
+                    -p "$ROOT" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
+                    -m "$(echo $METHODS | tr ' ' ',')" -vf "$tag" -pp "$PLOTS_DIR" \
+                    $em $(usetex_flag_py)
+            done
         done
     done
 
@@ -499,12 +551,15 @@ print_plan() {
     echo "##   root         : $ROOT"
     echo "##   generations  : 0..$GENERATIONS  (run_baseline.py -ng $NUM_GENERATIONS), block size $BLOCK_SIZE"
     echo "##   decoding     : T $TEMPERATURE, top-p $TOP_P, top-k $TOP_K, seed $SEED, fresh init every generation"
+    echo "##   mixtures     : $MIXTURES$( [[ " $MIXTURES " == *" 1.0 "* ]] && echo '  (1.0 = non-collapsing control, human data every generation)' )"
     echo "##   phases       : $PHASES"
     echo "##   interpreter  : $PYTHON"
     echo "##   GPUs         : train $TRAIN_GPUS, attack $ATTACK_GPUS, eval $EVAL_GPU"
     echo "##   search       : $RESTARTS restarts x $NUM_STEPS steps, verify every $VERIFY_EVERY"
     echo "##   attacks      : correctness then --vuln; methods [$METHODS], variants [$VARIANTS],"
     echo "##                  verdicts [$VERDICTS]"
+    echo "##   hit rule     : target wrong, baseline correct" \
+         "$( (( HOLD_ANCHOR )) && echo ', generation-0 anchor correct (HOLD_ANCHOR=1)' )"
     if [[ " $VARIANTS " == *" opt "* ]]; then
         echo "##   opt variant  : entropy match $OPT_ENTROPY_MATCH; vuln also sink factor" \
              "$OPT_SINK_FACTOR (cap $OPT_SINK_CAP), sink objective $OPT_SINK_OBJECTIVE" \

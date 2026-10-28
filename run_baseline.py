@@ -20,7 +20,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import mixture_suffix, mixture_tag
+from utils.naming import gen_zero_tag, generation_label, mixture_suffix, mixture_tag
 from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 
@@ -161,6 +161,7 @@ def main(
     perplexity_load_in_4bit: bool = False,
     recursive_init: bool = False,
     fresh_init: bool = False,
+    human_generation_zero: bool = False,
     training_gpus: int = 0,
     master_port: int = 29500,
 ) -> None:
@@ -219,6 +220,13 @@ def main(
             route to degradation that self-training does not cause. That is why it is the
             ablation. See utils/train_generation.py
         fresh_init (bool): the old spelling of the default; accepted and ignored
+        human_generation_zero (bool): ABLATION. Train generation 0 on the human corpus alone,
+            the rule every run before 2026-10-22 used. By default generation 0 trains on the
+            same mixture as every later generation, with the pristine base model's own samples
+            standing in for the previous generation's: the attacker's one fine-tune is then one
+            step of the very map the deployer's lineage iterates, which is what the surrogate
+            extrapolates. Run-level artifacts carry _hg0; use a separate --path, the
+            checkpoint names do not carry the rule
         training_gpus (int): how many of the visible GPUs to train one generation on, as data
             parallel ranks under torchrun. 0 uses all of them, 1 forces single GPU training
         master_port (int): torchrun rendezvous port. Only needs changing when two pipelines run
@@ -312,27 +320,42 @@ def main(
     # writing (and --histogram_only keeps finding) exactly the artifact names it always had.
     #
     # This is the *run-level* tag, for artifacts that span the whole run. The models and datasets of
-    # individual generations are named with mixture_suffix() instead, which additionally returns ""
-    # for generation 0 — see utils/naming.py for why generation 0 is deliberately shared
+    # individual generations are named with mixture_suffix() instead, which returns "" for the
+    # base corpus and, under --human_generation_zero only, for generation 0 — see utils/naming.py
     data_suffix = mixture_tag(real_data_fraction)
-    run_suffix = f"{init_suffix}{data_suffix}"
+    # the generation-0 data rule sits between the two for the same reason the weight lineage
+    # does: it changes every checkpoint from generation 0 up without reaching their names
+    gen0_suffix = gen_zero_tag(human_generation_zero)
+    run_suffix = f"{init_suffix}{gen0_suffix}{data_suffix}"
     # the checkpoint and corpus names do not carry the weight lineage, so a fresh-init run in a
     # root that already holds a recursive lineage of the same mixture would overwrite its
     # checkpoints while the recursive perplexity cache kept describing them. Refuse, unless this
     # run only evaluates what is there
-    other_suffix = ("_freshinit" if recursive_init else "_recursive") + data_suffix
-    other_cache = DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{other_suffix}.pt"
-    if not skip_training and os.path.exists(other_cache):
-        raise SystemExit(
-            f"{TColors.FAIL}{DATASET_PATH} already holds a "
-            f"{'fresh-init' if recursive_init else 'recursive'} lineage for this mixture"
-            f"{TColors.ENDC} ({other_cache}). The checkpoint names do not carry the weight "
-            f"lineage, so this run would overwrite those models. Use another --path"
-            + ("" if recursive_init else ", or --recursive_init to continue that lineage")
-            + "."
+    # the same holds for the generation-0 data rule: a mixed and a human-only generation 0 write
+    # the same checkpoint names (identical ones at -rdf 0), so one root holds one rule
+    other_lineages = {
+        ("_freshinit" if recursive_init else "_recursive") + gen0_suffix + data_suffix:
+            f"{'fresh-init' if recursive_init else 'recursive'} lineage for this mixture",
+        init_suffix + gen_zero_tag(not human_generation_zero) + data_suffix:
+            f"{'mixed' if human_generation_zero else 'human-only'} generation-0 lineage for "
+            f"this mixture",
+    }
+    for other_suffix, what in other_lineages.items():
+        other_cache = (
+            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{other_suffix}.pt"
         )
+        if not skip_training and os.path.exists(other_cache):
+            raise SystemExit(
+                f"{TColors.FAIL}{DATASET_PATH} already holds a {what}{TColors.ENDC} "
+                f"({other_cache}). The checkpoint names carry neither the weight lineage nor "
+                f"the generation-0 rule, so this run would overwrite those models. Use another "
+                f"--path, or the matching --recursive_init / --human_generation_zero to "
+                f"continue that lineage."
+            )
     # no underscores or backslashes: usetex renders the title, and a bare % is a LaTeX comment
-    run_label = f"{init_label}, real data fraction {real_data_fraction:g}"
+    run_label = f"{init_label}, real data fraction {real_data_fraction:g}" + (
+        ", human-only generation 0 (ablation)" if human_generation_zero else ""
+    )
 
     # allow tf32 for the matmuls of the training stage. The L40S' tensor cores run tf32 at
     # multiples of the fp32 rate and this only affects the fp32 fallbacks, not the bf16 path
@@ -472,7 +495,7 @@ def main(
     if real_data_fraction > 0:
         print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Real data fraction{TColors.ENDC}: "
-            f"{real_data_fraction:g} — every generation after 0 trains on "
+            f"{real_data_fraction:g} — every generation trains on "
             f"{1 - real_data_fraction:.0%} previous-generation output and "
             f"{real_data_fraction:.0%} original human data"
         )
@@ -482,6 +505,17 @@ def main(
             f"self-training, the fastest collapse (raise it if the models lose code generation "
             f"before the generation you want to attack)"
         )
+    # the generation-0 data rule: what stands in for 'the previous generation' when there is none
+    print(
+        f"## {TColors.OKBLUE}{TColors.BOLD}Generation 0 trains on{TColors.ENDC}: "
+        + (
+            "the human corpus alone (--human_generation_zero, ablation: the pre-2026-10-22 rule)"
+            if human_generation_zero or real_data_fraction >= 1.0
+            else "the same mixture as every later generation, with the base model's own "
+            "samples as the previous-generation corpus (generated_dataset_base, shared across "
+            "mixtures)"
+        )
+    )
     # the sampling parameters are not part of any artifact name, so this line is the only record
     # of them a run leaves behind; a truncation below top-p 1.0 / top-k -1 is itself a collapse
     # mechanism, so they are as much a lever on the collapse speed as the learning rate
@@ -545,6 +579,122 @@ def main(
                 + f"base_subdataset_bs{block_size}_{specifier_name}_shard{shard_id}"
             )
 
+        def generate_corpus(gen_id: int, gen_suffix: str) -> None:
+            """Samples one response per instruction from model_{gen_id} and merges the shards.
+
+            One worker per GPU, each generating the responses for its shard of the instruction
+            set. The shards were written once above; the workers only read them. ``gen_id`` -1
+            samples from the pristine base model (``--model_specifier``) and files the corpus
+            as ``generated_dataset_base``, which is what generation 0 trains on by default.
+
+            Args:
+                gen_id (int): the generation whose model is sampled, -1 for the base model
+                gen_suffix (str): the mixture suffix of that generation's artifacts
+            """
+            label = generation_label(gen_id)
+            process_list = []
+            for shard_id, d_id in enumerate(devices):
+                process = subprocess.Popen(
+                    [
+                        "env",
+                        f"CUDA_VISIBLE_DEVICES={d_id}",
+                        "python",
+                        "-m",
+                        "utils.generate_dataset",
+                        "--block_size",
+                        str(block_size),
+                        "--specifier_name",
+                        specifier_name,
+                        # the base model, sampled directly at generation -1
+                        "--model_specifier",
+                        model_specifier,
+                        "--dataset_batch_size",
+                        str(dataset_batch_size),
+                        "--generation",
+                        str(gen_id),
+                        "--shard_id",
+                        str(shard_id),
+                        "--engine",
+                        engine,
+                        "--gpu_memory_utilization",
+                        str(gpu_memory_utilization),
+                        "--temperature",
+                        str(temperature),
+                        "--top_p",
+                        str(top_p),
+                        "--top_k",
+                        str(top_k),
+                        "--path",
+                        str(path),
+                        "--seed",
+                        str(seed),
+                        # names the checkpoint it loads and the shard it writes
+                        "--real_data_fraction",
+                        str(real_data_fraction),
+                    ]
+                    + (["--human_generation_zero"] if human_generation_zero else []),
+                )
+                process_list.append(process)
+
+            # wait for all processes to finish. wait() instead of polling in a loop: the old loop
+            # mutated the list it was iterating over, which skips entries, and it tolerated a
+            # crashed worker silently — the failure then only surfaced as a missing shard in the
+            # concatenate below
+            for process in process_list:
+                process.wait()
+
+            failed_shards = [
+                shard
+                for shard, process in enumerate(process_list)
+                if process.returncode != 0
+            ]
+            if failed_shards:
+                raise RuntimeError(
+                    f"the dataset generation failed for shard(s) {failed_shards} of generation "
+                    f"{label}. See the subprocess output above for the actual error"
+                )
+
+            # merge all the subdatasets to one single dataset again
+            merged_dataset = concatenate_datasets(
+                [
+                    Dataset.load_from_disk(
+                        DATASET_PATH
+                        + f"subdataset_{label}_bs{block_size}_{specifier_name}{gen_suffix}"
+                        + f"_shard{shard_id}"
+                    )
+                    for shard_id in range(len(devices))
+                ]
+            )
+            merged_dataset.save_to_disk(
+                DATASET_PATH
+                + f"generated_dataset_{label}_bs{block_size}_{specifier_name}{gen_suffix}"
+            )
+
+        # ──────────────────────── the base model's corpus (generation -1) ─────────────────────
+        # what generation 0 trains on by default, in place of a previous generation's output: the
+        # pristine base model's own samples under the same decoding, mixed with the human corpus
+        # exactly as every later generation's input is. It is the same text under every mixture
+        # and is generated once per root. The ablation trains generation 0 on the human corpus
+        # alone and needs none, and so does the -rdf 1.0 control, whose mixture takes no
+        # synthetic rows at all
+        human_only_gen0 = human_generation_zero or real_data_fraction >= 1.0
+        base_corpus = (
+            DATASET_PATH
+            + f"generated_dataset_{generation_label(-1)}_bs{block_size}_{specifier_name}"
+        )
+        if not human_only_gen0 and continue_from_generation == 0:
+            if os.path.isdir(base_corpus):
+                print(
+                    f"## {TColors.OKBLUE}{TColors.BOLD}Base corpus{TColors.ENDC}: reusing "
+                    f"{base_corpus}"
+                )
+            else:
+                print(
+                    f"## {TColors.OKBLUE}{TColors.BOLD}Base corpus{TColors.ENDC}: sampling the "
+                    f"pristine base model once for generation 0's training corpus"
+                )
+                generate_corpus(-1, "")
+
         # ───────────────────────── start the actual finetuning ──────────────────────────────
         # iterte over two loops: first the model training and then the dataset generation
         # the model is trained for N times and after each training the dataset
@@ -561,25 +711,26 @@ def main(
             # which generation produced it. The corpus read here was generated by model_{gen_id - 1}
             # and the splits written below train model_{gen_id}, which for gen_id 1 is an unsuffixed
             # input and a suffixed output — hence two separate calls rather than one variable
-            gen_suffix = mixture_suffix(real_data_fraction, gen_id)
-            prev_suffix = mixture_suffix(real_data_fraction, gen_id - 1)
+            gen_suffix = mixture_suffix(real_data_fraction, gen_id, human_generation_zero)
+            prev_suffix = mixture_suffix(real_data_fraction, gen_id - 1, human_generation_zero)
 
-            if gen_id > 0:
-                # if the first training iteration is done, load the generated dataset from the disk
+            if gen_id > 0 or not human_only_gen0:
+                # the previous generation's corpus: model_{g-1}'s output, or for generation 0 the
+                # pristine base model's own output, generated once per root above. Either way
+                # --real_data_fraction of it is swapped back for original human examples, so
+                # generation 0 is one step of the same map every later generation applies
                 dataset = Dataset.load_from_disk(
                     DATASET_PATH
-                    + f"generated_dataset_{gen_id - 1}_bs{block_size}_{specifier_name}"
-                    + prev_suffix
+                    + f"generated_dataset_{generation_label(gen_id - 1)}_bs{block_size}"
+                    + f"_{specifier_name}{prev_suffix}"
                 )
                 dataset = dataset.map(format_prompt, batched=True)
-                # --real_data_fraction of it is swapped back for original human examples. Only
-                # generations above 0 are affected: generation 0 trains on the human corpus by
-                # definition, so there is nothing to mix in there
                 dataset = mix_real_data(
                     dataset, chunked_dataset, real_data_fraction, seed, gen_id
                 )
             else:
-                # for first iteration (gen_id = 0) take the original dataset
+                # the ablation (and the -rdf 1.0 control): generation 0 trains on the human
+                # corpus alone, the rule every run before 2026-10-22 used
                 dataset = chunked_dataset
 
             # for the first model the original dataset is used, then the generated dataset
@@ -643,6 +794,8 @@ def main(
                 train_command.append("--gradient_checkpointing")
             if recursive_init:
                 train_command.append("--recursive_init")
+            if human_generation_zero:
+                train_command.append("--human_generation_zero")
 
             training = subprocess.run(train_command, check=False)
             if training.returncode != 0:
@@ -652,81 +805,7 @@ def main(
                 )
 
             # ────────────────────────────── generate the new datasets ────────────────────────────
-            # one worker per GPU, each generating the responses for its shard of the instruction
-            # set. The shards were written once above; the workers only read them
-            process_list = []
-            for shard_id, d_id in enumerate(devices):
-                process = subprocess.Popen(
-                    [
-                        "env",
-                        f"CUDA_VISIBLE_DEVICES={d_id}",
-                        "python",
-                        "-m",
-                        "utils.generate_dataset",
-                        "--block_size",
-                        str(block_size),
-                        "--specifier_name",
-                        specifier_name,
-                        "--dataset_batch_size",
-                        str(dataset_batch_size),
-                        "--generation",
-                        str(gen_id),
-                        "--shard_id",
-                        str(shard_id),
-                        "--engine",
-                        engine,
-                        "--gpu_memory_utilization",
-                        str(gpu_memory_utilization),
-                        "--temperature",
-                        str(temperature),
-                        "--top_p",
-                        str(top_p),
-                        "--top_k",
-                        str(top_k),
-                        "--path",
-                        str(path),
-                        "--seed",
-                        str(seed),
-                        # names the checkpoint it loads and the shard it writes
-                        "--real_data_fraction",
-                        str(real_data_fraction),
-                    ],
-                )
-                process_list.append(process)
-
-            # wait for all processes to finish. wait() instead of polling in a loop: the old loop
-            # mutated the list it was iterating over, which skips entries, and it tolerated a
-            # crashed worker silently — the failure then only surfaced as a missing shard in the
-            # concatenate below
-            for process in process_list:
-                process.wait()
-
-            failed_shards = [
-                shard
-                for shard, process in enumerate(process_list)
-                if process.returncode != 0
-            ]
-            if failed_shards:
-                raise RuntimeError(
-                    f"the dataset generation failed for shard(s) {failed_shards} of generation "
-                    f"{gen_id}. See the subprocess output above for the actual error"
-                )
-
-            # merge all the subdatasets to one single dataset again
-            merged_dataset = concatenate_datasets(
-                [
-                    Dataset.load_from_disk(
-                        DATASET_PATH
-                        + f"subdataset_{gen_id}_bs{block_size}_{specifier_name}{gen_suffix}"
-                        + f"_shard{shard_id}"
-                    )
-                    for shard_id in range(len(devices))
-                ]
-            )
-            merged_dataset.save_to_disk(
-                DATASET_PATH
-                + f"generated_dataset_{gen_id}_bs{block_size}_{specifier_name}{gen_suffix}"
-            )
+            generate_corpus(gen_id, gen_suffix)
 
     # ────────────────── evaluate the models' perplexity and other metrics ─────────────────────────
     # iterate over every model and the generated dataset and calculate the perplexity
@@ -792,6 +871,7 @@ def main(
                     "--real_data_fraction",
                     str(real_data_fraction),
                 ]
+                + (["--human_generation_zero"] if human_generation_zero else [])
                 + (["--load_in_4bit"] if perplexity_load_in_4bit else []),
             )
             process_list.append(process)
@@ -870,8 +950,9 @@ def main(
             raise FileNotFoundError(
                 f"{cached_dict} does not exist. --histogram_only replots the cache of a run "
                 f"with the same --block_size, --model_specifier, --recursive_init "
-                f"({'set' if recursive_init else 'not set'} here) and --real_data_fraction "
-                f"({real_data_fraction:g} here)"
+                f"({'set' if recursive_init else 'not set'} here), --human_generation_zero "
+                f"({'set' if human_generation_zero else 'not set'} here) and "
+                f"--real_data_fraction ({real_data_fraction:g} here)"
             )
         perplexity_dict = torch.load(cached_dict)
         all_perplexities = torch.load(
@@ -1027,8 +1108,9 @@ if __name__ == "__main__":
         "-rdf",
         type=float,
         default=0.0,
-        help="share of every training corpus after generation 0 taken from the original human "
-        "dataset instead of the previous generation's output, in [0, 1). 0 is pure self-training "
+        help="share of every training corpus, generation 0 included, taken from the original human "
+        "dataset instead of the previous generation's output (the base model's own corpus at "
+        "generation 0), in [0, 1]. 0 is pure self-training "
         "and collapses fastest — the models lose code generation within about two generations, "
         "which leaves run_attack.py's capability gate nothing to attack. Raising it bounds the "
         "degradation so later generations still drift but stay capable. The corpus size does not "
@@ -1163,6 +1245,20 @@ if __name__ == "__main__":
         "do not carry the lineage",
     )
     parser.add_argument("--fresh_init", "-fi", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="ABLATION: train generation 0 on the human corpus alone, the rule every run before "
+        "2026-10-22 used. By default generation 0 trains on the same mixture as every later "
+        "generation, with the pristine base model's own samples (generated_dataset_base, "
+        "sampled once per root) standing in for the previous generation's corpus — the "
+        "attacker's one fine-tune is then one step of the map the deployer's lineage iterates, "
+        "which is what the surrogate extrapolates. Under this flag model_0 and its corpus are "
+        "shared across mixtures and stay unsuffixed, and every consumer of the root needs the "
+        "same flag. Run-level artifacts carry _hg0; use a separate --path, the checkpoint names "
+        "do not carry the rule",
+    )
     parser.add_argument(
         "--training_gpus",
         "-tg",

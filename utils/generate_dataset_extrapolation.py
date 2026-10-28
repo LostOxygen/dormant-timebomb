@@ -280,9 +280,15 @@ parser.add_argument(
     "-rdf",
     type=float,
     default=0.0,
-    help="the run's --real_data_fraction. It names the shard this writes and nothing else: the "
-    "base_subdataset read below is the human instruction set, which no mixture touches, and the "
-    "model_0 anchor is shared across mixtures (default: 0.0)",
+    help="the run's --real_data_fraction. It names the shard this writes and the model_0 anchor "
+    "the tilt is built from, which is this mixture's own generation 0; the base_subdataset read "
+    "below is the human instruction set, which no mixture touches (default: 0.0)",
+)
+parser.add_argument(
+    "--human_generation_zero",
+    "-hg0",
+    action="store_true",
+    help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone",
 )
 parser.add_argument(
     "--load_in_4bit",
@@ -316,14 +322,18 @@ temperature = args.temperature
 top_p = args.top_p
 top_k = args.top_k
 real_data_fraction = args.real_data_fraction
+human_generation_zero = args.human_generation_zero
 load_in_4bit = args.load_in_4bit
 path = args.path
 
 suffix = dataset_suffix(method)
-# the shard is named after the generation that produced it, so generation 0 stays untagged: n = 1
-# reproduces the real model_0 anchor, which every mixture shares. utils/calculate_perplexity.py
-# resolves the merged corpus with the same rule, one generation down
-mix = mixture_suffix(real_data_fraction, generation)
+# the shard is named after the generation that produced it, under the same rule as the real
+# run's corpora (generation 0 included, unless --human_generation_zero shares it).
+# utils/calculate_perplexity.py resolves the merged corpus with the same rule, one generation
+# down
+mix = mixture_suffix(real_data_fraction, generation, human_generation_zero)
+# the anchor the tilt is built from: this mixture's own generation 0
+anchor_mix = mixture_suffix(real_data_fraction, 0, human_generation_zero)
 # every method is indexed by the same factor: in the real collapse run generated_dataset_g is
 # produced by model_g, and model_0 is a single fine-tuning step away from the base model, so
 # model_g sits g + 1 steps out. With a factor of g instead, generation 0 would be a plain copy
@@ -385,7 +395,7 @@ if method == "logit":
     FastLanguageModel.for_inference(generation_model)
 
     model_collapsed, _ = FastLanguageModel.from_pretrained(
-        model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}",
+        model_name=f"{MODEL_PATH}model_0_bs{block_size}_{specifier_name}{anchor_mix}",
         max_seq_length=max_seq_length,
         dtype=None,
         load_in_4bit=load_in_4bit,

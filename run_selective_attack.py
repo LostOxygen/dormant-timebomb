@@ -1742,6 +1742,7 @@ def main(
     first_collapsed_path: str = "",
     no_surrogate_scoring: bool = False,
     real_data_fraction: float = 0.0,
+    human_generation_zero: bool = False,
     attack_gpus: int = 0,
     shard_units: str = "",
     handoff_file: str = "",
@@ -1797,6 +1798,8 @@ def main(
             are built from (default: resolved from the model outputs)
         no_surrogate_scoring (bool): do not decode the surrogates during verification. Halves the
             verification cost in transfer mode at the price of the surrogate report
+        human_generation_zero (bool): the run's --human_generation_zero ablation, under which
+            generation 0 is shared across mixtures and carries no suffix
         real_data_fraction (float): the --real_data_fraction run_baseline.py was given; it is part
             of the checkpoint names from generation 1 onward. Only used to find them
         attack_gpus (int): how many of the visible GPUs to shard the (task, restart) units over.
@@ -1892,7 +1895,11 @@ def main(
     checkpoints = {
         generation: overrides.get(generation)
         or resolve_collapsed_dir(
-            generation, specifier_name, block_size, real_data_fraction=real_data_fraction
+            generation,
+            specifier_name,
+            block_size,
+            real_data_fraction=real_data_fraction,
+            human_generation_zero=human_generation_zero,
         )
         for generation in generations
     }
@@ -1915,9 +1922,15 @@ def main(
 
     first_collapsed_dir = ""
     if transfer:
-        # generation 0 needs no mixture: it is the same checkpoint under every fraction
+        # the anchor is this mixture's own generation 0 (shared across mixtures only under
+        # --human_generation_zero)
         first_collapsed_dir = first_collapsed_path or resolve_collapsed_dir(
-            0, specifier_name, block_size, prefer_adapter=(surrogate_method == "lora")
+            0,
+            specifier_name,
+            block_size,
+            prefer_adapter=(surrogate_method == "lora"),
+            real_data_fraction=real_data_fraction,
+            human_generation_zero=human_generation_zero,
         )
         if targets == [0]:
             raise SystemExit(
@@ -2717,8 +2730,13 @@ if __name__ == "__main__":
         default=0.0,
         help="the --real_data_fraction run_baseline.py was given. A mixed run names checkpoints "
         "model_{gen}_bs{bs}_{name}_rdf{value}[_fp16] from generation 1 on, so the same value is "
-        "needed here to find them. The generation-0 surrogate anchor is shared across mixtures and "
-        "needs no value (default: 0.0)",
+        "needed here to find them, generation 0 and the surrogate anchor included (default: 0.0)",
+    )
+    parser.add_argument(
+        "--human_generation_zero",
+        "-hg0",
+        action="store_true",
+        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone",
     )
     parser.add_argument(
         "--path",

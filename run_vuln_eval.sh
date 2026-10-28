@@ -137,8 +137,8 @@ print(verification_tag_from_argv(sys.argv[1:]))' "${EXTRA_ARGS[@]}")"; then
     echo "error: could not resolve the verification tag from the passthrough arguments" >&2
     exit 2
 fi
-# and whether the hit rule holds the generation-0 anchor (default yes; -- -na drops it). Generation
-# 0's own attack file never carries it
+# and whether the hit rule also holds the generation-0 anchor (default no; -- -ha adds it).
+# Generation 0's own attack file never carries it
 if ! ANCHOR_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
         'import sys
 from utils.naming import anchor_held_from_argv, anchor_tag
@@ -178,9 +178,9 @@ else
     echo "##   verification : greedy (untagged attack files)"
 fi
 if [[ -n "$ANCHOR_TAG" ]]; then
-    echo "##   hit rule     : anchor held (attack files tagged $ANCHOR_TAG from generation 1 on)"
+    echo "##   hit rule     : anchor held (--hold_anchor; attack files tagged $ANCHOR_TAG from generation 1 on)"
 else
-    echo "##   hit rule     : baseline only (--no_anchor)"
+    echo "##   hit rule     : baseline only"
 fi
 echo "##   path         : $PATH_ROOT"
 echo "############################################################"

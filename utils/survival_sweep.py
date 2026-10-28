@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path", "-p", type=str, default="")
     parser.add_argument("--block_size", "-bs", type=int, default=512)
     parser.add_argument("--real_data_fraction", "-rdf", type=float, default=0.0)
+    parser.add_argument("--human_generation_zero", "-hg0", action="store_true",
+                        help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone")
     parser.add_argument("--collapsed_generation", "-cg", type=int, default=-1,
                         help="override the generation recorded in the result file")
     parser.add_argument("--collapsed_model_path", "-cmp", type=str, default="")
@@ -221,6 +223,7 @@ def main() -> None:
     baseline_dir = args.baseline_model_path or model_specifier
     collapsed_dir = args.collapsed_model_path or resolve_collapsed_dir(
         generation, specifier_name, args.block_size, real_data_fraction=args.real_data_fraction,
+        human_generation_zero=args.human_generation_zero,
     )
     tasks = [t for t in run_attack.TASKS if not args.tasks or t.name in args.tasks.split(",")]
     rows = select_rows(report, args, {t.name for t in tasks})

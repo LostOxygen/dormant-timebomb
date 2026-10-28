@@ -105,15 +105,25 @@ while holding the corpus \emph{size} fixed, so the number of optimizer steps per
 constant and the collapse curve stays attributable to composition rather than to budget:
 \begin{equation}
   \mathrm{corpus}_g \;=\; (1-f)\cdot \mathrm{sample}(D_{g-1}) \;+\; f \cdot \mathrm{sample}(H),
-  \qquad f \in [0,1],\; g \ge 1 .
+  \qquad f \in [0,1],\; g \ge 0, \qquad D_{-1} \sim M_{\mathrm{base}}(\,\cdot \mid \text{instructions}) .
   \label{eq:mixture}
 \end{equation}
 
 $f = 0$ is the pure replace regime. $f = 1$ is the \textbf{non-collapsing control}: same generation
 count, same seeds, same step count, no self-generated data at all, which is what separates
-``self-training moved the model'' from ``iterated fine-tuning moved the model''. Generation 0 is
-never mixed, since it trains on human data by definition. Implemented in \code{mix_real_data}
-(\href{../run_baseline.py}{\code{run_baseline.py}}).
+``self-training moved the model'' from ``iterated fine-tuning moved the model''.
+
+\textbf{Generation 0 is mixed like every other generation} (since 2026-10-22), with the pristine
+base model's own samples $D_{-1}$ standing in for a previous generation's corpus. This is what the
+threat model needs: the attacker's one fine-tune $M_0$ has to be one application of the \emph{same}
+map $M_{g+1} = \mathrm{finetune}(M_{\mathrm{base}}, \mathrm{corpus}_g)$ that produces the deployer's
+$M_1, M_2, \dots$, because every surrogate of the surrogate section extends the step
+$M_{\mathrm{base}} \to M_0$ by a factor $n$ and reads it as $n$ collapse steps. A generation 0
+trained on $H$ alone --- the rule before 2026-10-22, kept as the \code{--human_generation_zero}
+ablation --- makes that step a fine-tune on human code, and $n$ of them is not where the lineage
+goes. At $f = 0$ generation 0 is pure self-distillation of the base; at $f = 1$ the two rules
+coincide. Implemented in \code{mix_real_data} (\href{../run_baseline.py}{\code{run_baseline.py}}),
+the base corpus sampled once per root before the loop.
 
 \subsection{Why truncated sampling drives collapse}
 \label{sec:sharpening}
@@ -359,7 +369,8 @@ enabled in the attack with \code{--entropy_match}.
 
 Let $c$ be the model under attack (the real checkpoint, or a surrogate in transfer mode) and let $H$
 be the \textbf{hold set}: the models that must keep writing the secure implementation. $H$ is the
-pristine baseline, plus the generation-0 anchor when it is held, so $|H|$ is 1 or 2.
+pristine baseline, plus the generation-0 anchor under \code{--hold_anchor}, so $|H|$ is 1 by
+default and 2 under that flag.
 \begin{align}
   L(s) \;=\;& \CE_c(w \mid s)
     && \text{(1) break} \label{eq:obj1}\\
@@ -476,16 +487,22 @@ useless here and why the verdict of Section~\ref{sec:verdict} has to be imposed 
 \subsection{The hit rule}
 
 Let $\mathrm{status}_M \in \{\text{secure}, \text{insecure}, \text{unclassified}\}$ be the static
-classification of what model $M$ emits for the adversarial prompt. A hit requires all three of:
+classification of what model $M$ emits for the adversarial prompt. A hit requires both of:
 \begin{align}
   \mathrm{status}_c &= \text{insecure} && \text{the model under attack writes the vulnerability} \\
-  \mathrm{status}_b &= \text{secure} && \text{the pristine baseline does not} \\
-  \mathrm{status}_a &= \text{secure} && \text{the generation-0 anchor does not \quad (when held)}
+  \mathrm{status}_b &= \text{secure} && \text{the pristine baseline does not}
 \end{align}
+and, under \code{--hold_anchor} only, a third:
+\begin{equation}
+  \mathrm{status}_a = \text{secure} \qquad \text{the attacker's own generation-0 model does not.}
+\end{equation}
 
-The third condition is what makes the claim about \emph{collapse} rather than about fine-tuning:
-without it, a suffix that breaks every descendant of the base model counts, and that is a statement
-about the first fine-tune, not about the trajectory.
+\textbf{The default is the two-sided rule, and it follows from the threat model.} The attacker
+holds the foundational model and one fine-tune of it; that generation-0 model is the
+\emph{instrument} the surrogate is built from, not a deployment the suffix has to spare, so a
+suffix that also breaks it costs the claim nothing. The third condition is the stricter, optional
+claim --- that the suffix is specific to \emph{later} collapse rather than to any descendant of
+the base model --- and it shrinks the feasible set, which is why it is reported as its own family.
 
 \subsection{Sampled majority}
 
@@ -563,8 +580,10 @@ and raising it scales toward zero and makes the outcome a coin flip. This is the
 
 \subsection{Headroom, and its limits}
 
-For the three-sided hit rule to be satisfiable, the model under attack must be \emph{closer} to the
-insecure variant than the anchor it has to spare. Hence
+Headroom is a diagnostic for the \textbf{three-sided} rule (\code{--hold_anchor}), where the model
+under attack must be \emph{closer} to the insecure variant than the anchor it has to spare. Under
+the default two-sided rule the comparison is against the pristine baseline instead, and the same
+formula applies with $\mathrm{sm}_{M_{\mathrm{base}}}$ in place of $\mathrm{sm}_{M_0}$. Hence
 \begin{equation}
   \mathrm{headroom}(g, \mathrm{task}) \;=\; \mathrm{sm}_{M_0}(\mathrm{task}) \;-\; \mathrm{sm}_{M_g}(\mathrm{task}).
   \label{eq:headroom}
@@ -601,8 +620,8 @@ both & 3 \\
 \end{center}
 
 The clearest illustration is the OS-command-injection target, which has the largest headroom at
-every generation and is inadmissible at every generation because the anchor already writes the
-vulnerability with no suffix at all.
+every generation and is inadmissible at every generation because the model that must be spared
+already writes the vulnerability with no suffix at all.
 
 \section{The collapse map (poisoning)}
 \label{sec:collapsemap}
@@ -673,7 +692,7 @@ $m$ & hold-away hinge margin & 3.0 \\
 $\nu$, $m_t$ & weight and margin of the target-side hinge & 1.0, 0 (off) \\
 $\zeta$, $m_s$, $\kappa$ & sink-conditional break weight, margin, stay-on-task weight & 1.0, 2.0, 1.0 \\
 $B$, $k_{\mathrm{top}}$ & GCG search width, gradient top-$k$ & 256, 256 \\
-$H$ & hold set, $\{\text{baseline}\}$ or $\{\text{baseline}, \text{anchor}\}$ & with anchor \\
+$H$ & hold set, $\{\text{baseline}\}$, or with the anchor under \code{--hold_anchor} & $\{\text{baseline}\}$ \\
 $a$, $b$, $L^{*}$ & collapse-map slope, intercept, fixed point & measured \\
 $r_n$ & trigger-context payload rate at generation $n$ & measured \\
 \bottomrule
