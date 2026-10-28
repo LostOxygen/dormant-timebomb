@@ -435,9 +435,10 @@ decoding.
 | 3 collapse variants | nothing | two more collapse runs, then 1 and 2 on each |
 | 4a survival vs T | 2 | minutes per file |
 | 4b cost curve | 2 | 10 to 30 min per task and restart at `--every 10` |
-| 4c eval pipeline | 2 | hours, mostly the random controls |
+| 4c eval pipeline | 2 | ~3 h per random-control unit, 80 units in the four-mixture grid; sharded two workers per visible GPU by default (`--jobs`), ~16 h on four cards, five days serial |
 | 5 window | 1, 2 | plots only |
 
-Do not edit `run_attack_sweep.sh` or `run_vuln_eval.sh` while one of them is running: bash reads
-a running script by byte offset. Greedy and sampled sweeps of the same cell can run concurrently
+Do not edit `run_attack_sweep.sh` or `run_vuln_eval.sh` in place while one of them is running:
+bash reads a running script by byte offset. Writing the new version to a temporary file and
+`mv`-ing it over the old one is safe, since the running shell keeps the old inode open. Greedy and sampled sweeps of the same cell can run concurrently
 since they write different files.

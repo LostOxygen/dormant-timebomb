@@ -27,6 +27,16 @@
 # The mixture list is the ablation axis. One value is the main experiment; ten values (0.0 .. 0.9)
 # is the attackable-window study, and each of them needs its own collapse run first.
 #
+# The controls and temperature phases are sharded over the visible GPUs (since 2026-10-28). Each
+# of their units — one (model, mixture, generation, source) cell — is an independent
+# utils.verify_suffixes process, and a random-control unit scores 75 suffixes x 25 targets with
+# two unbatched greedy decodes per pair: measured at ~3 hours per unit with the GPU at ~20%, so
+# the 80 units of a four-mixture grid took five days in series. --jobs sets the worker count,
+# two per visible GPU by default (under 3GB each), pinned round-robin through
+# CUDA_VISIBLE_DEVICES; --jobs 1 is the old serial run. Every unit writes its own log under
+# attack_results/eval_logs/, a failed unit leaves a .FAILED marker beside it, and the output
+# names are unchanged, so a serial run's finished units are picked up as already done.
+#
 # Usage:
 #   ./run_vuln_eval.sh -n 9 --models "0.5b 3b" --rdf "0.5" [-p ./runs/x] [options]
 
@@ -44,6 +54,7 @@ PHASES="attack,controls,temperature,perplexity,plots"
 NUM_RANDOM=75
 TEMPERATURE=0.7
 NUM_SAMPLES=16
+JOBS=""            # resolved below: two workers per visible GPU
 FORCE=0
 DRY_RUN=0
 NO_USETEX=0
@@ -69,6 +80,9 @@ Options:
                             which is 75 at the defaults (default: 75)
       --temperature T       decoding temperature of the survival phase (default: 0.7)
       --num-samples N       samples per suffix in the survival phase (default: 16)
+      --jobs N              concurrent utils.verify_suffixes workers for the controls and
+                            temperature phases, pinned round-robin to the visible GPUs
+                            (default: two per visible GPU; 1 runs them one after another)
       --no-usetex           draw the figures without LaTeX
       --force               redo phases whose output already exists
       --dry-run             print every command without running it
@@ -90,6 +104,7 @@ while [[ $# -gt 0 ]]; do
         --num-random)      NUM_RANDOM="$2";   shift 2 ;;
         --temperature)     TEMPERATURE="$2";  shift 2 ;;
         --num-samples)     NUM_SAMPLES="$2";  shift 2 ;;
+        --jobs)            JOBS="$2";         shift 2 ;;
         --no-usetex)       NO_USETEX=1;       shift ;;
         --force)           FORCE=1;           shift ;;
         --dry-run)         DRY_RUN=1;         shift ;;
@@ -104,6 +119,24 @@ if [[ -z "$GENERATIONS" ]]; then
 fi
 if ! [[ "$GENERATIONS" =~ ^[0-9]+$ ]]; then
     echo "error: -n/--generations must be a non-negative integer" >&2; exit 2
+fi
+
+if [[ -n "$JOBS" ]] && ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: --jobs must be a positive integer" >&2; exit 2
+fi
+
+# the devices the workers are dealt over: the same helper the orchestrators shard with, so an
+# outer CUDA_VISIBLE_DEVICES (run_paper_full.sh pins ATTACK_GPUS) narrows the pool rather than
+# being overridden by a pin to a card it excluded
+if ! GPUS="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'from utils.devices import visible_devices
+print(" ".join(str(d) for d in visible_devices()))')"; then
+    echo "error: could not resolve the visible GPUs" >&2
+    exit 2
+fi
+read -r -a GPU_LIST <<< "$GPUS"
+if [[ -z "$JOBS" ]]; then
+    JOBS=$(( 2 * ${#GPU_LIST[@]} ))
 fi
 
 RESULTS_DIR="$PATH_ROOT/attack_results"
@@ -183,6 +216,7 @@ else
     echo "##   hit rule     : baseline only"
 fi
 echo "##   path         : $PATH_ROOT"
+echo "##   workers      : $JOBS over GPU(s) $GPUS (controls and temperature phases)"
 echo "############################################################"
 
 # a missing collapse run is the most common reason this script does nothing useful, so it is named
@@ -225,7 +259,10 @@ fi
 
 # ─────────────────────── controls, survival, both per generation ───────────────────────────
 # both phases score suffixes against one checkpoint, so they share the loop and differ only in the
-# arguments handed to utils.verify_suffixes
+# arguments handed to utils.verify_suffixes. score_suffixes decides what a cell needs and queues
+# it; run_units then deals the queue over the GPUs. The units are independent — one process, one
+# checkpoint, one output file each — which is what makes the fan-out result-neutral
+UNITS=()
 score_suffixes() {
     local size="$1" mixture="$2" generation="$3" source="$4" mode="$5"
     local name tag result out
@@ -273,22 +310,61 @@ sys.exit(0 if hits else 1)' "$result"; then
                   --num_samples "$NUM_SAMPLES")
     fi
 
-    echo "   \$ ${command[*]}"
     if (( DRY_RUN )); then
+        echo "   \$ ${command[*]}"
         return 0
     fi
-    # a plain pipe rather than a process substitution: the latter is set up by the shell even when
-    # the command is not run, so a --dry-run would try to open a log under a directory that a dry
-    # run deliberately does not create, and its output interleaves with the phase headings
-    local log code
-    log="$LOG_DIR/$(basename "${out%.json}").log"
-    echo "   log: $log"
-    "${command[@]}" 2>&1 | tee "$log"
-    code=${PIPESTATUS[0]}
-    if (( code != 0 )); then
-        echo "   FAILED with exit code $code -- see $log"
-        FAILURES=$(( FAILURES + 1 ))
+    echo "   queued: $(basename "$out")"
+    # the array holds strings, so the command is stored shell-quoted and rebuilt with eval
+    UNITS+=("$out"$'\t'"$(printf '%q ' "${command[@]}")")
+}
+
+# one worker: pinned to its GPU, its console output in its own log, a marker if it failed. The
+# output file is the resume point, so a failed unit must not leave one behind — verify_suffixes
+# writes it last, after scoring, which is why the marker is enough
+run_unit() {
+    local out="$1" quoted="$2" gpu="$3"
+    local log="$LOG_DIR/$(basename "${out%.json}").log" cmd started
+    eval "cmd=($quoted)"
+    rm -f "${log%.log}.FAILED"
+    started=$SECONDS
+    echo "   [gpu $gpu] start  $(basename "$out")"
+    if CUDA_VISIBLE_DEVICES="$gpu" "${cmd[@]}" > "$log" 2>&1; then
+        echo "   [gpu $gpu] done   $(basename "$out") in $(( SECONDS - started ))s"
+        grep -E 'samples a hit' "$log" | tail -n 1 | sed 's/^/           /'
+    else
+        touch "${log%.log}.FAILED"
+        echo "   [gpu $gpu] FAILED $(basename "$out") after $(( SECONDS - started ))s -- see $log"
     fi
+}
+
+# the pool: at most JOBS workers at once, GPUs dealt round-robin, failures counted off the
+# markers afterwards because a background job cannot increment the parent's counter
+run_units() {
+    local count=${#UNITS[@]} slot=0 unit out quoted gpu failed=0
+    if (( count == 0 )); then
+        echo "   nothing to run"
+        return 0
+    fi
+    echo "   $count unit(s) over $JOBS worker(s) on GPU(s) $GPUS; logs in $LOG_DIR"
+    for unit in "${UNITS[@]}"; do
+        out="${unit%%$'\t'*}"
+        quoted="${unit#*$'\t'}"
+        gpu="${GPU_LIST[$(( slot % ${#GPU_LIST[@]} ))]}"
+        while (( $(jobs -rp | wc -l) >= JOBS )); do
+            wait -n
+        done
+        run_unit "$out" "$quoted" "$gpu" &
+        slot=$(( slot + 1 ))
+    done
+    wait
+    for unit in "${UNITS[@]}"; do
+        out="${unit%%$'\t'*}"
+        [[ -f "$LOG_DIR/$(basename "${out%.json}").FAILED" ]] && failed=$(( failed + 1 ))
+    done
+    FAILURES=$(( FAILURES + failed ))
+    echo "   $(( count - failed ))/$count unit(s) completed"
+    UNITS=()
 }
 
 if has_phase controls; then
@@ -303,6 +379,7 @@ if has_phase controls; then
             done
         done
     done
+    run_units
 fi
 
 if has_phase temperature; then
@@ -316,6 +393,7 @@ if has_phase temperature; then
             done
         done
     done
+    run_units
 fi
 
 # ──────────────────────────────── perplexity ──────────────────────────────────────────────
