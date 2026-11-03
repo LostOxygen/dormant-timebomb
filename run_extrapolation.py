@@ -39,7 +39,7 @@ from utils.colors import TColors
 from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import factor_mode_tag, mixture_suffix, mixture_tag
+from utils.naming import DEFAULT_REPETITION_PENALTY, factor_mode_tag, mixture_suffix, mixture_tag
 from utils.extrapolation import (
     METHODS,
     METHOD_LABELS,
@@ -152,6 +152,7 @@ def main(
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     load_in_4bit: bool = False,
     perplexity_load_in_4bit: bool = False,
 ) -> None:
@@ -667,6 +668,8 @@ def main(
                         str(top_p),
                         "--top_k",
                         str(top_k),
+                        "--repetition_penalty",
+                        str(repetition_penalty),
                         "--path",
                         str(path),
                         # names the shard it writes; the base_subdataset it reads is the untagged
@@ -1089,6 +1092,15 @@ if __name__ == "__main__":
         default=20,
         help="top-k sampling cutoff of the generation, -1 disables it. Same constraint as "
         "--temperature (default: 20)",
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        "-rp",
+        type=float,
+        default=DEFAULT_REPETITION_PENALTY,
+        help="repetition penalty of the generation. Same constraint as --temperature: it has "
+        "to be the value the run_baseline.py run was sampled with, which is in that run's "
+        f"banner and, when not the default, in its _rp tag (default: {DEFAULT_REPETITION_PENALTY:g})",
     )
     parser.add_argument(
         "--load_in_4bit",

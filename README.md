@@ -199,7 +199,7 @@ python run_baseline.py --device cuda --num_generations 10 --skip_training \
 * ```<path>/generated_datasets/generated_dataset_<gen>_bs<block_size>_<model_name>/``` — synthetic dataset of generation `<gen>`
 * ```<path>/generated_datasets/chunked_dataset_bs<block_size>_<model_name>/``` — formatted original dataset
 * ```<path>/generated_datasets/perplexity_dict_bs<block_size>_<model_name>.pt``` and ```all_perplexities_bs<block_size>_<model_name>.pt```
-* ```plots/perplexity_histogram_bs<block_size>_<model_name>.{png,pdf}``` — histograms on top, median per generation below
+* ```plots/perplexity_histogram_bs<block_size>_<model_name>.{png,pdf}``` — one step histogram per generation (the median panel was dropped on 2026-11-03; the medians are in the cache and in `run_paper_tables.py`'s utility figure)
 
 ### Utility of the collapsed models: perplexity and correctness
 
@@ -246,6 +246,7 @@ second slice costs another scoring pass and not a second sweep over the generati
 | `--calibration_rows` | `-cr` | int | `128` | Validation rows used inside the factor search. |
 | `--calibration_steps` | `-cs` | int | `6` | Search steps per generation. |
 | `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
+| `--repetition_penalty` | `-rp` | float | `1.2` | Repetition penalty of the dataset generation, pinned on both engines (since 2026-11-03 a flag; `utils.naming.DEFAULT_REPETITION_PENALTY` holds the default). `1.0` disables it, Qwen2.5 ships `1.05`. A non-default value tags the run-level artifacts `_rp<value>`; the checkpoint names do not carry it, so one root holds one value and a run at another value is refused where the lineage already exists. |
 | `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
 | `--plot_only` | `-po` | flag | off | Replot from the cached measurements without loading a model. |
 
@@ -306,10 +307,9 @@ training; the script says so rather than reporting a leaky split silently.
 
 **The figures.** One per slice, both drawn by `utils.plotting` — the same module the two
 orchestrators draw their corpus histograms with, so all of them share one layout: every generation's
-per-sample **histogram on top**, the **median per generation below it**. Two views of the same
-numbers, which is the point of putting them in one figure — a median that barely moves while the
-tail explodes, and a tail that looks alarming while the bulk has not moved, are both misreadings a
-single panel invites.
+per-sample **histogram**, one step curve per generation (until 2026-11-03 a median-per-generation panel sat below it; the medians are now read off `run_paper_tables.py`'s utility figure). Read it next to the
+medians: a median that barely moves while the tail explodes, and a tail that looks alarming while
+the bulk has not moved, are both misreadings one view alone invites.
 
 Reading them: **lower is better**, and the dashed line is the *un-fine-tuned* base model, not a
 quality ceiling — generation 0 sits below it because it is fine tuned on this dataset's own
@@ -375,6 +375,46 @@ table and the JSON keep the raw statuses. Writes
 `plots/test_correctness_bs{bs}_{model}{mix}.<png,pdf>` and a
 `generated_datasets/test_correctness_bs{bs}_{model}{mix}.json` cache holding every per-problem
 verdict.
+
+#### `run_distribution_collapse.py`
+
+The third view: the token distribution itself. Perplexity says how well a generation models
+human code and HumanEval whether it still writes code that runs; neither says which *end* of
+collapse a lineage is at. A lineage that retrains on its own tempered samples sharpens first (the
+mass piles onto the modes, entropy falls, the corpus repeats itself) and diffuses later (it can no
+longer continue text it did not write, entropy rises, the corpus stops being Python). This script
+measures both ends, on the models and on the corpora they wrote.
+
+```bash
+python run_distribution_collapse.py -msz 0.5b -rdf 0.5 -n 9 -p ./runs/x -pp ./runs/x/plots
+python run_distribution_collapse.py -msz 0.5b -rdf 0.5 -n 9 -p ./runs/x --corpus_only   # no GPU
+python run_distribution_collapse.py -msz 0.5b -rdf 0.5 -p ./runs/x --plot_only
+```
+
+| flag | short | type | default | description |
+|---|---|---|---|---|
+| `--generations` | `-n` | int | `9` | Highest generation index. |
+| `--rows` | `-r` | int | `256` | Rows per row set scored on every model: the held-out human rows and the generation's own samples. |
+| `--tokens` | `-t` | int | `0` | Positions per row set and model, `0` for every response position of the rows. |
+| `--corpus_rows` | `-cr` | int | `4000` | Responses per corpus for the n-gram statistics, the same row indices in every corpus so the prompts match. |
+| `--corpus_only` | `-co` | flag | off | Only the corpus side; needs no GPU. |
+| `--resume` | `-rs` | flag | off | Keep the model statistics an existing result file holds; the corpora are always redone. |
+| `--plot_only` | `-po` | flag | off | Replot from the result file. |
+
+Model side, teacher forced on every checkpoint plus the pristine base, templated like the
+perplexity: the mean and median predictive entropy per response position (nats), the top-1 mass,
+the share of near-deterministic positions (entropy below 0.1 nats) and of diffuse ones (above 2
+nats), an entropy histogram and the perplexity at the target, on two row sets — the held-out human
+rows `evaluate_perplexity` scores and the generation's **own corpus**, the text the next
+generation trains on. Corpus side, the human corpus, the base model's samples (index -1) and every
+generation's corpus at the same `--corpus_rows` rows: unigram entropy and the conditional bigram and
+trigram entropies (plug-in, nats, one sample size everywhere), distinct-n for n = 1..4, 4-grams
+repeated within a response, the mass on the 100 most frequent tokens, the Jensen-Shannon distance
+of the unigram distribution to the human corpus's, and the share of responses whose extracted code
+compiles (an empty extraction is prose, not compiling code). Writes
+`attack_results/distribution_collapse_{model}{mix}.json` and
+`plots/distribution_collapse_{model}{mix}.<png,pdf>`; `run_paper_tables.py` draws the lineages
+against each other from the JSON files, and both paper scripts run it in their utility phase.
 
 ## Step 2: Approximating later generations with `run_extrapolation.py`
 
@@ -559,6 +599,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Base model; must match step 1. |
 | `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
 | `--dataset_size` | `-dsz` | int | `0` | Samples to use from the upstream 50k dataset; `0` uses all of it. **Must match step 1** — both take the same front slice, which is what makes their histograms comparable. |
+| `--repetition_penalty` | `-rp` | float | `1.2` | Repetition penalty of the generation; must be the value the step 1 run was sampled with (its banner, or its `_rp` tag when not the default). |
 | `--real_data_fraction` | `-rdf` | float | `0.0` | The `-rdf` of the step 1 run this comparison is filed against, in `[0, 1)`. It namespaces what *this* step writes — the corpora of generations 1+, the perplexity cache and the figure — so a comparison against a mixed run cannot be replotted as an unmixed one. It changes nothing about what is computed: the surrogate is built from `model_0`, which every mixture trains identically, so step 2 always approximates the untempered self-training trajectory and is only a like-for-like comparison against an `-rdf 0` step 1. |
 | `--path` | `-p` | str | `""` (cwd) | Root directory for `generated_datasets/` and `model_outputs/`; must match step 1. |
 
@@ -909,7 +950,7 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--mu_correct` | `-mc` | float | `0.5` | Weight μ of the baseline-stays-correct anchor; `0` disables that term (and its extra forward/backward pass). |
 | `--verify_every` | `-ve` | int | `10` | Run the behavioural check every N steps. Lower catches hits earlier but costs two generations plus two subprocesses each time. |
 | `--max_new_tokens` | `-mnt` | int | `96` | Decoding budget during verification. |
-| `--repetition_penalty` | `-rp` | float | `1.0` | Decoding repetition penalty during verification (the dataset generation scripts use `3.0`; `1.0` is plain greedy decoding). |
+| `--repetition_penalty` | `-rp` | float | `1.0` | Decoding repetition penalty during verification (`1.0` is plain greedy decoding; unrelated to the dataset generation's `run_baseline.py -rp`, which defaults to `1.2`). |
 | `--exec_timeout` | `-et` | float | `10.0` | Per-candidate unit-test timeout in seconds. |
 | `--no_exec` | `-ne` | flag | off | Never execute generated code. Disables behavioural verification **and the capability gate**, leaving loss-only scoring that does **not** establish wrong behaviour. |
 | `--hold_anchor` | `-ha` | flag | off | Also require the generation-0 model to keep writing correct code, i.e. the three-sided rule. Off by default: that model is the attacker's own fine-tune and the surrogate's instrument, not a deployment the suffix has to spare. Files are tagged `_anchor`. `--no_anchor`/`-na` is the default and is accepted as a no-op. |
@@ -920,6 +961,11 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--min_capability` | `-mcap` | float | `0.2` | Fraction of clean tasks a surrogate rung must solve for `--surrogate_factor auto` to accept it. It no longer gates the run. |
 | `--skip_capability_check` | `-scc` | flag | off | Do not stop the run when the capability probe fails. Per-task exclusion of tasks the collapsed model already gets wrong still applies. |
 | `--attack_gpus` | `-ag` | int | `0` | GPUs to shard the search over. `0` uses every visible one, `1` keeps it in this process. See [Sharding the search](#sharding-the-search-over-the-gpus). |
+| `--also_greedy` | `-vg` | flag | off | Read the greedy verdict (`-vt 0`) next to the sampled one in every behavioural check and write both result files from this one search. The search is the same either way (verification has its own RNG stream and greedy decoding draws nothing), so the two files are what a sampled run and a greedy run of the cell write, for one search plus one extra decode per model per check. Needs a sampled verification; refused with `--stop_on_success` and `--random_control_trials`. `run_paper.sh` uses it whenever `VERDICTS` lists both. |
+| `--no_share_base_forward` | | flag | sharing on | In logit transfer mode the hold baseline is the surrogate's own base module, so its candidate losses are read off the forward the surrogate runs anyway (a third of the candidate scoring under the sink objective, a quarter under the default one). Bit-identical to the separate forward; this flag restores the separate one. |
+| `--check_shared_forward` | | flag | off | Instead of searching, evaluate one candidate batch of the first attackable task with the shared base forward on and off and exit non-zero unless every objective term and the gradient are `torch.equal`. |
+
+Every figure in the repo draws from the Nord palette in `utils/nord.py` (roles, ordinal ramps, colormaps and the shared `apply_style`); `PLOT_THEME=dark` in the environment draws the same figures with a transparent background and white ink for a dark slide, and `run_paper.sh` takes `PLOTS_DIR` and `LOG_DIR` from the environment so that set can live beside the paper's (`PLOT_THEME=dark PLOTS_DIR=$ROOT/plots_dark LOG_DIR=/tmp/dark_logs ./run_paper.sh --phases plots --force --yes`). `run_paper_tables.py` turns a finished grid's result files into the write-up's tables — utility, the token-distribution curves (`run_distribution_collapse.py`), the hit-rate grids per suite and verdict (percent of attackable targets broken, per generation), the lineage comparison of those rates (`tables_<size>_rates_*`, per method and pooled), surrogate quality, the sink screen, and the surrogate calibration behind `--calibration` — as figures under `plots/tables_<size>_*` and as markdown; both paper scripts run it in their plots phase.
 | `--seed` | `-s` | int | `1337` | RNG seed. |
 
 ### Sharding the search over the GPUs
@@ -957,7 +1003,11 @@ Two consequences worth knowing:
   had consumed. Every unit now seeds that stream from `(seed, task, restart)`, which makes a
   trajectory a property of its unit: a sharded run and an `-ag 1` run produce **identical** suffixes,
   and so do two runs that select different subsets of the tasks. Results from before this are not
-  comparable candidate-for-candidate.
+  comparable candidate-for-candidate. The same holds for the **sampled verdicts** since
+  2026-10-28: the verification RNG stream is seeded per unit too, so a unit's sampled draws no
+  longer depend on which process ran it or on what ran before it there (before that, an `-ag 1`
+  run and a sharded run of one search could disagree on a sampled verdict while agreeing on
+  every suffix). Sampled files from before that date are the per-process realization.
 * per-GPU memory is **unchanged** — every worker holds the whole model set — so this makes a run
   faster, not larger.
 

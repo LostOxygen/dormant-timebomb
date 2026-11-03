@@ -41,27 +41,21 @@ import re
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 
+from utils import nord
 from utils.colors import TColors
 from utils.models import add_model_arguments, resolve_model_specifier
 from utils.naming import ANCHOR_TAG, entropy_tag, factor_mode_tag, mixture_tag
 
-# from the palette run_baseline.py plots with (Tableau's colorblind-safe ten). Verified for this
-# pair rather than assumed: OKLab dE is 37.9 at normal vision and 38.2 / 29.5 / 33.7 under
-# simulated deuteranopia / protanopia / tritanopia, against a target of 8
-SERIES_COLORS: dict[str, str] = {
-    "none": "#006BA4",  # dark blue — direct attack on the real checkpoint
-    "logit": "#FF800E",  # orange — the logit surrogate
-    "lora": "#A9373B",  # dark red — the weight-space surrogate, only when asked for
-}
+# the method colours every figure shares (utils/nord.py): blue for the direct attack on the real
+# checkpoint, orange for the logit surrogate, red for the weight-space one
+SERIES_COLORS: dict[str, str] = dict(nord.METHOD_COLORS)
 # the per-target matrix, mirroring run_vuln_plots.OUTCOME_COLORS so the correctness and the
 # vulnerability grids read the same way. The two exclusions are opposites and must not be pooled:
 # a broken target means a wrong answer would measure collapse rather than the attack, a broken
 # baseline means there was no correct answer to flip
 OUTCOME_COLORS: dict[str, str] = {
-    "hit": "#006BA4",
-    "no-hit": "#D9D9D9",
-    "baseline-broken": "#FFBC79",
-    "target-broken": "#595959",
+    key: nord.OUTCOME_COLORS[key]
+    for key in ("hit", "no-hit", "baseline-broken", "target-broken")
 }
 OUTCOME_LABELS: dict[str, str] = {
     "hit": "wrong code elicited",
@@ -74,9 +68,9 @@ SERIES_LABELS: dict[str, str] = {
     "logit": "logit surrogate",
     "lora": "lora surrogate",
 }
-MARKERS: dict[str, str] = {"none": "o", "logit": "s", "lora": "^"}
-GATE_SHADE: str = "#ABABAB"
-CAPABILITY_COLOR: str = "#595959"
+MARKERS: dict[str, str] = dict(nord.METHOD_MARKERS)
+GATE_SHADE: str = nord.NORD4
+CAPABILITY_COLOR: str = nord.ANCHOR
 
 
 def result_file(
@@ -343,27 +337,9 @@ def style(usetex: bool) -> None:
     Returns:
         None
     """
-    mpl.rcParams.update(
-        {
-            "text.usetex": usetex,
-            "text.latex.preamble": r"\usepackage{bm}",
-            "font.family": "serif",
-            "font.serif": ["Times"],
-            "font.size": 18,
-            "axes.labelsize": 18,
-            "axes.labelweight": "bold",
-            "axes.titlesize": 18,
-            "axes.titleweight": "bold",
-            "legend.fontsize": 14,
-            "xtick.labelsize": 15,
-            "ytick.labelsize": 15,
-            "xtick.major.width": 2,
-            "ytick.major.width": 2,
-            "axes.grid": True,
-            "grid.alpha": 0.3,
-            "pdf.compression": 9,
-        }
-    )
+    # the shared Nord style (utils/nord.py), at this figure's font size
+    nord.apply_style(usetex, font_size=18)
+    mpl.rcParams.update({"legend.fontsize": 14, "xtick.labelsize": 15, "ytick.labelsize": 15})
 
 
 def plot_target_matrix(
@@ -414,7 +390,7 @@ def plot_target_matrix(
                 )
                 if entry["outcome"] == "hit":
                     axis.text(x, y, str(entry["n_hits"]), ha="center", va="center",
-                              color="white", fontsize=11)
+                              color=nord.OUTCOME_TEXT["hit"], fontsize=11)
         axis.set_xlim(-0.5, len(shown) - 0.5)
         axis.set_ylim(len(targets) - 0.5, -0.5)
         axis.set_xticks(range(len(shown)))
@@ -534,7 +510,7 @@ def plot(
 
     for axis in (top, bottom):
         for spine in axis.spines.values():
-            spine.set_color("black")
+            spine.set_color(nord.TEXT)
 
     figure.tight_layout()
     os.makedirs(os.path.dirname(plot_stem) or ".", exist_ok=True)

@@ -242,10 +242,14 @@ fi
 # read back out of the passthrough and turned into the tag by utils.naming — the same function
 # run_attack.py names the file with. The last occurrence wins, matching argparse
 SURROGATE_FACTOR=""
+# and whether the run writes the greedy verdict's file next to the sampled one (--also_greedy):
+# then a generation is "already done" only when both files exist
+ALSO_GREEDY=0
 for (( i = 0; i < ${#EXTRA_ARGS[@]}; i++ )); do
     case "${EXTRA_ARGS[i]}" in
         -sf|--surrogate_factor)     SURROGATE_FACTOR="${EXTRA_ARGS[i+1]:-}" ;;
         -sf=*|--surrogate_factor=*) SURROGATE_FACTOR="${EXTRA_ARGS[i]#*=}" ;;
+        -vg|--also_greedy)          ALSO_GREEDY=1 ;;
     esac
 done
 FACTOR_TAG=""
@@ -268,6 +272,10 @@ if ! DECODING_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
 from utils.naming import verification_tag_from_argv
 print(verification_tag_from_argv(sys.argv[1:]))' "${EXTRA_ARGS[@]}")"; then
     echo "error: could not resolve the verification tag from the passthrough arguments" >&2
+    exit 2
+fi
+if (( ALSO_GREEDY )) && [[ -z "$DECODING_TAG" ]]; then
+    echo "error: --also_greedy needs a sampled verification; this sweep is greedy (-vt 0)" >&2
     exit 2
 fi
 # the fifth tag: whether the generation-0 anchor is a condition of the hit. Same mechanism; it is
@@ -325,6 +333,9 @@ if [[ -n "$FACTOR_TAG" ]]; then
 fi
 if [[ -n "$DECODING_TAG" ]]; then
     echo "##   verification : sampled, files tagged $DECODING_TAG"
+    if (( ALSO_GREEDY )); then
+        echo "##                  plus the greedy verdict of the same search, in the untagged file"
+    fi
 else
     echo "##   verification : greedy (untagged result files)"
 fi
@@ -390,10 +401,12 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
         run_method="none"
         result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}.json"
+        greedy_result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}.json"
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
         result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate.json"
+        greedy_result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate.json"
         factor_label="n = $((gen + 1))"
         if [[ -n "$FACTOR_TAG" ]]; then
             factor_label="n from -sf $SURROGATE_FACTOR, at most $((gen + 1))"
@@ -413,7 +426,15 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     echo
     echo "== $label =="
 
-    if [[ -f "$result_file" ]] && (( FORCE == 0 )); then
+    done_already=0
+    if [[ -f "$result_file" ]]; then
+        done_already=1
+        # a merged run is done only when the greedy twin is on disk too
+        if (( ALSO_GREEDY )) && [[ ! -f "$greedy_result_file" ]]; then
+            done_already=0
+        fi
+    fi
+    if (( done_already )) && (( FORCE == 0 )); then
         echo "   already done: $result_file (pass --force to re-run)"
         STATUS_GENS+=("$gen")
         STATUS_CODES+=("cached")

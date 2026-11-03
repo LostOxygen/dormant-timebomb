@@ -35,6 +35,7 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 
+from utils import nord
 from utils.colors import TColors
 from utils.naming import default_run_tag, find_run_tag
 from utils.plotting import (
@@ -59,10 +60,8 @@ PLOTS_PATH: str = "./plots/"
 # coloured apart on purpose: one means the pristine model is already insecure, the other that the
 # collapsed model no longer writes classifiable code
 OUTCOME_COLORS: dict = {
-    "hit": GENERATION_COLORS[0],
-    "no-hit": GENERATION_COLORS[3],
-    "baseline-insecure": GENERATION_COLORS[8],
-    "collapsed-broken": GENERATION_COLORS[4],
+    key: nord.OUTCOME_COLORS[key]
+    for key in ("hit", "no-hit", "baseline-insecure", "collapsed-broken")
 }
 OUTCOME_LABELS: dict = {
     "hit": "insecure code elicited",
@@ -72,14 +71,12 @@ OUTCOME_LABELS: dict = {
 }
 
 
-def mixture_colors(count: int) -> list:
-    """A sequential palette for the real-data mixture, which is an *ordered* variable.
-
-    GENERATION_COLORS is categorical and its first entries are two near-identical blues, so a
-    ten-value mixture sweep drawn from it is unreadable. viridis also matches the heatmap the
-    mixture figure puts beside these lines, so the same fraction is the same colour in both panels.
-    """
-    return [plt.cm.viridis(value) for value in np.linspace(0.05, 0.9, max(count, 1))]
+def mixture_colors(mixtures: list) -> list:
+    """One colour per real-data mixture, in the order given: an *ordered* variable, so the
+    frost ramp (utils.nord.mixture_colors), with the non-collapsing control at 1.0 in the
+    reference grey. The same mapping every figure of the repo uses for a mixture."""
+    mapping = nord.mixture_colors([float(m) for m in mixtures])
+    return [mapping[float(m)] for m in mixtures]
 
 
 def escape(text: str, usetex: bool) -> str:
@@ -124,9 +121,16 @@ def run_suffix(args) -> str:
 
 
 def stem(args, figure: str, tag: str = "") -> str:
-    """Output path of a figure, following the repo's artifact naming."""
+    """Output path of a figure, following the repo's artifact naming.
+
+    With ``-msn`` the model's specifier name follows the block size, as every other per-model
+    artifact spells it (``bs512_Qwen2.5-Coder-0.5B-Instruct``); without it the figures pool the
+    models into panels and carry no size, so two sizes drawn one after the other would otherwise
+    overwrite each other's files.
+    """
+    model = f"_{args.model_specifier_name}" if args.model_specifier_name else ""
     return os.path.join(
-        args.plots_path, f"vuln_{figure}_bs{args.block_size}{tag}{run_suffix(args)}"
+        args.plots_path, f"vuln_{figure}_bs{args.block_size}{model}{tag}{run_suffix(args)}"
     )
 
 
@@ -149,8 +153,8 @@ def figure_attack_success(records: list, args) -> list:
 
     for column, model in enumerate(models):
         top, bottom = axes[0][column], axes[1][column]
-        palette = mixture_colors(len(mixtures))
-        markers = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+        palette = mixture_colors(mixtures)
+        markers = list(nord.MARKERS)
         for index, mixture in enumerate(mixtures):
             rows = sorted(
                 (r for r in direct if r.specifier_name == model
@@ -215,7 +219,7 @@ def figure_target_matrix(records: list, args) -> list:
                 )
                 if task.hit:
                     axis.text(x, y, str(task.n_success), ha="center", va="center",
-                              color="white", fontsize=13)
+                              color=nord.OUTCOME_TEXT["hit"], fontsize=13)
         axis.set_xlim(-0.5, len(rows) - 0.5)
         axis.set_ylim(len(targets) - 0.5, -0.5)
         axis.set_xticks(range(len(rows)))
@@ -449,13 +453,13 @@ def figure_rdf_window(records: list, args) -> list:
 
     figure, axes = plt.subplots(1, 2, figsize=(16, 1.0 * len(mixtures) + 3.5),
                                 gridspec_kw={"width_ratios": [3, 2]})
-    image = axes[0].imshow(grid, aspect="auto", cmap="viridis", vmin=0, vmax=1,
+    image = axes[0].imshow(grid, aspect="auto", cmap=nord.sequential_cmap(), vmin=0, vmax=1,
                            origin="lower")
     for row in range(len(mixtures)):
         for column in range(len(generations)):
             if not np.isnan(grid[row][column]):
                 axes[0].text(column, row, f"{grid[row][column]:.2f}", ha="center",
-                             va="center", color="white", fontsize=12)
+                             va="center", color=nord.text_on(grid[row][column]), fontsize=12)
     axes[0].set_xticks(range(len(generations)))
     axes[0].set_xticklabels(generations)
     axes[0].set_yticks(range(len(mixtures)))
@@ -466,8 +470,8 @@ def figure_rdf_window(records: list, args) -> list:
     axes[0].grid(False)
     figure.colorbar(image, ax=axes[0], fraction=0.046)
 
-    palette = mixture_colors(len(mixtures))
-    markers = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+    palette = mixture_colors(mixtures)
+    markers = list(nord.MARKERS)
     for index, mixture in enumerate(mixtures):
         axes[1].plot(generations, counts[index], marker=markers[index % len(markers)],
                      markersize=7, linewidth=2.5, color=palette[index], label=f"{mixture:.0%}")

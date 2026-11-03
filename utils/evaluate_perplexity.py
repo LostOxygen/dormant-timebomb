@@ -69,6 +69,7 @@ import matplotlib.pyplot as plt
 import torch
 from datasets import load_dataset
 
+from utils import nord
 from utils.colors import TColors
 from utils.extrapolation import extrapolate_logits, factor_calibration_file
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
@@ -981,7 +982,7 @@ def calibration_figure(payload: dict, plot_stem: str, usetex: bool) -> None:
                 note, xy=(0.98, 0.06), xycoords="axes fraction", ha="right", fontsize=14
             )
         for spine in scaled_axis.spines.values():
-            spine.set_color("black")
+            spine.set_color(nord.TEXT)
 
     fitted = {int(key): value for key, value in calibration["factors"].items()}
     generations = sorted(fitted)
@@ -1026,7 +1027,7 @@ def calibration_figure(payload: dict, plot_stem: str, usetex: bool) -> None:
             fontweight="bold",
         )
     for spine in factor_axis.spines.values():
-        spine.set_color("black")
+        spine.set_color(nord.TEXT)
 
     save_figure(figure, plot_stem)
 

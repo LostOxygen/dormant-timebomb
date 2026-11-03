@@ -6,6 +6,7 @@ import argparse
 import datetime
 import getpass
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -20,7 +21,14 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import gen_zero_tag, generation_label, mixture_suffix, mixture_tag
+from utils.naming import (
+    DEFAULT_REPETITION_PENALTY,
+    gen_zero_tag,
+    generation_label,
+    mixture_suffix,
+    mixture_tag,
+    penalty_tag,
+)
 from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 
@@ -155,6 +163,7 @@ def main(
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
+    repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
     gradient_accumulation_steps: int = 4,
     load_in_4bit: bool = False,
     gradient_checkpointing: bool = False,
@@ -326,7 +335,11 @@ def main(
     # the generation-0 data rule sits between the two for the same reason the weight lineage
     # does: it changes every checkpoint from generation 0 up without reaching their names
     gen0_suffix = gen_zero_tag(human_generation_zero)
-    run_suffix = f"{init_suffix}{gen0_suffix}{data_suffix}"
+    # and the generation decoding's repetition penalty last, for the same reason: it changes
+    # every corpus and therefore every checkpoint from generation 0 up without reaching their
+    # names. Empty at the default, so existing roots keep their names
+    penalty_suffix = penalty_tag(repetition_penalty)
+    run_suffix = f"{init_suffix}{gen0_suffix}{data_suffix}{penalty_suffix}"
     # the checkpoint and corpus names do not carry the weight lineage, so a fresh-init run in a
     # root that already holds a recursive lineage of the same mixture would overwrite its
     # checkpoints while the recursive perplexity cache kept describing them. Refuse, unless this
@@ -334,28 +347,43 @@ def main(
     # the same holds for the generation-0 data rule: a mixed and a human-only generation 0 write
     # the same checkpoint names (identical ones at -rdf 0), so one root holds one rule
     other_lineages = {
-        ("_freshinit" if recursive_init else "_recursive") + gen0_suffix + data_suffix:
+        ("_freshinit" if recursive_init else "_recursive") + gen0_suffix + data_suffix
+        + penalty_suffix:
             f"{'fresh-init' if recursive_init else 'recursive'} lineage for this mixture",
-        init_suffix + gen_zero_tag(not human_generation_zero) + data_suffix:
+        init_suffix + gen_zero_tag(not human_generation_zero) + data_suffix + penalty_suffix:
             f"{'mixed' if human_generation_zero else 'human-only'} generation-0 lineage for "
             f"this mixture",
     }
+    # and this lineage sampled under another repetition penalty: any _rp tag (or none) other
+    # than this run's on the lineage's cache name
+    lineage_stem = (
+        f"all_perplexities_bs{block_size}_{specifier_name}{init_suffix}{gen0_suffix}{data_suffix}"
+    )
+    for cache_name in os.listdir(DATASET_PATH) if os.path.isdir(DATASET_PATH) else []:
+        match = re.fullmatch(re.escape(lineage_stem) + r"(_rp[0-9.]+)?\.pt", cache_name)
+        if match and (match.group(1) or "") != penalty_suffix:
+            other_penalty = match.group(1)[3:] if match.group(1) else f"{DEFAULT_REPETITION_PENALTY:g}"
+            other_lineages[cache_name[len("all_perplexities_bs"):]] = (
+                f"lineage for this mixture sampled with repetition penalty {other_penalty}"
+            )
     for other_suffix, what in other_lineages.items():
         other_cache = (
-            DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{other_suffix}.pt"
+            os.path.join(DATASET_PATH, "all_perplexities_bs" + other_suffix)
+            if other_suffix.endswith(".pt")
+            else DATASET_PATH + f"all_perplexities_bs{block_size}_{specifier_name}{other_suffix}.pt"
         )
         if not skip_training and os.path.exists(other_cache):
             raise SystemExit(
                 f"{TColors.FAIL}{DATASET_PATH} already holds a {what}{TColors.ENDC} "
-                f"({other_cache}). The checkpoint names carry neither the weight lineage nor "
-                f"the generation-0 rule, so this run would overwrite those models. Use another "
-                f"--path, or the matching --recursive_init / --human_generation_zero to "
-                f"continue that lineage."
+                f"({other_cache}). The checkpoint names carry neither the weight lineage, the "
+                f"generation-0 rule nor the repetition penalty, so this run would overwrite "
+                f"those models. Use another --path, or the matching --recursive_init / "
+                f"--human_generation_zero / --repetition_penalty to continue that lineage."
             )
     # no underscores or backslashes: usetex renders the title, and a bare % is a LaTeX comment
     run_label = f"{init_label}, real data fraction {real_data_fraction:g}" + (
         ", human-only generation 0 (ablation)" if human_generation_zero else ""
-    )
+    ) + (f", repetition penalty {repetition_penalty:g}" if penalty_suffix else "")
 
     # allow tf32 for the matmuls of the training stage. The L40S' tensor cores run tf32 at
     # multiples of the fp32 rate and this only affects the fp32 fallbacks, not the bf16 path
@@ -522,7 +550,10 @@ def main(
     print(
         f"## {TColors.OKBLUE}{TColors.BOLD}Sampling{TColors.ENDC}: temperature {temperature:g}, "
         f"top-p {top_p:g}, top-k {top_k} "
-        f"({'untruncated' if top_p >= 1.0 and top_k < 0 else 'truncated, drives collapse'})"
+        f"({'untruncated' if top_p >= 1.0 and top_k < 0 else 'truncated, drives collapse'}), "
+        f"repetition penalty {repetition_penalty:g}"
+        + (" (the default; Qwen2.5 ships 1.05, 1.0 disables it)"
+           if not penalty_tag(repetition_penalty) else " (tagged _rp in the run-level names)")
     )
     # printed because unsloth silently rewrites CUDA_VISIBLE_DEVICES to a single device at import,
     # which used to collapse this list to [0] without any sign of it in the output
@@ -624,6 +655,8 @@ def main(
                         str(top_p),
                         "--top_k",
                         str(top_k),
+                        "--repetition_penalty",
+                        str(repetition_penalty),
                         "--path",
                         str(path),
                         "--seed",
@@ -1197,6 +1230,18 @@ if __name__ == "__main__":
         default=20,
         help="top-k sampling cutoff of the dataset generation, -1 disables it (default: 20, "
         "Qwen2.5's own value)",
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        "-rp",
+        type=float,
+        default=DEFAULT_REPETITION_PENALTY,
+        help="repetition penalty of the dataset generation, pinned on both engines. 1.0 disables "
+        "it, Qwen2.5 ships 1.05. It reaches the run-level artifact names as _rp{value} when it "
+        "is not the default, and one root holds one value: the checkpoint names do not carry "
+        "it, so a run at another value is refused in a root that already holds this lineage "
+        f"(default: {DEFAULT_REPETITION_PENALTY:g}; see utils/generate_dataset.py for the "
+        "measurements behind it)",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",

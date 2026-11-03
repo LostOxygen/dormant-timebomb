@@ -61,7 +61,7 @@ import torch
 
 from utils.colors import TColors
 from utils.models import resolve_model_specifier
-from utils.naming import generation_label, mixture_suffix
+from utils.naming import DEFAULT_REPETITION_PENALTY, generation_label, mixture_suffix
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
@@ -89,7 +89,7 @@ MIN_NEW_TOKENS: int = 128
 # the decoding before recursive training had done anything, and generations 1..9 then only fell
 # from 10.5% to 1.5%. That made the models lose code generation within two generations, which
 # leaves run_attack.py's capability gate nothing to attack.
-REPETITION_PENALTY: float = 1.2
+REPETITION_PENALTY: float = DEFAULT_REPETITION_PENALTY   # the default of --repetition_penalty
 
 
 def format_prompts(instructions: list, tokenizer) -> list:
@@ -182,7 +182,7 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
         # grows with every generation, so the distortion is not a constant offset across the
         # collapse trend. Keep it identical in every generation path or the histograms stop being
         # comparable
-        repetition_penalty=REPETITION_PENALTY,
+        repetition_penalty=repetition_penalty,
         min_tokens=MIN_NEW_TOKENS,
         max_tokens=block_size,
         # vLLM returns only the continuation, so unlike the transformers path there is no prompt
@@ -307,7 +307,7 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
                 temperature=temperature,
                 top_p=top_p,
                 top_k=top_k,
-                repetition_penalty=REPETITION_PENALTY,
+                repetition_penalty=repetition_penalty,
                 min_new_tokens=MIN_NEW_TOKENS,
                 max_new_tokens=block_size,
                 use_cache=True,
@@ -444,6 +444,15 @@ if __name__ == "__main__":
         "(default: 20, Qwen2.5's own value)",
     )
     parser.add_argument(
+        "--repetition_penalty",
+        "-rp",
+        type=float,
+        default=REPETITION_PENALTY,
+        help="repetition penalty of the generation, the same on both engines. 1.0 disables it; "
+        "Qwen2.5 ships 1.05. See REPETITION_PENALTY for the measurements behind the default "
+        f"(default: {REPETITION_PENALTY:g})",
+    )
+    parser.add_argument(
         "--path",
         "-p",
         type=str,
@@ -482,6 +491,7 @@ if __name__ == "__main__":
     temperature = args.temperature
     top_p = args.top_p
     top_k = args.top_k
+    repetition_penalty = args.repetition_penalty
     path = args.path
     real_data_fraction = args.real_data_fraction
 

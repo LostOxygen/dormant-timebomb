@@ -97,6 +97,9 @@ SINK_CAP="${SINK_CAP:-0}"
 
 # Survival phase: the temperature curve, and how many samples each point averages.
 TEMPERATURES="${TEMPERATURES:-0,0.3,0.5,0.7,1.0}"
+# the generation repetition penalty of every collapse and extrapolation run (1.2 = repo default,
+# 1.05 = Qwen2.5's own, 1.0 = off); a non-default value needs its own roots
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
 SURVIVAL_SAMPLES="${SURVIVAL_SAMPLES:-16}"
 TRAJECTORY_EVERY="${TRAJECTORY_EVERY:-10}"
 
@@ -354,7 +357,8 @@ preflight() {
     fi
 
     for script in run_attack_sweep.sh run_vuln_eval.sh run_baseline.py run_margin.py \
-                  run_attack_vuln.py run_vuln_plots.py utils/survival_sweep.py; do
+                  run_attack_vuln.py run_vuln_plots.py run_paper_tables.py utils/survival_sweep.py \
+                  run_distribution_collapse.py; do
         [[ -e "$script" ]] || { echo "error: missing $script" >&2; problems=1; }
     done
 
@@ -371,8 +375,8 @@ phase_collapse() {
         wants_lineage "$name" || continue
         run "collapse_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_baseline.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" \
-            -rdf "$rdf" -tp "$temp" -tpp "$top_p" -tpk "$top_k" -sd "$seed" -p "$path" \
-            $(init_flag "$init") $(gen0_flag "$init")
+            -rdf "$rdf" -tp "$temp" -tpp "$top_p" -tpk "$top_k" -rp "$REPETITION_PENALTY" -sd "$seed" \
+            -p "$path" $(init_flag "$init") $(gen0_flag "$init")
     done
 }
 
@@ -388,6 +392,9 @@ phase_utility() {
         run "correctness_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_correctness \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" -rdf "$rdf" -p "$path" \
             $(gen0_flag "$init") $(usetex_flag_py)
+        run "distribution_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" run_distribution_collapse.py \
+            -n "$GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" -rdf "$rdf" -p "$path" \
+            -pp "$path/plots" --resume $(gen0_flag "$init") $(usetex_flag_py)
     done
 }
 
@@ -399,7 +406,7 @@ phase_extrapolation() {
         [[ "$name" == "$PRIMARY" ]] || continue   # one cell is enough for the surrogate figure
         run "extrapolation_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_extrapolation.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" -rdf "$rdf" \
-            -tp "$temp" -tpp "$top_p" -tpk "$top_k" -m logit -p "$path"
+            -tp "$temp" -tpp "$top_p" -tpk "$top_k" -rp "$REPETITION_PENALTY" -m logit -p "$path"
     done
 }
 
@@ -594,6 +601,32 @@ phase_plots() {
     else
         echo "   plots_margin skipped: no margin_*.json under $RESULTS_DIR (run --phases margin)"
     fi
+
+    # the result tables (run_paper_tables.py): one set per root in scope, over the mixtures
+    # that root holds, under that root's weight lineage and generation-0 rule. This script's
+    # sweeps hold the anchor and run the plain variant only, so the tables are read that way
+    local -a table_roots=()
+    local -A table_mixtures table_init
+    for record in "${LINEAGES[@]}"; do
+        IFS='|' read -r name path rdf _t _p _k _s init _desc <<< "$record"
+        wants_lineage "$name" || continue
+        if [[ -z "${table_mixtures[$path]+x}" ]]; then
+            table_roots+=("$path"); table_mixtures[$path]=""; table_init[$path]="$init"
+        fi
+        table_mixtures[$path]+=" $rdf"
+    done
+    for path in "${table_roots[@]}"; do
+        if [[ ! -d "$path/attack_results" ]]; then
+            skip "plots_tables_$(basename "$path")" "no attack results under $path yet"
+            continue
+        fi
+        # shellcheck disable=SC2046,SC2086
+        run "plots_tables_$(basename "$path")" "$PYTHON" run_paper_tables.py -p "$path" \
+            -pp "$path/plots" -msz "$MODEL_SIZE" --mixtures ${table_mixtures[$path]} \
+            -n "$GENERATIONS" -bs "$BLOCK_SIZE" --variants plain -ha \
+            $(init_flag "${table_init[$path]}") $(gen0_flag "${table_init[$path]}") \
+            $(usetex_flag_py)
+    done
 
     # the decoding-variant roots keep their own attack_results/ and plots/
     for record in "${LINEAGES[@]}"; do

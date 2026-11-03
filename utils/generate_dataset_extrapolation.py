@@ -49,7 +49,7 @@ from transformers import (
 
 from utils.colors import TColors
 from utils.models import DEFAULT_MODEL_SPECIFIER
-from utils.naming import mixture_suffix
+from utils.naming import DEFAULT_REPETITION_PENALTY, mixture_suffix
 from utils.extrapolation import (
     METHODS,
     dataset_suffix,
@@ -65,7 +65,7 @@ MODEL_PATH: str = "./model_outputs/"
 # See utils/generate_dataset.py for the measurements behind the value: at 3.0 the penalty stops the
 # model reusing identifiers it has already written and only 7.8% of responses still compile,
 # against 96.9% at 1.2 and 100% for the human corpus
-REPETITION_PENALTY: float = 1.2
+REPETITION_PENALTY: float = DEFAULT_REPETITION_PENALTY   # the default of --repetition_penalty
 
 class UnslothExtrapolationProcessor(LogitsProcessor):
     def __init__(self, model_collapsed, generation_n: float, prompt_attention_mask: torch.Tensor):
@@ -276,6 +276,14 @@ parser.add_argument(
     "(default: 20, Qwen2.5's own value)",
 )
 parser.add_argument(
+    "--repetition_penalty",
+    "-rp",
+    type=float,
+    default=REPETITION_PENALTY,
+    help="repetition penalty of the generation; has to match the run_baseline.py run this stage "
+    f"is compared against. 1.0 disables it (default: {REPETITION_PENALTY:g})",
+)
+parser.add_argument(
     "--real_data_fraction",
     "-rdf",
     type=float,
@@ -321,6 +329,7 @@ surrogate_p1 = args.surrogate_top_p
 temperature = args.temperature
 top_p = args.top_p
 top_k = args.top_k
+repetition_penalty = args.repetition_penalty
 real_data_fraction = args.real_data_fraction
 human_generation_zero = args.human_generation_zero
 load_in_4bit = args.load_in_4bit
@@ -529,14 +538,14 @@ for start in tqdm(
                     generation_n=generation_n,
                     prompt_attention_mask=inputs["attention_mask"],
                 ),
-                RepetitionPenaltyLogitsProcessor(penalty=REPETITION_PENALTY),
+                RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty),
             ]
         )
         sampling_kwargs["repetition_penalty"] = 1.0
     else:
         # no extrapolation processor is involved, so there is nothing the built-in penalty could be
         # cancelled by and it can be left to generate() as usual
-        sampling_kwargs["repetition_penalty"] = REPETITION_PENALTY
+        sampling_kwargs["repetition_penalty"] = repetition_penalty
         if method == "data":
             # the whole method *is* the truncation of the sampling support, so its schedule
             # replaces the pipeline's top_p instead of composing with it — which also matches

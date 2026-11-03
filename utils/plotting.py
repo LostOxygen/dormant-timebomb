@@ -6,11 +6,16 @@ utils/evaluate_perplexity.py plots the train and the validation slice of the hum
 three go through plot_perplexity_figure, so the figures stay comparable — a change to the panel
 arrangement, the palette or the axis scales lands in all of them at once.
 
-Every figure has the same two panels: the per-sample **histogram** on top, which is the shape of
-the distribution, and the **median per generation** below it, which is that shape reduced to one
-number per generation so the trend is readable. They share nothing but the data — the top panel's
-x-axis is perplexity, the bottom one's is the generation index — so they are deliberately not
-`sharex`.
+Every figure is one panel: the per-sample **histogram**, one step curve per generation, which is
+the shape of the distribution and how it deforms over the collapse (a growing right tail, a mode
+that walks). The **median per generation** used to sit below it as a second panel and was dropped
+on 2026-11-03 — the medians are in the callers' caches and in run_paper_tables.py's utility
+figure, which reads them per lineage. `MedianSeries` and `draw_median_panel` stay here for a
+caller that wants that panel on its own axes; `plot_perplexity_figure` no longer draws it and
+accepts its old `extra_series` / `anchor` / `median_ylabel` arguments as no-ops.
+
+The histograms wear their own palette, `nord.perplexity_colors` (Tableau's colour-blind six as an
+ordinal ramp, blue to orange with the collapse); everything else in the repo keeps the Nord roles.
 
 Why the drawing is here and not in utils/evaluate_perplexity.py, which is the module that owns the
 perplexity evaluation: that module imports unsloth at the top, before torch and transformers,
@@ -29,35 +34,24 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 
+from utils import nord
 from utils.colors import TColors
 
 # lower y-limit of the histogram panel. Everything below it is invisible, so it doubles as the
 # threshold visible_perplexity_range() uses to decide where to cut the x-axis
 Y_LIMIT_LOWER: float = 1e-5
 
-# one colour per generation, dark blue -> light blue -> gray -> orange -> dark red, so the reading
-# order of the histograms matches the collapse. Colourblind safe, and there are eleven of them for
-# ten generations on purpose: the eleventh is the spare a longer run takes before the cycle wraps
-GENERATION_COLORS: list = [
-    "#2369BD",  # darker blue
-    "#006BA4",  # dark blue
-    "#5F9ED1",  # light blue
-    "#A2C8EC",  # very light blue
-    "#ABABAB",  # gray
-    "#898989",  # dark gray
-    "#898989",  # darker gray
-    "#FFBC79",  # light orange
-    "#FF800E",  # orange
-    "#C85200",  # dark orange
-    "#A9373B",  # dark red
-]
+# one colour per generation. The histogram panel draws from PERPLEXITY_COLORS, the perplexity
+# figures' own ramp (blue to orange with the collapse, see utils/nord.py); GENERATION_COLORS is
+# the Nord frost ramp the other figures that import it from here keep (run_vuln_plots.py).
+# Eleven for ten generations on purpose: the eleventh is the spare a longer run takes
+GENERATION_COLORS: list = nord.generation_colors(11)
+PERPLEXITY_COLORS: list = nord.perplexity_colors(11)
 
-# the median panel's two curves and its reference line, in the same palette. Verified rather than
-# assumed: OKLab dE 37.9 at normal vision, 38.2 / 29.5 / 33.7 under simulated deuteranopia /
-# protanopia / tritanopia, against a target of 8
-BASELINE_COLOR: str = "#006BA4"
-SURROGATE_COLOR: str = "#FF800E"
-ANCHOR_COLOR: str = "#595959"
+# the median panel's two curves and its reference line: the roles every figure shares
+BASELINE_COLOR: str = nord.BASELINE
+SURROGATE_COLOR: str = nord.SURROGATE
+ANCHOR_COLOR: str = nord.ANCHOR
 
 
 @dataclass
@@ -216,29 +210,9 @@ def apply_perplexity_style(usetex: bool, font_size: float = 20) -> None:
         None
     """
     sns.set_style("whitegrid")
-    sns.set_palette(sns.color_palette(GENERATION_COLORS))
-    mpl.rcParams.update(
-        {
-            "text.usetex": usetex,
-            "text.latex.preamble": r"\usepackage{bm}",
-            "font.family": "serif",
-            "font.serif": ["Times"],
-            "font.size": font_size,
-            "font.weight": "bold",
-            "axes.labelsize": font_size,
-            "axes.labelweight": "bold",
-            "axes.titlesize": font_size,
-            "axes.titleweight": "bold",
-            "legend.fontsize": font_size - 5,
-            "xtick.labelsize": font_size - 2,
-            "ytick.labelsize": font_size - 2,
-            "xtick.major.width": 2,
-            "ytick.major.width": 2,
-            "axes.grid": True,
-            "grid.alpha": 0.3,
-            "pdf.compression": 9,
-        }
-    )
+    sns.set_palette(sns.color_palette(nord.CATEGORICAL))
+    # the Nord palette and chrome, on top of seaborn's grid style (utils/nord.py owns the rcParams)
+    nord.apply_style(usetex, font_size)
 
 
 def draw_histogram_panel(
@@ -248,7 +222,9 @@ def draw_histogram_panel(
 
     Density rather than counts, so generations of different sizes are comparable — the generated
     corpora are not all the same length — and log on both axes because the distribution spans
-    decades in x and the interesting tail is orders of magnitude below the mode in y.
+    decades in x and the interesting tail is orders of magnitude below the mode in y. The bin
+    count is fixed, so a 512-row validation set and a 50k-sample corpus are drawn at the same
+    resolution and their figures compare bin for bin.
 
     Args:
         axis: the axes to draw on
@@ -276,19 +252,21 @@ def draw_histogram_panel(
             label=label,
             element="step",
             alpha=0.4,
-            color=GENERATION_COLORS[index % len(GENERATION_COLORS)],
+            color=PERPLEXITY_COLORS[index % len(PERPLEXITY_COLORS)],
             ax=axis,
         )
 
     axis.set_xscale("log")
     axis.set_yscale("log")
     axis.set_xlim(lower_limit, upper_limit)
-    axis.set_ylim(y_limit_lower, 1)
+    # a narrow distribution over narrow bins has densities above 1, so the top follows the data
+    # where it has to; 1 stays the ceiling of the wide corpus histograms
+    axis.set_ylim(y_limit_lower, max(1.0, axis.get_ylim()[1]))
     axis.set_xlabel("Perplexity", fontweight="bold")
     axis.set_ylabel("Probability", fontweight="bold")
     axis.legend(loc="upper right")
     for spine in axis.spines.values():
-        spine.set_color("black")
+        spine.set_color(nord.TEXT)
 
     return lower_limit, upper_limit, num_clipped, num_total
 
@@ -353,7 +331,7 @@ def draw_median_panel(
         axis.set_xticks(ticks)
     axis.legend(loc="upper left")
     for spine in axis.spines.values():
-        spine.set_color("black")
+        spine.set_color(nord.TEXT)
 
 
 def save_figure(figure, plot_stem: str, show: bool = False) -> None:
@@ -390,18 +368,14 @@ def plot_perplexity_figure(
     font_size: float = 20,
     show: bool = False,
 ) -> tuple:
-    """The repo's perplexity figure: the histograms on top, the median per generation below.
+    """The repo's perplexity figure: one step histogram per generation.
 
-    The two panels are two views of the *same* numbers, which is why they belong in one figure: the
-    histogram says how the distribution deforms (a growing right tail, a mode that walks), the
-    median says how far along that deformation is at each generation. Reading one without the other
-    invites the two classic misreadings — a median that moves little while the tail explodes, or a
-    tail that looks alarming while the bulk has not moved.
-
-    `extra_series` and `anchor` exist for the callers that have more than one lineage to show on the
-    median panel (utils/evaluate_perplexity.py draws its surrogate and the un-fine-tuned base model
-    there); the histogram panel always shows `perplexity_dict` alone, because eleven colours already
-    carry the generation index and a second lineage would have to reuse them.
+    The histogram says how the distribution deforms over the collapse — a growing right tail, a
+    mode that walks. It shows `perplexity_dict` alone, because eleven colours already carry the
+    generation index and a second lineage would have to reuse them. The median panel that used to
+    sit below it was dropped on 2026-11-03; `primary_label`, `primary_color`, `extra_series`,
+    `anchor` and `median_ylabel` are accepted so that the callers did not have to change, and are
+    not drawn.
 
     Args:
         perplexity_dict (dict): label -> that generation's per-sample perplexities. The labels are
@@ -423,25 +397,10 @@ def plot_perplexity_figure(
             caller can report how much of its data the range left out
     """
     apply_perplexity_style(usetex, font_size)
+    del primary_label, primary_color, extra_series, anchor, median_ylabel  # the dropped panel's
 
-    figure, (upper, lower) = plt.subplots(
-        2, 1, figsize=(10, 11), height_ratios=[3, 2]
-    )
-
+    figure, upper = plt.subplots(1, 1, figsize=(10, 7))
     span = draw_histogram_panel(upper, perplexity_dict, y_limit_lower)
-
-    medians, band = {}, {}
-    for index, (label, perplexities) in enumerate(perplexity_dict.items()):
-        generation = generation_index(label)
-        generation = index if generation < 0 else generation
-        median, q25, q75 = quantiles(perplexities)
-        medians[generation] = median
-        band[generation] = (q25, q75)
-    primary = MedianSeries(
-        label=primary_label, medians=medians, band=band, color=primary_color, marker="o"
-    )
-    draw_median_panel(lower, [primary] + list(extra_series or []), anchor, median_ylabel)
-
     upper.set_title(title, fontweight="bold")
     save_figure(figure, plot_stem, show)
 

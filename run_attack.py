@@ -536,7 +536,10 @@ class Decoding:
 GREEDY_DECODING = Decoding()
 
 
-def judge_model(model, tokenizer, prompt: str, task, cfg, prefer_pass: bool) -> dict:
+def judge_model(
+    model, tokenizer, prompt: str, task, cfg, prefer_pass: bool,
+    decoding: Decoding | None = None,
+) -> dict:
     """Decodes `prompt` with one model under `cfg.decoding` and judges every completion.
 
     The judgement is `run_unit_tests` looked up at call time, so run_attack_vuln.py's static
@@ -549,6 +552,8 @@ def judge_model(model, tokenizer, prompt: str, task, cfg, prefer_pass: bool) -> 
         task: the `AttackTask` the completions are judged against
         cfg: the `SearchConfig` (decoding budget, penalty, decoding, exec settings)
         prefer_pass (bool): tie-breaking direction for `majority_status`
+        decoding (Decoding | None): how to decode; None takes `cfg.decoding`. `--also_greedy`
+            passes the greedy decoding here to read the second verdict off the same suffix
 
     Returns:
         dict: ``status`` (the majority), ``statuses`` (per sample), ``pass_rate``, ``wrong_rate``
@@ -556,7 +561,8 @@ def judge_model(model, tokenizer, prompt: str, task, cfg, prefer_pass: bool) -> 
             carrying the majority status
     """
     raws = model.complete_many(
-        tokenizer, prompt, cfg.max_new_tokens, cfg.repetition_penalty, cfg.decoding
+        tokenizer, prompt, cfg.max_new_tokens, cfg.repetition_penalty,
+        cfg.decoding if decoding is None else decoding,
     )
     codes = [extract_code(raw) for raw in raws]
     statuses = [
@@ -600,6 +606,20 @@ def majority_status(statuses: list[str], prefer_pass: bool) -> str:
     if prefer_pass or not non_pass:
         return "pass" if "pass" in tied else tied[0]
     return non_pass[0]
+
+
+def _token_losses(logits: Tensor, target_ids: Tensor) -> Tensor:
+    """Per-token cross-entropy of `target_ids` under `logits`, in float32. Shape (B, n_target).
+
+    The one place this is spelled out: `TargetModel.target_token_losses` and the tapped base
+    forward of `ExtrapolatedModel.candidate_token_losses_with_base` both go through it, which
+    is what makes the shared forward bit-identical to the separate one rather than merely
+    equal in exact arithmetic.
+    """
+    batch = logits.shape[0]
+    flat = logits.reshape(-1, logits.shape[-1]).float()
+    labels = target_ids.unsqueeze(0).expand(batch, -1).reshape(-1)
+    return F.cross_entropy(flat, labels, reduction="none").view(batch, -1)
 
 
 class TargetModel:
@@ -658,11 +678,7 @@ class TargetModel:
         The sink-conditional objective reads individual positions out of this (the shared prefix,
         the diverging span); the default objective takes its mean.
         """
-        logits = self._tail_logits(embeds, target_ids.numel())
-        batch = logits.shape[0]
-        flat = logits.reshape(-1, logits.shape[-1]).float()
-        labels = target_ids.unsqueeze(0).expand(batch, -1).reshape(-1)
-        return F.cross_entropy(flat, labels, reduction="none").view(batch, -1)
+        return _token_losses(self._tail_logits(embeds, target_ids.numel()), target_ids)
 
     def target_losses(self, embeds: Tensor, target_ids: Tensor) -> Tensor:
         """Per-sequence mean cross-entropy of `target_ids`. Returns shape (B,)."""
@@ -710,6 +726,19 @@ class TargetModel:
         grad = torch.autograd.grad(loss, [one_hot])[0]
         return loss.detach().float().item(), grad.detach().float()
 
+    def _candidate_embeds(self, chunk: Tensor, seg: Segments) -> Tensor:
+        """The input embeddings of one chunk of candidate suffixes between the fixed parts."""
+        n = chunk.shape[0]
+        return torch.cat(
+            [
+                seg.before.expand(n, -1, -1),
+                self.embed_ids(chunk),
+                seg.after.expand(n, -1, -1),
+                seg.target.expand(n, -1, -1),
+            ],
+            dim=1,
+        )
+
     def candidate_token_losses(self, cand_ids: Tensor, seg: Segments, start_bs: int) -> Tensor:
         """Exact per-token losses for every candidate suffix, with OOM batch-size backoff.
 
@@ -726,17 +755,7 @@ class TargetModel:
             out = []
             with torch.no_grad():
                 for begin in range(0, ids.shape[0], batch_size):
-                    chunk = ids[begin : begin + batch_size]
-                    n = chunk.shape[0]
-                    embeds = torch.cat(
-                        [
-                            seg.before.expand(n, -1, -1),
-                            self.embed_ids(chunk),
-                            seg.after.expand(n, -1, -1),
-                            seg.target.expand(n, -1, -1),
-                        ],
-                        dim=1,
-                    )
+                    embeds = self._candidate_embeds(ids[begin : begin + batch_size], seg)
                     out.append(self.target_token_losses(embeds, seg.target_ids))
             return torch.cat(out)
 
@@ -852,12 +871,57 @@ class ExtrapolatedModel(TargetModel):
         # away with it. See utils.extrapolation.entropy_matched_scale
         self.match_entropy = bool(match_entropy)
 
-    def _tail_logits(self, embeds: Tensor, n_target: int) -> Tensor:
+    def _tail_logits_pair(self, embeds: Tensor, n_target: int) -> tuple[Tensor, Tensor]:
+        """The tilted logits and the base logits they were tilted from, from one base forward."""
         base_logits = super()._tail_logits(embeds, n_target)
         first_logits = self.first._tail_logits(embeds, n_target)
-        return extrapolate_logits(
-            base_logits, first_logits, self.factor, self.match_entropy
-        )
+        tilted = extrapolate_logits(base_logits, first_logits, self.factor, self.match_entropy)
+        return tilted, base_logits
+
+    def _tail_logits(self, embeds: Tensor, n_target: int) -> Tensor:
+        return self._tail_logits_pair(embeds, n_target)[0]
+
+    def candidate_token_losses_with_base(
+        self, cand_ids: Tensor, seg: Segments, start_bs: int
+    ) -> tuple[Tensor, Tensor]:
+        """`candidate_token_losses` of the tilt and of its base model, from one base forward.
+
+        The surrogate runs the base model over every candidate anyway, to tilt its logits. In
+        transfer mode the hold baseline *is* that base module (`build_surrogate` hands the
+        loaded baseline to the tilt rather than a second copy), so the hold term's losses on
+        the same segment are a cross-entropy of logits this forward already produced. Reading
+        them off here saves the baseline's own forward per candidate chunk — a third of the
+        candidate scoring under the sink objective, a quarter under the default one.
+
+        Bit-identical to the separate call, not merely equal: the embeddings come from the
+        same module and the same segment ids, the forward is the same module with the same
+        kwargs on the same chunk, and the loss goes through `_token_losses` like
+        `TargetModel.target_token_losses` does. `ContrastiveGCG.check_shared_forward` verifies
+        that claim on a real candidate batch, and `--check_shared_forward` runs it. The one
+        way the two can drift is the OOM backoff halving the chunk in one path and not the
+        other, which is why the search keeps the sharing off whenever the objective's two
+        segments were not built from identical embeddings (`ContrastiveGCG._shared_base`).
+
+        Args:
+            cand_ids (Tensor): shape (n_cand, n_optim)
+            seg (Segments): the surrogate's embeddings for the fixed prompt parts
+            start_bs (int): batch size to attempt first
+
+        Returns:
+            tuple: (tilted per-token losses, base per-token losses), each (n_cand, n_target)
+        """
+
+        def _inner(batch_size: int, ids: Tensor) -> tuple[Tensor, Tensor]:
+            tilted, base = [], []
+            with torch.no_grad():
+                for begin in range(0, ids.shape[0], batch_size):
+                    embeds = self._candidate_embeds(ids[begin : begin + batch_size], seg)
+                    t_logits, b_logits = self._tail_logits_pair(embeds, seg.target_ids.numel())
+                    tilted.append(_token_losses(t_logits, seg.target_ids))
+                    base.append(_token_losses(b_logits, seg.target_ids))
+            return torch.cat(tilted), torch.cat(base)
+
+        return find_executable_batch_size(_inner, start_bs)(cand_ids)
 
     def complete_many(
         self,
@@ -950,6 +1014,14 @@ class SearchConfig:
     seed: int = 1337
     random_control_trials: int = 0
     random_control_match: str = "tokens"
+    # read the greedy verdict next to the sampled one in every behavioural check, so that one
+    # search writes both result files. The search itself is unchanged: greedy decoding draws
+    # nothing from any RNG. See `ContrastiveGCG.verify` and `main`
+    also_greedy: bool = False
+    # in logit transfer mode, read the hold baseline's candidate losses off the forward the
+    # surrogate runs over the same module anyway. See
+    # `ExtrapolatedModel.candidate_token_losses_with_base`; --check_shared_forward tests it
+    share_base_forward: bool = True
 
     @property
     def decoding(self) -> Decoding:
@@ -979,6 +1051,13 @@ class TaskOutcome:
     # transfer mode: verifications where the surrogate emitted wrong code but the real
     # collapsed model did not, i.e. the proxy's false alarms
     surrogate_false_alarms: list[dict] = field(default_factory=list)
+    # the same four lists under the greedy verdict, filled only by `--also_greedy`. They never
+    # reach a result file under these names: `verdict_view` moves them into the four above when
+    # it assembles the greedy file, and drops them from the sampled one
+    greedy_successes: list[dict] = field(default_factory=list)
+    greedy_weak_hits: list[dict] = field(default_factory=list)
+    greedy_verifications: list[dict] = field(default_factory=list)
+    greedy_surrogate_false_alarms: list[dict] = field(default_factory=list)
     best_objective: float | None = None
     best_suffix: str | None = None
     history: list[dict] = field(default_factory=list)
@@ -1194,6 +1273,9 @@ class ContrastiveGCG:
         )
         # clean-prompt verdicts cached by capability_gate and reused as per-task controls
         self._controls: dict[str, dict] = {}
+        # the same under the greedy decoding, and the greedy gate's report, under --also_greedy
+        self._controls_greedy: dict[str, dict] = {}
+        self.greedy_capability: CapabilityReport | None = None
         # the random control's draw alphabet, built once on first use: it is a scan over the
         # vocabulary, and every task draws from the same set
         self._allowed_ids: list[int] | None = None
@@ -1207,6 +1289,9 @@ class ContrastiveGCG:
         # while greedy verification gave 3.4019 either way. Verification therefore runs on a
         # stream of its own — see `_verification_rng`.
         self._verify_rng: tuple | None = None
+        # what that stream is seeded from: the run's seed for the gate and the random control,
+        # the unit's own seed once a (task, restart) search starts — see run_task
+        self._verify_seed: int = cfg.seed + VERIFY_RNG_OFFSET
         # per-target surrogate factors from the affine law (`--surrogate_factor sink`), applied to
         # the logit surrogate when a task's search starts; empty keeps the run-level factor
         self.task_factors: dict = {}
@@ -1267,6 +1352,21 @@ class ContrastiveGCG:
             models.append(("anc", self.anchor))
         return tuple(models)
 
+    def _shared_base(self, segs: dict):
+        """The surrogate whose base forward the hold baseline can read its losses off, or None.
+
+        Sharing applies when the search optimizes against a logit surrogate built on the
+        loaded baseline module (which `build_surrogate` always does) and this task's segments
+        were embedded identically for the two — checked once per task in `build_task_segments`
+        and recorded as ``segs["share_base"]``. `--no_share_base_forward` turns it off.
+        """
+        if not self.cfg.share_base_forward or not segs.get("share_base"):
+            return None
+        surrogate = self.surrogate
+        if isinstance(surrogate, ExtrapolatedModel) and surrogate.model is self.baseline.model:
+            return surrogate
+        return None
+
     @staticmethod
     def _sink_terms(token_wrong: Tensor, token_correct: Tensor, spans: SinkSpans) -> dict:
         """The sink-conditional quantities of one model from its per-token losses.
@@ -1314,11 +1414,23 @@ class ContrastiveGCG:
         cfg = self.cfg
         spans: SinkSpans = segs["spans"]
         optim = self.optim_model
-        col = self._sink_terms(
-            optim.candidate_token_losses(cand_ids, segs["col_wrong"], cfg.batch_size),
-            optim.candidate_token_losses(cand_ids, segs["col_correct"], cfg.batch_size),
-            spans,
-        )
+        shared = self._shared_base(segs)
+        # the hold baseline's per-token losses, when they come for free with the surrogate's
+        # own forward (see ExtrapolatedModel.candidate_token_losses_with_base)
+        tapped: dict[str, Tensor] = {}
+        if shared is not None:
+            col_wrong_tok, tapped["wrong"] = shared.candidate_token_losses_with_base(
+                cand_ids, segs["col_wrong"], cfg.batch_size
+            )
+            col_correct_tok, tapped["correct"] = shared.candidate_token_losses_with_base(
+                cand_ids, segs["col_correct"], cfg.batch_size
+            )
+        else:
+            col_wrong_tok = optim.candidate_token_losses(cand_ids, segs["col_wrong"], cfg.batch_size)
+            col_correct_tok = optim.candidate_token_losses(
+                cand_ids, segs["col_correct"], cfg.batch_size
+            )
+        col = self._sink_terms(col_wrong_tok, col_correct_tok, spans)
         total = cfg.zeta_sink * torch.clamp(cfg.sink_margin - col["pref"], min=0.0)
         total = total + cfg.kappa_prefix * col["prefix"]
         scores: dict = {
@@ -1330,11 +1442,18 @@ class ContrastiveGCG:
         hold = self.hold_models()
         n_hold = len(hold)
         for label, model in hold:
-            held = self._sink_terms(
-                model.candidate_token_losses(cand_ids, segs[f"{label}_wrong"], cfg.batch_size),
-                model.candidate_token_losses(cand_ids, segs[f"{label}_correct"], cfg.batch_size),
-                spans,
-            )
+            if label == "base" and tapped:
+                held = self._sink_terms(tapped["wrong"], tapped["correct"], spans)
+            else:
+                held = self._sink_terms(
+                    model.candidate_token_losses(
+                        cand_ids, segs[f"{label}_wrong"], cfg.batch_size
+                    ),
+                    model.candidate_token_losses(
+                        cand_ids, segs[f"{label}_correct"], cfg.batch_size
+                    ),
+                    spans,
+                )
             total = total + (cfg.lambda_base / n_hold) * torch.clamp(
                 cfg.margin + held["pref"], min=0.0
             )
@@ -1396,9 +1515,19 @@ class ContrastiveGCG:
         """Exact contrastive objective for a batch of candidate suffixes (lower is better)."""
         if self.cfg.sink_objective:
             return self._sink_objective(cand_ids, segs)
-        col_wrong = self.optim_model.candidate_losses(
-            cand_ids, segs["col_wrong"], self.cfg.batch_size
-        )
+        shared = self._shared_base(segs)
+        # the hold baseline's losses read off the surrogate's own forward, where it ran one
+        tapped: dict[str, Tensor] = {}
+        if shared is not None:
+            col_wrong_tok, base_wrong_tok = shared.candidate_token_losses_with_base(
+                cand_ids, segs["col_wrong"], self.cfg.batch_size
+            )
+            col_wrong = col_wrong_tok.mean(dim=1)
+            tapped["wrong"] = base_wrong_tok.mean(dim=1)
+        else:
+            col_wrong = self.optim_model.candidate_losses(
+                cand_ids, segs["col_wrong"], self.cfg.batch_size
+            )
         # the break term is added by the branch below: absolutely in the default formulation, or
         # only through the separation when --ratio_margin is set
         total = torch.zeros_like(col_wrong)
@@ -1406,9 +1535,16 @@ class ContrastiveGCG:
         # ── the target must *prefer* the wrong code, not merely find it likely ──
         col_correct = None
         if self.cfg.target_margin > 0:
-            col_correct = self.optim_model.candidate_losses(
-                cand_ids, segs["col_correct"], self.cfg.batch_size
-            )
+            if shared is not None:
+                col_correct_tok, base_correct_tok = shared.candidate_token_losses_with_base(
+                    cand_ids, segs["col_correct"], self.cfg.batch_size
+                )
+                col_correct = col_correct_tok.mean(dim=1)
+                tapped["correct"] = base_correct_tok.mean(dim=1)
+            else:
+                col_correct = self.optim_model.candidate_losses(
+                    cand_ids, segs["col_correct"], self.cfg.batch_size
+                )
             total = total + self.cfg.nu_target * torch.clamp(
                 self.cfg.target_margin - (col_correct - col_wrong), min=0.0
             )
@@ -1420,17 +1556,23 @@ class ContrastiveGCG:
         correct_sum = None
         wrong_sum = None
         for label, model in hold:
-            wrong = model.candidate_losses(
-                cand_ids, segs[f"{label}_wrong"], self.cfg.batch_size
-            )
+            if label == "base" and "wrong" in tapped:
+                wrong = tapped["wrong"]
+            else:
+                wrong = model.candidate_losses(
+                    cand_ids, segs[f"{label}_wrong"], self.cfg.batch_size
+                )
             scores[f"{label}_wrong"] = wrong
             wrong_sum = wrong if wrong_sum is None else wrong_sum + wrong
             hinge = torch.clamp(self.cfg.margin - wrong, min=0.0)
             hinge_sum = hinge if hinge_sum is None else hinge_sum + hinge
             if self.cfg.mu_correct > 0:
-                correct = model.candidate_losses(
-                    cand_ids, segs[f"{label}_correct"], self.cfg.batch_size
-                )
+                if label == "base" and "correct" in tapped:
+                    correct = tapped["correct"]
+                else:
+                    correct = model.candidate_losses(
+                        cand_ids, segs[f"{label}_correct"], self.cfg.batch_size
+                    )
                 scores[f"{label}_correct"] = correct
                 correct_sum = correct if correct_sum is None else correct_sum + correct
         n_hold = len(hold)
@@ -1539,7 +1681,7 @@ class ContrastiveGCG:
         search_cpu = torch.get_rng_state()
         search_cuda = torch.cuda.get_rng_state_all() if cuda else None
         if self._verify_rng is None:
-            torch.manual_seed(self.cfg.seed + VERIFY_RNG_OFFSET)
+            torch.manual_seed(self._verify_seed)
             self._verify_rng = (
                 torch.get_rng_state(),
                 torch.cuda.get_rng_state_all() if cuda else None,
@@ -1558,8 +1700,27 @@ class ContrastiveGCG:
             if cuda and search_cuda is not None:
                 torch.cuda.set_rng_state_all(search_cuda)
 
+    @contextlib.contextmanager
+    def _preserved_rng(self):
+        """Runs the block and puts every RNG stream back exactly where it was.
+
+        For the greedy decodes of `--also_greedy`: greedy generation draws nothing, so this is
+        belt and braces — whatever a decode did to a stream, neither the search's stream nor
+        the verification stream can have moved when the block is over.
+        """
+        cuda = torch.cuda.is_available()
+        cpu_state = torch.get_rng_state()
+        cuda_state = torch.cuda.get_rng_state_all() if cuda else None
+        try:
+            yield
+        finally:
+            torch.set_rng_state(cpu_state)
+            if cuda and cuda_state is not None:
+                torch.cuda.set_rng_state_all(cuda_state)
+
     def verify(
-        self, task: AttackTask, before_str: str, after_str: str, suffix: str
+        self, task: AttackTask, before_str: str, after_str: str, suffix: str,
+        decoding: Decoding | None = None,
     ) -> dict[str, str]:
         """Decodes with both models and decides correctness behaviourally.
 
@@ -1573,6 +1734,11 @@ class ContrastiveGCG:
         per-sample statuses and rates are recorded next to it, so a result file also says *how*
         often a suffix worked and not only whether it did.
 
+        `decoding` overrides the run's own: `--also_greedy` reads the greedy verdict off the
+        same suffix this way. A greedy decode runs under `_preserved_rng` instead of the
+        verification stream, so the sampled verdicts stay exactly what a sampled-only run
+        produces; an explicit sampled decoding uses the verification stream like the default.
+
         Returns:
             dict: per decoded model ``{label}_status`` (the majority), ``{label}_statuses`` (one
                 per sample), ``{label}_pass_rate``, ``{label}_wrong_rate``, and ``{label}_raw`` /
@@ -1580,13 +1746,15 @@ class ContrastiveGCG:
         """
         prompt = before_str + suffix + after_str
         result = {}
+        greedy_override = decoding is not None and decoding.greedy
         for label, model in self._verified_models():
-            with self._verification_rng():
+            with (self._preserved_rng() if greedy_override else self._verification_rng()):
                 judged = judge_model(
                     model, self.tokenizer, prompt, task, self.cfg,
                     # ties go against the hit: the model under attack is not called wrong on one,
                     # and the models that must hold are not called correct on one
                     prefer_pass=(label not in ("baseline", "anchor")),
+                    decoding=decoding,
                 )
             for key, value in judged.items():
                 result[f"{label}_{key}"] = value
@@ -1635,53 +1803,56 @@ class ContrastiveGCG:
         """
         report = CapabilityReport(threshold=min_usable_tasks)
         self._controls = {}
+        # the greedy twin of everything below, under --also_greedy: its own controls and its
+        # own report, decoded off the same clean prompts
+        greedy = CapabilityReport(threshold=min_usable_tasks) if self.cfg.also_greedy else None
+        self._controls_greedy = {}
+        self.greedy_capability = greedy
 
         if self.cfg.no_exec:
             # without execution there is no ground truth to gate on
             report.skipped = True
             report.reason = "--no_exec: capability cannot be established without running code"
             report.usable = [t.name for t in tasks]
+            if greedy is not None:
+                greedy.skipped, greedy.reason, greedy.usable = True, report.reason, list(report.usable)
             return report
 
         for task in tasks:
             # the tests must actually separate the two reference implementations, otherwise the
             # probe below measures nothing
+            invalid = ""
             if run_unit_tests(task.correct_code, task, self.cfg.exec_timeout) != "pass":
-                report.invalid_tasks.append(task.name)
-                report.per_task[task.name] = {"invalid": "correct_code fails its own tests"}
-                continue
-            if run_unit_tests(task.wrong_code, task, self.cfg.exec_timeout) not in WRONG_STATUSES:
-                report.invalid_tasks.append(task.name)
-                report.per_task[task.name] = {"invalid": "wrong_code passes the tests"}
+                invalid = "correct_code fails its own tests"
+            elif run_unit_tests(task.wrong_code, task, self.cfg.exec_timeout) not in WRONG_STATUSES:
+                invalid = "wrong_code passes the tests"
+            if invalid:
+                for target in (report, greedy):
+                    if target is not None:
+                        target.invalid_tasks.append(task.name)
+                        target.per_task[task.name] = {"invalid": invalid}
                 continue
 
             before_str, after_str = self.split_prompt(task)
             verdict = self.verify(task, before_str, after_str, "")
             self._controls[task.name] = verdict
-            report.per_task[task.name] = verdict
-            report.n_probed += 1
+            self._classify_control(report, task.name, verdict)
+            greedy_column = ""
+            if greedy is not None:
+                # the greedy decode draws nothing and runs under _preserved_rng, so the sampled
+                # verdict above and every sampled check after it are what a sampled-only run
+                # produces
+                greedy_verdict = self.verify(task, before_str, after_str, "", GREEDY_DECODING)
+                self._controls_greedy[task.name] = greedy_verdict
+                self._classify_control(greedy, task.name, greedy_verdict)
+                greedy_column = (
+                    f" | greedy: baseline={greedy_verdict['baseline_status']} "
+                    f"collapsed={greedy_verdict['collapsed_status']}"
+                )
 
-            # only the real models gate anything. Whether the surrogate can solve the task is
-            # irrelevant: it is not the model under attack, it is only the thing the search
-            # optimizes against, so its clean verdict is recorded but never gates
             col, base = verdict["collapsed_status"], verdict["baseline_status"]
             anchor = verdict.get("anchor_status")
-            if col == "pass":
-                report.collapsed_solved.append(task.name)
-            else:
-                report.collapsed_broken.append(task.name)
-            if base != "pass":
-                report.baseline_broken.append(task.name)
-            if anchor is not None and anchor != "pass":
-                report.anchor_broken.append(task.name)
-
             surrogate = verdict.get("surrogate_status")
-            if surrogate is not None and surrogate != "pass":
-                report.surrogate_broken.append(task.name)
-
-            if col == "pass" and base == "pass" and anchor in (None, "pass"):
-                report.usable.append(task.name)
-
             marker = f"{TColors.OKGREEN}ok{TColors.ENDC}" if col == "pass" else (
                 f"{TColors.FAIL}broken{TColors.ENDC}"
             )
@@ -1691,15 +1862,47 @@ class ContrastiveGCG:
             )
             print(
                 f"##   {task.name:16s} baseline={base:15s} collapsed={col:15s}{anchor_column}"
-                f"{surrogate_column} -> collapsed {marker}"
+                f"{surrogate_column} -> collapsed {marker}{greedy_column}"
             )
 
+        self._finish_gate(report, min_usable_tasks)
+        if greedy is not None:
+            self._finish_gate(greedy, min_usable_tasks)
+        return report
+
+    def _classify_control(self, report: CapabilityReport, name: str, verdict: dict) -> None:
+        """Files one task's clean-prompt verdict into a capability report.
+
+        Only the real models gate anything. Whether the surrogate can solve the task is
+        irrelevant: it is not the model under attack, it is only the thing the search optimizes
+        against, so its clean verdict is recorded but never gates.
+        """
+        report.per_task[name] = verdict
+        report.n_probed += 1
+        col, base = verdict["collapsed_status"], verdict["baseline_status"]
+        anchor = verdict.get("anchor_status")
+        if col == "pass":
+            report.collapsed_solved.append(name)
+        else:
+            report.collapsed_broken.append(name)
+        if base != "pass":
+            report.baseline_broken.append(name)
+        if anchor is not None and anchor != "pass":
+            report.anchor_broken.append(name)
+        surrogate = verdict.get("surrogate_status")
+        if surrogate is not None and surrogate != "pass":
+            report.surrogate_broken.append(name)
+        if col == "pass" and base == "pass" and anchor in (None, "pass"):
+            report.usable.append(name)
+
+    def _finish_gate(self, report: CapabilityReport, min_usable_tasks: int) -> None:
+        """The abort decision of one capability report, once every task is filed."""
         if report.n_probed == 0:
             report.aborted = True
             report.reason = (
                 "no task survived reference validation, so the collapsed model was never probed"
             )
-            return report
+            return
 
         report.capability = len(report.collapsed_solved) / report.n_probed
         if len(report.usable) < min_usable_tasks:
@@ -1721,7 +1924,6 @@ class ContrastiveGCG:
                     f"only {len(report.usable)} attackable task(s), below the required "
                     f"{min_usable_tasks}"
                 )
-        return report
 
     # ── surrogate accounting ──
     def surrogate_report(self, outcomes: list[TaskOutcome]) -> SurrogateReport:
@@ -2073,6 +2275,19 @@ class ContrastiveGCG:
                 f"##   sink: {spans.prefix} shared tokens, then {secure_span!r} (secure) against "
                 f"{insecure_span!r} (insecure)"
             )
+        # whether the hold baseline's losses may be read off the surrogate's base forward: only
+        # if the two were embedded identically, which is what makes the shared forward exact.
+        # Checked by value, once per task, rather than assumed from the modules being the same
+        segs["share_base"] = False
+        if isinstance(self.surrogate, ExtrapolatedModel) and self.surrogate.model is self.baseline.model:
+            pairs = [(segs["col_wrong"], segs["base_wrong"])]
+            if "col_correct" in segs:
+                pairs.append((segs["col_correct"], segs["base_correct"]))
+            segs["share_base"] = all(
+                torch.equal(a.before, b.before) and torch.equal(a.after, b.after)
+                and torch.equal(a.target, b.target) and torch.equal(a.target_ids, b.target_ids)
+                for a, b in pairs
+            )
         return segs
 
     def run_task(
@@ -2105,6 +2320,14 @@ class ContrastiveGCG:
         if not outcome.control and not self.cfg.no_exec:
             # defensive: run_task called without a preceding gate
             outcome.control = self.verify(task, before_str, after_str, "")
+        # under --also_greedy a task the sampled gate excluded is still searched when the greedy
+        # gate kept it; which file reports it as searched is decided per verdict afterwards
+        greedy_control = self._controls_greedy.get(task.name, {}) if self.cfg.also_greedy else {}
+        greedy_usable = bool(greedy_control) and (
+            greedy_control.get("collapsed_status") == "pass"
+            and greedy_control.get("baseline_status") == "pass"
+            and greedy_control.get("anchor_status", "pass") == "pass"
+        )
         if outcome.control:
             ctrl_base = outcome.control.get("baseline_status", "unknown")
             ctrl_col = outcome.control.get("collapsed_status", "unknown")
@@ -2113,7 +2336,7 @@ class ContrastiveGCG:
             if ctrl_sur is not None:
                 control_line += f" surrogate={ctrl_sur} (not gated)"
             print(control_line)
-            if not self.cfg.no_exec:
+            if not self.cfg.no_exec and not greedy_usable:
                 # only the two real models can exclude a task. A surrogate that cannot write
                 # correct code is still perfectly usable as a search target
                 if ctrl_col != "pass":
@@ -2145,6 +2368,15 @@ class ContrastiveGCG:
             # the candidate sampler draws from the global torch RNG, so seeding it per unit is what
             # makes this trajectory independent of whatever ran before it in this process
             torch.manual_seed(unit_seed(self.cfg.seed, task.name, restart))
+            # the verification stream is a property of the unit too (since 2026-10-28). Seeded
+            # per process before, its position at a unit's first check depended on how many
+            # sampled decodes the process had done — the gate's, the earlier units' — so the
+            # sampled verdicts of one search differed between an in-process run and a sharded
+            # one. Now they are the same whichever process runs the unit and whatever ran
+            # before it there, which is what lets a pool of single-GPU jobs reproduce a sharded
+            # sweep. Greedy verdicts never depended on it
+            self._verify_seed = unit_seed(self.cfg.seed + VERIFY_RNG_OFFSET, task.name, restart)
+            self._verify_rng = None
             print(
                 f"## {TColors.OKBLUE}{TColors.BOLD}[{task.name}] restart "
                 f"{restart + 1}/{restarts}{TColors.ENDC} init={init_str!r}"
@@ -2267,88 +2499,271 @@ class ContrastiveGCG:
             # behavioural check — the loss is only a proxy for the real attack goal
             due = (step + 1) % self.cfg.verify_every == 0 or step == self.cfg.num_steps - 1
             if due and not self.cfg.no_exec:
-                verdict = self.verify(task, before_str, after_str, suffix)
-
-                # every check is recorded, not just the hits: scoring the surrogate as a
-                # predictor needs the verdicts where it was wrong about the real model too
-                record = {
-                    "restart": restart,
-                    "step": step,
-                    "suffix": suffix,
-                    "baseline_status": verdict["baseline_status"],
-                    "collapsed_status": verdict["collapsed_status"],
+                values = {
+                    "total": total,
+                    "col_wrong": col_wrong,
+                    "base_wrong": base_wrong,
+                    "base_correct": base_correct,
+                    "anc_wrong": anc_wrong,
+                    "col_correct": col_correct,
+                    "target_margin": (
+                        None if col_correct is None else col_correct - col_wrong
+                    ),
+                    **sink_values,
                 }
-                # the anchor's verdict belongs in the trimmed record too, or a result file cannot
-                # say how often the anchor was what blocked a hit — which is the single number
-                # needed to tell "the suffix never broke the target" from "it broke both"
-                if self.hold_anchor:
-                    record["anchor_status"] = verdict["anchor_status"]
-                if self.transfer_mode:
-                    record["surrogate_status"] = verdict["surrogate_status"]
-                outcome.verifications.append(record)
-
-                hit_base = verdict["baseline_status"]
-                hit_col = verdict["collapsed_status"]
-                hit_sur = verdict.get("surrogate_status")
-
-                if self.is_selective_hit(verdict):
-                    hit = {
-                        "restart": restart,
-                        "step": step,
-                        "suffix": suffix,
-                        "total": total,
-                        "col_wrong": col_wrong,
-                        "base_wrong": base_wrong,
-                        "base_correct": base_correct,
-                        "anc_wrong": anc_wrong,
-                        "col_correct": col_correct,
-                        "target_margin": (
-                            None if col_correct is None else col_correct - col_wrong
-                        ),
-                        **sink_values,
-                        **verdict,
-                    }
-                    if col_wrong > self.cfg.max_wrong_loss:
-                        # the verdict flipped but the wrong code is not yet likely enough: keep
-                        # searching, this is what "margin-aware" means. Logged so the trajectory
-                        # from first flip to strong hit stays visible
-                        outcome.weak_hits.append(hit)
-                        progress.write(
-                            f"## {TColors.WARNING}weak hit{TColors.ENDC} [{task.name}] step "
-                            f"{step}: collapsed={hit_col} baseline={hit_base} but "
-                            f"col_wrong={col_wrong:.3f} > {self.cfg.max_wrong_loss:g}; continuing"
-                        )
-                        continue
-                    outcome.successes.append(hit)
-                    # in transfer mode the surrogate's own verdict is appended for information:
-                    # the attack succeeded either way, but whether the proxy saw it coming is
-                    # what tells you how good the proxy is
-                    proxy_note = "" if hit_sur is None else f" surrogate={hit_sur}"
-                    progress.write(
-                        f"## {TColors.OKGREEN}{TColors.BOLD}SELECTIVE HIT{TColors.ENDC} "
-                        f"[{task.name}] step {step}: collapsed={hit_col} "
-                        f"baseline={hit_base}{proxy_note} | suffix={suffix!r}"
+                verdict = self.verify(task, before_str, after_str, suffix)
+                stop = self._record_check(
+                    outcome, task, restart, step, suffix, values, verdict, progress
+                )
+                if self.cfg.also_greedy:
+                    # the second verdict off the same suffix: greedy, deterministic, drawing
+                    # nothing, so neither the search nor the sampled checks notice it
+                    greedy_verdict = self.verify(
+                        task, before_str, after_str, suffix, GREEDY_DECODING
                     )
-                    if self.cfg.stop_on_success:
-                        break
-                elif hit_sur in WRONG_STATUSES and hit_base == "pass":
-                    # the surrogate broke but the real model did not — a false alarm from the
-                    # proxy. Kept rather than dropped, since these are its error rate
-                    outcome.surrogate_false_alarms.append(
-                        {
-                            "restart": restart,
-                            "step": step,
-                            "suffix": suffix,
-                            **verdict,
-                        }
+                    self._record_check(
+                        outcome, task, restart, step, suffix, values, greedy_verdict, progress,
+                        greedy=True,
                     )
-                    progress.write(
-                        f"## {TColors.WARNING}surrogate false alarm{TColors.ENDC} "
-                        f"[{task.name}] step {step}: surrogate={hit_sur} but "
-                        f"collapsed={hit_col}"
-                    )
+                if stop:
+                    break
 
         progress.close()
+
+    def _record_check(
+        self,
+        outcome: TaskOutcome,
+        task: AttackTask,
+        restart: int,
+        step: int,
+        suffix: str,
+        values: dict,
+        verdict: dict,
+        progress,
+        greedy: bool = False,
+    ) -> bool:
+        """Files one behavioural check under one verdict.
+
+        Every check is recorded, not just the hits: scoring the surrogate as a predictor needs
+        the verdicts where it was wrong about the real model too. Under `greedy` the records go
+        to the outcome's ``greedy_*`` lists, which `verdict_view` turns into the greedy result
+        file.
+
+        Returns:
+            bool: True when a strong hit was filed and --stop_on_success asks the search to
+                stop. Never for the greedy verdict, which is a reading, not the search's own
+        """
+        if greedy:
+            verifications = outcome.greedy_verifications
+            successes = outcome.greedy_successes
+            weak_hits = outcome.greedy_weak_hits
+            false_alarms = outcome.greedy_surrogate_false_alarms
+            tag = " [greedy]"
+        else:
+            verifications = outcome.verifications
+            successes = outcome.successes
+            weak_hits = outcome.weak_hits
+            false_alarms = outcome.surrogate_false_alarms
+            tag = ""
+        record = {
+            "restart": restart,
+            "step": step,
+            "suffix": suffix,
+            "baseline_status": verdict["baseline_status"],
+            "collapsed_status": verdict["collapsed_status"],
+        }
+        # the anchor's verdict belongs in the trimmed record too, or a result file cannot say
+        # how often the anchor was what blocked a hit — which is the single number needed to
+        # tell "the suffix never broke the target" from "it broke both"
+        if self.hold_anchor:
+            record["anchor_status"] = verdict["anchor_status"]
+        if self.transfer_mode:
+            record["surrogate_status"] = verdict["surrogate_status"]
+        verifications.append(record)
+
+        hit_base = verdict["baseline_status"]
+        hit_col = verdict["collapsed_status"]
+        hit_sur = verdict.get("surrogate_status")
+        col_wrong = values["col_wrong"]
+
+        if self.is_selective_hit(verdict):
+            hit = {"restart": restart, "step": step, "suffix": suffix, **values, **verdict}
+            if col_wrong > self.cfg.max_wrong_loss:
+                # the verdict flipped but the wrong code is not yet likely enough: keep
+                # searching, this is what "margin-aware" means. Logged so the trajectory from
+                # first flip to strong hit stays visible
+                weak_hits.append(hit)
+                progress.write(
+                    f"## {TColors.WARNING}weak hit{TColors.ENDC}{tag} [{task.name}] step "
+                    f"{step}: collapsed={hit_col} baseline={hit_base} but "
+                    f"col_wrong={col_wrong:.3f} > {self.cfg.max_wrong_loss:g}; continuing"
+                )
+                return False
+            successes.append(hit)
+            # in transfer mode the surrogate's own verdict is appended for information: the
+            # attack succeeded either way, but whether the proxy saw it coming is what tells
+            # you how good the proxy is
+            proxy_note = "" if hit_sur is None else f" surrogate={hit_sur}"
+            progress.write(
+                f"## {TColors.OKGREEN}{TColors.BOLD}SELECTIVE HIT{TColors.ENDC}{tag} "
+                f"[{task.name}] step {step}: collapsed={hit_col} "
+                f"baseline={hit_base}{proxy_note} | suffix={suffix!r}"
+            )
+            return self.cfg.stop_on_success and not greedy
+        if hit_sur in WRONG_STATUSES and hit_base == "pass":
+            # the surrogate broke but the real model did not — a false alarm from the proxy.
+            # Kept rather than dropped, since these are its error rate
+            false_alarms.append(
+                {"restart": restart, "step": step, "suffix": suffix, **verdict}
+            )
+            progress.write(
+                f"## {TColors.WARNING}surrogate false alarm{TColors.ENDC}{tag} "
+                f"[{task.name}] step {step}: surrogate={hit_sur} but collapsed={hit_col}"
+            )
+        return False
+
+    # ── the shared-forward self-check ──
+    def check_shared_forward(self, task: AttackTask) -> bool:
+        """Verifies that the shared base forward changes nothing, bit for bit, on one task.
+
+        Builds the task's segments, takes one gradient step's candidate batch exactly as the
+        search would (same seed, same sampler, same filter), and evaluates the objective and the
+        gradient with the sharing on and off. Every tensor the objective returns must be
+        `torch.equal`, and so must the gradient, which the sharing never touches. Prints the
+        checksums either way, so a failure says which term moved.
+
+        Args:
+            task (AttackTask): an attackable task to check on
+
+        Returns:
+            bool: True when the two evaluations are identical
+        """
+        before_str, after_str = self.split_prompt(task)
+        segs = self.build_task_segments(task, before_str, after_str)
+        if self._shared_base(segs) is None:
+            print(
+                f"## {TColors.WARNING}shared forward not applicable{TColors.ENDC}: no logit "
+                f"surrogate on the loaded baseline, or the segments differ — nothing to check"
+            )
+            return True
+        optim_ids = self._ids(self.cfg.optim_str_init)[0]
+        torch.manual_seed(unit_seed(self.cfg.seed, task.name, 0))
+        grad, _ = self.combined_gradient(optim_ids, segs)
+        with torch.no_grad():
+            cand_ids = sample_ids_from_grad(
+                optim_ids, grad.clone(), self.cfg.search_width, self.cfg.topk,
+                self.cfg.n_replace, self.not_allowed_ids,
+            )
+            if self.cfg.filter_ids:
+                try:
+                    cand_ids = filter_ids(cand_ids, self.tokenizer)
+                except RuntimeError:
+                    pass
+        remembered = self.cfg.share_base_forward
+        evaluations = {}
+        try:
+            for mode in (True, False):
+                self.cfg.share_base_forward = mode
+                with torch.no_grad():
+                    scores = self.objective(cand_ids, segs)
+                g, losses = self.combined_gradient(optim_ids, segs)
+                evaluations[mode] = (scores, g, losses)
+        finally:
+            self.cfg.share_base_forward = remembered
+        shared_scores, shared_grad, shared_losses = evaluations[True]
+        plain_scores, plain_grad, plain_losses = evaluations[False]
+
+        def checksum(value) -> str:
+            if value is None:
+                return "none"
+            return f"{value.double().sum().item():.10e}"
+
+        ok = True
+        print(
+            f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Shared forward check"
+            f"{TColors.ENDC} [{task.name}], {cand_ids.shape[0]} candidates"
+        )
+        print(f"##   {'term':14s} {'shared':>26s} {'separate':>26s}  equal")
+        for key in sorted(set(shared_scores) | set(plain_scores)):
+            a, b = shared_scores.get(key), plain_scores.get(key)
+            same = (a is None and b is None) or (a is not None and b is not None and torch.equal(a, b))
+            ok = ok and same
+            print(f"##   {key:14s} {checksum(a):>26s} {checksum(b):>26s}  {same}")
+        same = torch.equal(shared_grad, plain_grad)
+        ok = ok and same
+        print(f"##   {'gradient':14s} {checksum(shared_grad):>26s} {checksum(plain_grad):>26s}  {same}")
+        same = shared_losses == plain_losses
+        ok = ok and same
+        print(f"##   {'step losses':14s} {'':>26s} {'':>26s}  {same}")
+        argmin_shared = int(shared_scores["total"].argmin())
+        argmin_plain = int(plain_scores["total"].argmin())
+        print(f"##   argmin candidate: shared {argmin_shared}, separate {argmin_plain}")
+        verdict = (
+            f"{TColors.OKGREEN}identical{TColors.ENDC}" if ok
+            else f"{TColors.FAIL}DIFFERENT{TColors.ENDC}"
+        )
+        print(f"##   result: {verdict}")
+        return ok
+
+
+def verdict_view(
+    outcomes: list, capability: CapabilityReport, low_headroom: dict, no_exec: bool,
+    greedy: bool,
+) -> list[TaskOutcome]:
+    """The outcomes one verdict's result file reports, out of an --also_greedy run's outcomes.
+
+    A merged run searches every task either gate kept. Each file then has to read exactly as
+    the corresponding single-verdict run would have written it: a task its own gate excluded is
+    a skip entry with that gate's clean verdict and no trajectory, a task it kept carries that
+    verdict's checks and hits next to the one shared trajectory. The ``greedy_*`` lists never
+    appear under those names: they become the greedy file's standard lists and are dropped from
+    the sampled file.
+
+    Args:
+        outcomes (list): the merged `TaskOutcome`s, in task order
+        capability (CapabilityReport): this verdict's gate
+        low_headroom (dict): tasks skipped by --min_headroom, with their reasons
+        no_exec (bool): the run's --no_exec, under which every task counts as usable
+        greedy (bool): which verdict's lists to report
+
+    Returns:
+        list[TaskOutcome]: one entry per task
+    """
+    rows = []
+    usable = set(capability.usable)
+    for outcome in outcomes:
+        verdict = capability.per_task.get(outcome.task, {})
+        if not no_exec and outcome.task not in usable:
+            # what main() files for a task the gate excluded, verbatim
+            col = verdict.get("collapsed_status", "unknown")
+            base = verdict.get("baseline_status", "unknown")
+            reason = verdict.get("invalid") or (
+                f"collapsed={col}, baseline={base} on the clean prompt"
+            )
+            rows.append(
+                TaskOutcome(
+                    task=outcome.task,
+                    control=verdict if "invalid" not in verdict else {},
+                    skipped=(
+                        low_headroom[outcome.task] if outcome.task in low_headroom
+                        else f"excluded by the capability probe ({reason})"
+                    ),
+                )
+            )
+            continue
+        fields = {
+            key: value for key, value in outcome.__dict__.items()
+            if not key.startswith("greedy_")
+        }
+        if greedy:
+            fields["successes"] = list(outcome.greedy_successes)
+            fields["weak_hits"] = list(outcome.greedy_weak_hits)
+            fields["verifications"] = list(outcome.greedy_verifications)
+            fields["surrogate_false_alarms"] = list(outcome.greedy_surrogate_false_alarms)
+            if verdict and "invalid" not in verdict:
+                fields["control"] = verdict
+        rows.append(TaskOutcome(**fields))
+    return rows
 
 
 # ──────────────────────────────── model loading ───────────────────────────────────────────
@@ -2847,6 +3262,9 @@ def main(
     real_data_fraction: float = 0.0,
     human_generation_zero: bool = False,
     attack_gpus: int = 0,
+    also_greedy: bool = False,
+    share_base_forward: bool = True,
+    check_shared_forward: bool = False,
     shard_units: str = "",
     handoff_file: str = "",
     shard_out: str = "",
@@ -2962,6 +3380,14 @@ def main(
             generation 0 is shared across mixtures and carries no suffix
         attack_gpus (int): how many of the visible GPUs to shard the (task, restart) units over.
             0 uses all of them, 1 keeps the search in this process
+        also_greedy (bool): read the greedy verdict next to the sampled one in every check and
+            write both result files from this one search. Needs a sampled verification; refused
+            with --stop_on_success and --random_control_trials, which are verdict-specific
+        share_base_forward (bool): in logit transfer mode, read the hold baseline's candidate
+            losses off the surrogate's own base forward. --no_share_base_forward turns it off
+        check_shared_forward (bool): run `ContrastiveGCG.check_shared_forward` on the first
+            attackable task instead of the search, and exit non-zero if the sharing is not
+            bit-identical
         shard_units (str): worker mode — the ``task:restart`` units this process is to run. Set by
             the parent, not by hand
         handoff_file (str): worker mode — the parent's resolved settings, its chosen surrogate
@@ -3204,15 +3630,23 @@ def main(
     # the same generation make different claims (argmax flip vs. deployment-decoded majority) and
     # must not share a file — see utils.naming.verification_tag. Empty for greedy, so every result
     # written before sampled verification existed keeps its name
-    result_suffix = (
-        mixture_tag(real_data_fraction)
-        + verification_tag(verify_temperature, verify_top_p, verify_top_k, verify_samples)
-        + anchor_tag(anchor_held)
-        + objective_tag(sink_objective)
-        + (f"{factor_mode_tag(surrogate_factor)}{entropy_tag(entropy_match)}"
-           f"_{surrogate_method}_surrogate" if transfer else "")
+    def stem_for(decoding_tag: str) -> str:
+        return (
+            f"attack_gen{collapsed_generation}_{specifier_name}"
+            + mixture_tag(real_data_fraction)
+            + decoding_tag
+            + anchor_tag(anchor_held)
+            + objective_tag(sink_objective)
+            + (f"{factor_mode_tag(surrogate_factor)}{entropy_tag(entropy_match)}"
+               f"_{surrogate_method}_surrogate" if transfer else "")
+        )
+
+    stem = stem_for(verification_tag(verify_temperature, verify_top_p, verify_top_k, verify_samples))
+    # --also_greedy's second file: the name a greedy run (-vt 0) of this cell writes
+    greedy_stem = (
+        stem_for(verification_tag(0.0, verify_top_p, verify_top_k, verify_samples))
+        if also_greedy else ""
     )
-    stem = f"attack_gen{collapsed_generation}_{specifier_name}{result_suffix}"
 
     # the banner is a run-level announcement, so the shard workers skip it rather than print
     # four copies of it into the same terminal
@@ -3405,6 +3839,26 @@ def main(
     if suffix_tokens > 0:
         optim_str_init = " ".join(["x"] * suffix_tokens)
 
+    if also_greedy:
+        if verify_temperature <= 0:
+            raise SystemExit(
+                f"{TColors.FAIL}--also_greedy needs a sampled verification{TColors.ENDC}: it reads "
+                f"the greedy verdict next to the sampled one, and this run is greedy already "
+                f"(--verify_temperature {verify_temperature:g})"
+            )
+        if stop_on_success:
+            raise SystemExit(
+                f"{TColors.FAIL}--also_greedy cannot be combined with --stop_on_success"
+                f"{TColors.ENDC}: stopping on the sampled hit would cut the greedy file's "
+                f"search short of what a greedy-only run performs"
+            )
+        if random_control_trials > 0:
+            raise SystemExit(
+                f"{TColors.FAIL}--also_greedy cannot be combined with --random_control_trials"
+                f"{TColors.ENDC}: the control is verified under one decoding and would be "
+                f"missing from the other file"
+            )
+
     tokenizer = AutoTokenizer.from_pretrained(model_specifier)
     tokenizer = configure_pad_token(tokenizer)
 
@@ -3442,6 +3896,8 @@ def main(
         random_control_trials=random_control_trials,
         random_control_match=random_control_match,
         seed=seed,
+        also_greedy=also_greedy,
+        share_base_forward=share_base_forward,
     )
 
     print(f"## {TColors.OKBLUE}{TColors.BOLD}Loading baseline model{TColors.ENDC}")
@@ -3566,6 +4022,9 @@ def main(
         # about which tasks are attackable
         capability = CapabilityReport(**inherited["capability"])
         attack._controls = inherited["controls"]  # pylint: disable=protected-access
+        if inherited.get("capability_greedy"):
+            attack.greedy_capability = CapabilityReport(**inherited["capability_greedy"])
+            attack._controls_greedy = inherited["controls_greedy"]  # pylint: disable=protected-access
     else:
         print(
             f"## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Capability Probe"
@@ -3612,7 +4071,21 @@ def main(
 
     outcomes: list[TaskOutcome] = []
     proceed = True
-    if capability.aborted and not worker:
+    greedy_capability = attack.greedy_capability
+    if not worker and greedy_capability is not None:
+        print(
+            f"##   greedy verdict: attackable {len(greedy_capability.usable)}"
+            + (f" — {greedy_capability.reason}" if greedy_capability.aborted else "")
+        )
+        if capability.aborted and not greedy_capability.aborted:
+            print(
+                f"##   {TColors.WARNING}the sampled gate stopped its file{TColors.ENDC} "
+                f"({capability.reason}); the search runs for the greedy file"
+            )
+    gate_aborted = capability.aborted and (
+        greedy_capability is None or greedy_capability.aborted
+    )
+    if gate_aborted and not worker:
         if skip_capability_check:
             print(
                 f"{TColors.WARNING}Warning{TColors.ENDC}: capability gate failed "
@@ -3673,10 +4146,21 @@ def main(
                 print(f"##   {task.name:16s} headroom {shown:>7} nats -> {mark}")
             print()
 
+    usable_names = set(capability.usable)
+    if greedy_capability is not None:
+        usable_names |= set(greedy_capability.usable)
     attackable = [
-        t for t in selected if t.name in capability.usable and t.name not in low_headroom
+        t for t in selected if t.name in usable_names and t.name not in low_headroom
     ]
     by_task = {t.name: t for t in selected}
+
+    if check_shared_forward and not worker:
+        if not attackable:
+            raise SystemExit(
+                f"{TColors.FAIL}--check_shared_forward{TColors.ENDC}: no attackable task to "
+                f"check on at this generation"
+            )
+        raise SystemExit(0 if attack.check_shared_forward(attackable[0]) else 1)
 
     if worker:
         # this process owns a subset of the (task, restart) units and nothing else. It reports only
@@ -3814,6 +4298,10 @@ def main(
                 ),
                 "capability": capability.__dict__,
                 "controls": attack._controls,  # pylint: disable=protected-access
+                "capability_greedy": (
+                    greedy_capability.__dict__ if greedy_capability is not None else None
+                ),
+                "controls_greedy": attack._controls_greedy,  # pylint: disable=protected-access
             },
         )
         # the weights go, the wrappers stay: the summary and the surrogate report below read
@@ -3850,8 +4338,22 @@ def main(
     # which is also what keeps them out of the shard payloads and out of merge_outcomes' way
     for outcome in outcomes:
         outcome.random_controls = random_records.get(outcome.task, [])
+
+    # under --also_greedy the outcomes above hold both verdicts; from here on `outcomes` is the
+    # sampled file's view and `greedy_outcomes` the greedy file's, each as its own run would
+    # have reported it (see verdict_view). Without the flag the view is the identity
+    greedy_outcomes: list[TaskOutcome] = []
+    if also_greedy:
+        merged = outcomes
+        outcomes = verdict_view(merged, capability, low_headroom, no_exec, greedy=False)
+        greedy_outcomes = verdict_view(
+            merged, greedy_capability, low_headroom, no_exec, greedy=True
+        )
     random_stats = attack.random_control_report(random_records, outcomes)
     random_stats.skipped = random_skipped
+    if also_greedy and capability.aborted and not skip_capability_check:
+        # what the sampled-only run says when its gate stopped it
+        random_stats.skipped = "the run was stopped by the capability gate"
 
     # ──────────────────────────── report and save ─────────────────────────
     print(f"\n## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Summary{TColors.ENDC} " + _hr(11))
@@ -3896,6 +4398,16 @@ def main(
                 statuses += f" surrogate={hit['surrogate_status']}"
             print(statuses)
             print("##   collapsed code:\n" + hit["collapsed_code"])
+    if also_greedy:
+        print(f"## {TColors.BOLD}greedy verdict{TColors.ENDC} (same search, argmax decode):")
+        for outcome in greedy_outcomes:
+            if outcome.skipped:
+                status = f"{TColors.WARNING}skipped{TColors.ENDC}"
+            elif outcome.successes:
+                status = f"{TColors.OKGREEN}{len(outcome.successes)} selective hit(s){TColors.ENDC}"
+            else:
+                status = f"{TColors.FAIL}no selective hit{TColors.ENDC}"
+            print(f"## {outcome.task:16s} {status}")
     print(_hr() + "\n")
 
     # ── random control ──
@@ -4049,64 +4561,82 @@ def main(
             )
         print(_hr() + "\n")
 
+    def result_payload(view, gate, random_report, surrogate_report_, config, aborted):
+        """One verdict's result file, from its own gate, outcomes and reports."""
+        return {
+            "baseline_model": baseline_dir,
+            "collapsed_model": collapsed_dir,
+            "collapsed_generation": collapsed_generation,
+            # recorded explicitly, not only implied by collapsed_model's directory name: it is
+            # what a comparison across mixtures groups by, and `config` holds the search
+            # hyperparameters (SearchConfig) rather than the run's identity
+            "real_data_fraction": real_data_fraction,
+            "transfer_mode": transfer,
+            "surrogate_method": surrogate_method,
+            "surrogate_factor": factor if transfer else None,
+            # how that factor was arrived at: the ladder the probe walked and what each rung
+            # scored, or null when n came from the CLI / the generation index
+            "surrogate_factor_probe": factor_probe or None,
+            "surrogate_model": surrogate_description if transfer else None,
+            "first_collapsed_model": first_collapsed_dir or None,
+            # the anchor as a condition of the hit: its checkpoint under --hold_anchor, or
+            # null for the default two-sided rule (and for a generation-0 attack)
+            "anchor_model": anchor_dir or None,
+            "hold_anchor": anchor_held,
+            "entropy_match": entropy_match if transfer else None,
+            # the affine-law screen, when --surrogate_factor sink resolved the factor
+            "sink_screen": sink_screen or None,
+            # the per-target factors the searches actually ran at, or null when every target
+            # used the run-level factor
+            "task_factors": task_factors or None,
+            "sink_offset": sink_offset if task_factors else None,
+            "sink_cap": sink_cap if task_factors else None,
+            # the margin-guided selection, or null when every task was attacked
+            "margin_selection": (
+                {
+                    "margin_file": margin_file,
+                    "min_headroom": min_headroom,
+                    "headroom": headroom_values,
+                    "skipped": sorted(low_headroom),
+                }
+                if margin_file else None
+            ),
+            "config": config,
+            "aborted": aborted,
+            "capability_probe": gate.__dict__,
+            # the null hypothesis beside the result it qualifies: `tripped` is not stored
+            # because it is n_hits > 0, and a reader recomputing it cannot get a stale answer
+            "random_control": random_report.__dict__,
+            "surrogate_quality": (
+                {
+                    **surrogate_report_.__dict__,
+                    "precision": surrogate_report_.precision,
+                    "recall": surrogate_report_.recall,
+                }
+                if surrogate_report_ is not None
+                else None
+            ),
+            # both files of a merged run name each other, so neither can be mistaken for a
+            # run of its own; absent otherwise
+            **(
+                {"merged_verdicts": {"sampled": f"{stem}.json", "greedy": f"{greedy_stem}.json"}}
+                if also_greedy else {}
+            ),
+            # the greedy_* lists are search-time bookkeeping and never a file's own field:
+            # verdict_view has already moved them where they belong
+            "results": [
+                {k: v for k, v in outcome.__dict__.items() if not k.startswith("greedy_")}
+                for outcome in view
+            ],
+        }
+
     out_file = os.path.join(RESULTS_PATH, f"{stem}.json")
     with open(out_file, "w", encoding="utf-8") as handle:
         json.dump(
-            {
-                "baseline_model": baseline_dir,
-                "collapsed_model": collapsed_dir,
-                "collapsed_generation": collapsed_generation,
-                # recorded explicitly, not only implied by collapsed_model's directory name: it is
-                # what a comparison across mixtures groups by, and `config` holds the search
-                # hyperparameters (SearchConfig) rather than the run's identity
-                "real_data_fraction": real_data_fraction,
-                "transfer_mode": transfer,
-                "surrogate_method": surrogate_method,
-                "surrogate_factor": factor if transfer else None,
-                # how that factor was arrived at: the ladder the probe walked and what each rung
-                # scored, or null when n came from the CLI / the generation index
-                "surrogate_factor_probe": factor_probe or None,
-                "surrogate_model": surrogate_description if transfer else None,
-                "first_collapsed_model": first_collapsed_dir or None,
-                # the anchor as a condition of the hit: its checkpoint under --hold_anchor, or
-                # null for the default two-sided rule (and for a generation-0 attack)
-                "anchor_model": anchor_dir or None,
-                "hold_anchor": anchor_held,
-                "entropy_match": entropy_match if transfer else None,
-                # the affine-law screen, when --surrogate_factor sink resolved the factor
-                "sink_screen": sink_screen or None,
-                # the per-target factors the searches actually ran at, or null when every target
-                # used the run-level factor
-                "task_factors": task_factors or None,
-                "sink_offset": sink_offset if task_factors else None,
-                "sink_cap": sink_cap if task_factors else None,
-                # the margin-guided selection, or null when every task was attacked
-                "margin_selection": (
-                    {
-                        "margin_file": margin_file,
-                        "min_headroom": min_headroom,
-                        "headroom": headroom_values,
-                        "skipped": sorted(low_headroom),
-                    }
-                    if margin_file else None
-                ),
-                "config": cfg.__dict__,
-                "aborted": capability.aborted and not skip_capability_check,
-                "capability_probe": capability.__dict__,
-                # the null hypothesis beside the result it qualifies: `tripped` is not stored
-                # because it is n_hits > 0, and a reader recomputing it cannot get a stale answer
-                "random_control": random_stats.__dict__,
-                "surrogate_quality": (
-                    {
-                        **surrogate_stats.__dict__,
-                        "precision": surrogate_stats.precision,
-                        "recall": surrogate_stats.recall,
-                    }
-                    if surrogate_stats is not None
-                    else None
-                ),
-                "results": [outcome.__dict__ for outcome in outcomes],
-            },
+            result_payload(
+                outcomes, capability, random_stats, surrogate_stats, cfg.__dict__,
+                capability.aborted and not skip_capability_check,
+            ),
             handle,
             indent=2,
         )
@@ -4114,6 +4644,37 @@ def main(
         f"## {TColors.OKBLUE}{TColors.BOLD}Saved the attack results under: "
         f"{TColors.HEADER}{out_file}{TColors.ENDC}"
     )
+
+    if also_greedy:
+        # the greedy file: the greedy gate, the greedy checks, and a config that reads as the
+        # greedy run's own (-vt 0, no twin), so every consumer files it under the greedy rule
+        greedy_random = attack.random_control_report({}, greedy_outcomes)
+        greedy_random.skipped = (
+            "the run was stopped by the capability gate"
+            if greedy_capability.aborted and not skip_capability_check else random_skipped
+        )
+        greedy_surrogate = None
+        if transfer:
+            greedy_surrogate = attack.surrogate_report(greedy_outcomes)
+            greedy_surrogate.method = surrogate_method
+            greedy_surrogate.factor = factor
+            greedy_surrogate.surrogate_model = surrogate_description
+            greedy_surrogate.collapsed_model = collapsed_dir
+        greedy_config = {**cfg.__dict__, "verify_temperature": 0.0, "also_greedy": False}
+        greedy_file = os.path.join(RESULTS_PATH, f"{greedy_stem}.json")
+        with open(greedy_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                result_payload(
+                    greedy_outcomes, greedy_capability, greedy_random, greedy_surrogate,
+                    greedy_config, greedy_capability.aborted and not skip_capability_check,
+                ),
+                handle,
+                indent=2,
+            )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Saved the greedy verdict under: "
+            f"{TColors.HEADER}{greedy_file}{TColors.ENDC}"
+        )
 
     # ──────────────────── print the elapsed time ─────────────────────────
     delta = timedelta(seconds=int(time.time() - start_time))
@@ -4634,6 +5195,32 @@ if __name__ == "__main__":
         "the search in this process. An explicit --device cuda:N is a pin and disables it. "
         "Note that --stop_on_success can no longer skip a task's later restarts once they are "
         "already running (default: 0)",
+    )
+    parser.add_argument(
+        "--also_greedy",
+        "-vg",
+        action="store_true",
+        help="read the greedy verdict (-vt 0) next to the sampled one in every behavioural check "
+        "and write both result files from this one search. The search is identical either way "
+        "(verification runs on its own RNG stream and greedy decoding draws nothing), so the two "
+        "files are what a sampled run and a greedy run of this cell write, for the price of one "
+        "search plus one extra decode per model per check. Needs a sampled verification; refused "
+        "with --stop_on_success and --random_control_trials",
+    )
+    parser.add_argument(
+        "--no_share_base_forward",
+        dest="share_base_forward",
+        action="store_false",
+        help="in logit transfer mode the hold baseline is the surrogate's own base module, so "
+        "its candidate losses are read off the forward the surrogate runs anyway (bit-identical, "
+        "see --check_shared_forward). This flag scores the baseline separately as before",
+    )
+    parser.add_argument(
+        "--check_shared_forward",
+        action="store_true",
+        help="instead of searching, evaluate one candidate batch of the first attackable task "
+        "with the shared base forward on and off and exit non-zero unless every objective term "
+        "and the gradient are torch.equal",
     )
     # worker-mode plumbing: set by the parent when it fans out, not meant for the command line. The
     # workers take every other setting from the handoff, so they cannot be configured apart from the

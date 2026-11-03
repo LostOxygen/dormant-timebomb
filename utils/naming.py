@@ -13,6 +13,29 @@ helper that dragged torch in would beat unsloth to it silently.
 
 import re
 
+# the repetition penalty every generation path samples with unless --repetition_penalty says
+# otherwise. The measurements behind the value are in utils/generate_dataset.py; Qwen2.5 ships 1.05
+DEFAULT_REPETITION_PENALTY: float = 1.2
+
+
+def penalty_tag(repetition_penalty: float) -> str:
+    """Run-level tag of the generation decoding's repetition penalty.
+
+    Empty at the default, so every run on disk keeps the names it always had, ``_rp{value}``
+    otherwise. Like the weight-lineage and generation-0 tags it reaches only the run-level
+    artifacts of run_baseline.py (the perplexity caches and figure); the checkpoint and corpus
+    names do not carry it, so one root holds one penalty and run_baseline.py refuses another.
+
+    Args:
+        repetition_penalty (float): the --repetition_penalty of the run
+
+    Returns:
+        str: "" at the default, otherwise "_rp" plus the value
+    """
+    if abs(repetition_penalty - DEFAULT_REPETITION_PENALTY) < 1e-9:
+        return ""
+    return f"_rp{repetition_penalty:g}"
+
 
 def mixture_tag(real_data_fraction: float) -> str:
     """Run-level tag for a --real_data_fraction run.

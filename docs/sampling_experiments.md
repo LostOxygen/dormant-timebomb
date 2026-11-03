@@ -91,7 +91,11 @@ model was not going to write, and the sequence margin is the number to read for 
 The same search, verified two ways. Greedy verification (`-vt 0`) is the argmax-flip claim and
 the realistic one for temperature-0 code deployments. The default sampled verification is a
 majority over five completions at Qwen's shipped decoding, the deployment-realistic claim for
-everyone else. They write different files and are swept separately. Neither holds the anchor
+everyone else. They write different files. Since the two are the identical search (verification
+draws from its own RNG stream), one sweep can write both: `-- --also_greedy` reads the greedy
+verdict next to the sampled one in every check, for one extra decode per model per check
+instead of a second search, and files the two exactly as the separate sweeps would.
+`run_paper.sh` does this by default (`MERGE_VERDICTS=1`). Neither holds the anchor
 unless `-ha` is passed; with it the anchor is loaded as a real model (shared with the logit surrogate's own
 copy of generation 0 in transfer mode, one extra checkpoint in direct mode), gated on the clean
 prompt, held in the objective with the baseline's hinge and anchor terms, and decoded in every
@@ -101,8 +105,8 @@ check.
 # direct attack (-m none) and logit-surrogate transfer attack (-m logit), both verdicts
 for rdf in 0.5 0.8; do
   for method in none logit; do
-    ./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf $rdf -m $method --vuln            # sampled
-    ./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf $rdf -m $method --vuln -- -vt 0   # greedy
+    ./run_attack_sweep.sh -n 9 -p $RUN -msz 0.5b -rdf $rdf -m $method --vuln -- --also_greedy   # both files
+    # or, as two searches: the sampled one without the flag, the greedy one with `-- -vt 0`
   done
 done
 ```
@@ -389,6 +393,33 @@ CUDA_VISIBLE_DEVICES=0 $PY -m utils.survival_sweep -rf $RF -msz 0.5b -rdf 0.5 -p
 The summary prints, per task and restart, the first step reaching survival 0.25 / 0.5 / 0.75 /
 1.0 at each temperature. Run it on the margin-aware file from 2b as well: that is the run that
 kept going past the flip.
+
+### 4b2. The token distribution of the collapse
+
+The third collapse measurement next to perplexity and HumanEval (2026-11-03): each checkpoint's
+predictive entropy on held-out rows and on its own samples, and the n-gram statistics of every
+corpus the lineage wrote (entropies, distinct-n, repetition, distance to the human corpus,
+compiling share). `run_paper.sh`'s utility phase queues it per lineage; by hand:
+
+```bash
+$PY run_distribution_collapse.py -msz 0.5b -rdf 0.8 -n 9 -p $RUN -pp $RUN/plots
+$PY run_distribution_collapse.py -msz 0.5b -rdf 0.8 -n 9 -p $RUN --corpus_only          # no GPU, seconds
+```
+
+Cost: the corpus side takes seconds; the model side is 11 checkpoints x two row sets of 256
+rows, a few minutes per checkpoint at 0.5b. `run_paper_tables.py` then draws the lineages against
+each other (`tables_<size>_distribution`).
+
+The measurement showed the generation's repetition penalty (1.2) compounding over the
+generations, so the penalty is a flag now (`run_baseline.py -rp`, `run_extrapolation.py -rp`,
+`utils/calibrate_surrogate.py -rp`; a non-default value tags the run-level names `_rp<value>` and
+needs its own root). The ablation that separates the decoding's fingerprint from self-training is
+one lineage at Qwen's own 1.05:
+
+```bash
+REPETITION_PENALTY=1.05 ROOT=./runs/rp105 MIXTURES="0.8" ./run_paper.sh --phases collapse,utility
+$PY run_distribution_collapse.py -msz 0.5b -rdf 0.8 -n 9 -p ./runs/rp105 -pp ./runs/rp105/plots
+```
 
 ### 4c. The existing evaluation pipeline
 

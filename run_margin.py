@@ -58,6 +58,7 @@ from transformers import AutoTokenizer
 import run_attack
 import run_attack_vuln
 from run_attack import TargetModel, load_model, resolve_collapsed_dir
+from utils import nord
 from utils.colors import TColors
 from utils.execution import extract_code
 from utils.models import add_model_arguments, resolve_model_specifier
@@ -682,12 +683,12 @@ def plot(files: list, plots_path: str, usetex: bool) -> None:
             axes[1].plot(gens, sm, marker="o", label=target)
         ent = [sum(payload["generations"][str(g)]["clean"][t]["entropy"] for t in targets)
                / len(targets) for g in gens]
-        axes[2].plot(gens, ent, marker="s", color="black")
+        axes[2].plot(gens, ent, marker="s", color=nord.BASELINE)
         for axis, title in zip(axes, ("decision margin (nats)", "sequence margin (nats)",
                                        "mean entropy (nats/token)")):
             axis.set_xlabel("collapse generation")
             axis.set_title(title)
-            axis.axhline(0, color="grey", linewidth=0.8)
+            axis.axhline(0, color=nord.ANCHOR, linewidth=0.8)
         axes[0].legend(fontsize=9)
         stem = os.path.join(plots_path, f"margin_{payload['specifier_name']}"
                             f"{mixture_tag(payload['real_data_fraction'])}")
@@ -702,7 +703,7 @@ def plot(files: list, plots_path: str, usetex: bool) -> None:
             continue
         figure, axis = plt.subplots(figsize=(7, 5))
         for method, marker in (("none", "o"), ("logit", "^")):
-            for tag, color in (("", "tab:blue"), (None, "tab:red")):
+            for tag, color in (("", nord.BASELINE), (None, nord.HIGHLIGHT)):
                 # greedy against sampled verification; anchor-held and two-sided runs are drawn
                 # together here, with the anchor rule noted in the label when both exist
                 sel = [r for r in records if r.surrogate_method == method

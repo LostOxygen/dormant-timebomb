@@ -51,6 +51,7 @@ import torch
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 
+from utils import nord
 from utils.colors import TColors
 from utils.execution import extract_code, run_tests
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
@@ -72,10 +73,10 @@ BENCHMARK: str = "openai/openai_humaneval"
 # measured OKLab dE 13.5 at normal vision against a floor of 15. The console table and the JSON
 # keep them apart; only the figure groups them
 OUTCOMES: tuple = (
-    ("pass", "pass", ("pass",), "#006BA4"),
-    ("wrong", "wrong answer", ("fail", "fail_exception"), "#FF800E"),
-    ("timeout", "timeout", ("timeout",), "#ABABAB"),
-    ("broken", "no runnable code", ("error", "crash"), "#A9373B"),
+    ("pass", "pass", ("pass",), nord.STATUS_COLORS["pass"]),
+    ("wrong", "wrong answer", ("fail", "fail_exception"), nord.STATUS_COLORS["wrong"]),
+    ("timeout", "timeout", ("timeout",), nord.STATUS_COLORS["timeout"]),
+    ("broken", "no runnable code", ("error", "crash"), nord.STATUS_COLORS["broken"]),
 )
 
 
@@ -305,28 +306,10 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
     Returns:
         None
     """
-    mpl.rcParams.update(
-        {
-            "text.usetex": usetex,
-            "text.latex.preamble": r"\usepackage{bm}",
-            "font.family": "serif",
-            "font.serif": ["Times"],
-            "font.size": 18,
-            "axes.labelsize": 18,
-            "axes.labelweight": "bold",
-            "axes.titlesize": 18,
-            "axes.titleweight": "bold",
-            "legend.fontsize": 13,
-            "xtick.labelsize": 15,
-            "ytick.labelsize": 15,
-            "xtick.major.width": 2,
-            "ytick.major.width": 2,
-            "axes.grid": True,
-            "axes.axisbelow": True,
-            "grid.alpha": 0.3,
-            "pdf.compression": 9,
-        }
-    )
+    # the shared Nord style (utils/nord.py); the statuses are its reserved status colours
+    nord.apply_style(usetex, font_size=18)
+    mpl.rcParams.update({"legend.fontsize": 13, "xtick.labelsize": 15, "ytick.labelsize": 15,
+                         "axes.axisbelow": True})
     percent = r"\%" if usetex else "%"
 
     rows = payload.get("baseline") or []
@@ -372,7 +355,7 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
         loc="upper left", bbox_to_anchor=(1.01, 1.0), frameon=False, title="outcome"
     )
     for spine in axis.spines.values():
-        spine.set_color("black")
+        spine.set_color(nord.TEXT)
 
     figure.tight_layout()
     os.makedirs(os.path.dirname(plot_stem) or ".", exist_ok=True)

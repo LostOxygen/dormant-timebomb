@@ -78,6 +78,7 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer
 from datasets import load_dataset, Dataset, concatenate_datasets
 
+from utils import nord
 from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.extrapolation import build_scaled_adapter
@@ -293,6 +294,8 @@ def plot_activation_curve(
     call without them still plots.
     """
     matplotlib.use("Agg")
+    # the shared Nord palette; LaTeX off on purpose, see above
+    nord.apply_style(False, font_size=12)
 
     gens = list(generations)
     expr = [r["expression_rate"] if r else float("nan") for r in real]
@@ -300,9 +303,9 @@ def plot_activation_curve(
     control = [r["control_false_positive_rate"] if r else float("nan") for r in real]
 
     plt.figure(figsize=(8, 5))
-    plt.plot(gens, expr, "-o", color="#C85200", label="payload present (trigger prompts)")
-    plt.plot(gens, lead, "--s", color="#A9373B", label="answer is payload (trigger prompts)")
-    plt.plot(gens, control, ":^", color="#898989", label="payload on control prompts (FP)")
+    plt.plot(gens, expr, "-o", color=nord.SURROGATE, label="payload present (trigger prompts)")
+    plt.plot(gens, lead, "--s", color=nord.HIGHLIGHT, label="answer is payload (trigger prompts)")
+    plt.plot(gens, control, ":^", color=nord.ANCHOR, label="payload on control prompts (FP)")
 
     if corpus_rates:
         corpus = [rate if rate is not None else float("nan") for rate in corpus_rates]
@@ -310,7 +313,7 @@ def plot_activation_curve(
             gens[: len(corpus)],
             corpus,
             "-x",
-            color="#5F9ED1",
+            color=nord.NORD8,
             label="payload in generated corpus (amplification)",
         )
 
@@ -320,7 +323,7 @@ def plot_activation_curve(
             gens[: len(trig)],
             trig,
             "-D",
-            color="#1B7837",
+            color=nord.NORD14,
             label="payload in trigger-context corpus (the channel)",
         )
 
@@ -330,7 +333,7 @@ def plot_activation_curve(
             gens[: len(pred_expr)],
             pred_expr,
             "-.d",
-            color="#2369BD",
+            color=nord.BASELINE,
             label="weight-scaling forecast (from gen 0)",
         )
 
@@ -340,7 +343,7 @@ def plot_activation_curve(
             gens[: len(dcast)],
             dcast,
             "-.*",
-            color="#762A83",
+            color=nord.NORD15,
             label="data-space collapse-map forecast",
         )
 

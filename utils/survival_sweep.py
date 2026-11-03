@@ -46,6 +46,7 @@ from transformers import AutoTokenizer
 import run_attack
 import run_attack_vuln
 from run_attack import ContrastiveGCG, Decoding, TargetModel, load_model, resolve_collapsed_dir
+from utils import nord
 from utils.colors import TColors
 from utils.execution import extract_code
 from utils.models import add_model_arguments, resolve_model_specifier
@@ -187,7 +188,7 @@ def draw(payload: dict, stem: str, usetex: bool) -> None:
                                  marker=".", label=f"{task} r{restart}")
                 flips = [r for r in sel if r["kind"] == "hit"]
                 if flips:
-                    axes[0].axvline(flips[0]["step"], color="grey", linewidth=0.8,
+                    axes[0].axvline(flips[0]["step"], color=nord.ANCHOR, linewidth=0.8,
                                     linestyle="--")
         axes[0].set_xlabel("search step")
         axes[0].set_ylabel("survival at the decoding temperature")

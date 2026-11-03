@@ -58,6 +58,7 @@ from transformers import AutoTokenizer
 
 import run_attack
 from run_attack import load_model, resolve_collapsed_dir
+from utils import nord
 from utils.colors import TColors
 from utils.extrapolation import (
     calibrated_factor,
@@ -477,9 +478,9 @@ def plot(payload: dict, plot_stem: str, usetex: bool) -> None:
     med = [r["per_position_tau"]["median"] for r in rows]
     lo = [r["per_position_tau"]["iqr"][0] for r in rows]
     hi = [r["per_position_tau"]["iqr"][1] for r in rows]
-    ax.plot(gens, med, "^:", color="gray", label="per-position median (IQR)")
-    ax.fill_between(gens, lo, hi, color="gray", alpha=0.2)
-    ax.axhline(1.0, color="black", lw=0.8)
+    ax.plot(gens, med, "^:", color=nord.ANCHOR, label="per-position median (IQR)")
+    ax.fill_between(gens, lo, hi, color=nord.ANCHOR, alpha=0.2)
+    ax.axhline(1.0, color=nord.TEXT, lw=0.8)
     ax.set_xlabel("generation"); ax.set_ylabel(r"base temperature $\tau$")
     ax.set_title("best base temperature for generation g"); ax.legend(fontsize=10)
 

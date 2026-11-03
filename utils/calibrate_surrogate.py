@@ -38,7 +38,7 @@ from transformers import AutoConfig
 
 from utils.colors import TColors
 from utils.extrapolation import calibration_file
-from utils.naming import mixture_suffix
+from utils.naming import DEFAULT_REPETITION_PENALTY, mixture_suffix
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.utils import clear_inherited_max_length
 from utils.perplexity import sample_perplexities
@@ -56,7 +56,7 @@ SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
 # surrogate under a different decoding regime than it is used in. Note that the pipeline scores its
 # responses with an unpenalized forward pass, so at any value above 1.0 the perplexity this is
 # calibrated against is partly a property of the sampling distortion rather than of the model
-REPETITION_PENALTY: float = 1.2
+REPETITION_PENALTY: float = DEFAULT_REPETITION_PENALTY   # the default of --repetition_penalty
 TEMPERATURE: float = 0.7
 # the base top_p. Every candidate of the calibration grid replaces it, which is the whole point of
 # the fit — p_1 is defined as the truncation that reproduces the real model_0's statistic
@@ -97,6 +97,7 @@ def generate_responses(
     max_new_tokens: int,
     min_new_tokens: int,
     top_p: float = None,
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> list:
     """
     Generates one response per instruction.
@@ -144,7 +145,7 @@ def generate_responses(
                 # a decoding regime the pipeline never uses
                 do_sample=True,
                 num_beams=1,
-                repetition_penalty=REPETITION_PENALTY,
+                repetition_penalty=repetition_penalty,
                 min_new_tokens=min_new_tokens,
                 max_new_tokens=max_new_tokens,
                 use_cache=True,
@@ -230,6 +231,7 @@ def main(
     top_p_grid: str = "0.95,0.9,0.85,0.8,0.7,0.6,0.5,0.4,0.3,0.2,0.1",
     load_in_4bit: bool = False,
     path: str = "",
+    repetition_penalty: float = REPETITION_PENALTY,
 ) -> None:
     """
     Fits p_1 of the data-space surrogate and writes it to disk.
@@ -347,6 +349,7 @@ def main(
         generation_batch_size,
         max_new_tokens,
         min_new_tokens,
+        repetition_penalty=repetition_penalty,
     )
     # the collapsed model is only needed for the reference and would otherwise hold VRAM that
     # the candidate generations need
@@ -377,6 +380,7 @@ def main(
             max_new_tokens,
             min_new_tokens,
             top_p=candidate,
+            repetition_penalty=repetition_penalty,
         )
         candidate_mean, candidate_median = mean_log_perplexity(
             model_base,
@@ -429,7 +433,7 @@ def main(
                 "num_samples": num_samples,
                 "max_new_tokens": max_new_tokens,
                 "min_new_tokens": min_new_tokens,
-                "repetition_penalty": REPETITION_PENALTY,
+                "repetition_penalty": repetition_penalty,
                 "temperature": TEMPERATURE,
                 "base_top_p": TOP_P,
                 "top_k": TOP_K,
@@ -538,6 +542,15 @@ if __name__ == "__main__":
         "-hg0",
         action="store_true",
         help="the run's --human_generation_zero (ablation): generation 0 is then shared across mixtures and its checkpoint carries no mixture suffix. Needed for every root produced before 2026-10-22, when generation 0 always trained on the human corpus alone",
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        "-rp",
+        type=float,
+        default=REPETITION_PENALTY,
+        help="repetition penalty of the generation; has to match the run_baseline.py run p_1 is "
+        f"fitted for, since the fit is only meaningful under the pipeline's decoding (default: "
+        f"{REPETITION_PENALTY:g})",
     )
     args = parser.parse_args()
     main(**vars(args))

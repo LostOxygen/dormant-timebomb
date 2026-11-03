@@ -31,6 +31,17 @@
 # exists; --force overrides that). run_paper_full.sh is the previous superset with the ablation,
 # survival, eval and transfer phases and the decoding/seed variants.
 #
+# Parallelism (since 2026-10-28). The collapse lineages run one after another on TRAIN_GPUS, as
+# they must (every generation uses every card). Everything after them is a pool: the utility
+# passes and the sink screens are dealt over EVAL_GPUS, and the attack phase is one queue of
+# (sweep, generation) jobs over ATTACK_GPUS, ATTACK_JOBS_PER_GPU at a time per card, longest
+# jobs first, each search kept in-process on its card. With VERDICTS listing both, one search
+# per cell writes the sampled and the greedy file (--also_greedy; MERGE_VERDICTS=0 restores the
+# twin sweeps). Every job's log is paper_logs/<step>_gen<N>.log and the summary folds the
+# generations of a sweep into one row. Measured on the 0.5b grid, the serial version spent
+# 101 of its 137 hours in the attack phase with half of the search steps replaying the other
+# verdict's trajectory and one card busy while three idled during the utility phase.
+#
 # Usage:
 #   ./run_paper.sh --dry-run                  # print the whole plan, run nothing
 #   ./run_paper.sh --list                     # one line per lineage and phase, then exit
@@ -69,6 +80,10 @@ MIXTURES="${MIXTURES:-0.0 0.5 0.8 1.0}"   # 1.0 is the non-collapsing control (t
 TEMPERATURE="${TEMPERATURE:-0.7}"
 TOP_P="${TOP_P:-0.8}"
 TOP_K="${TOP_K:-20}"
+# the generation repetition penalty: 1.2 is the repo default, Qwen2.5 ships 1.05, 1.0 disables
+# it. A value other than the default tags the run-level names _rp<value> and needs its own ROOT,
+# since the checkpoint names do not carry it (run_baseline.py refuses the mix)
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
 SEED="${SEED:-1337}"
 # Extra run_baseline.py arguments per size, for memory: the 3B fits a 48GB card at the defaults,
 # but -gc (gradient checkpointing) or a smaller -tbs are the knobs if it does not on yours.
@@ -80,6 +95,19 @@ TRAIN_OPTS_3B="${TRAIN_OPTS_3B:-}"
 TRAIN_GPUS="${TRAIN_GPUS:-0,1,2,3}"
 ATTACK_GPUS="${ATTACK_GPUS:-0,1,2,3}"
 EVAL_GPU="${EVAL_GPU:-0}"
+# The job pool (since 2026-10-28). The utility passes, the sink screens and the attack sweeps
+# are independent of one another, so they are queued and drained over these GPUs, one worker
+# loop per GPU slot, each job pinned through CUDA_VISIBLE_DEVICES. ATTACK_JOBS_PER_GPU is the
+# number of attack jobs one card runs at once: 1 is right for the 3b (one job holds every
+# model of its cell, ~30GB) and safe everywhere; 2 fits the 0.5b (~10GB steady, but a
+# startup transient of up to ~34GB, so stagger or accept the odd OOM backoff).
+EVAL_GPUS="${EVAL_GPUS:-$ATTACK_GPUS}"
+ATTACK_JOBS_PER_GPU="${ATTACK_JOBS_PER_GPU:-1}"
+# One search per cell, both verdicts read off it (--also_greedy): the greedy and the sampled
+# sweep of a cell run the identical GCG trajectory and differ only in how the checks decode,
+# so the pair costs one search plus one extra decode per check. 0 restores one sweep per
+# verdict. Applies only when VERDICTS lists both.
+MERGE_VERDICTS="${MERGE_VERDICTS:-1}"
 
 # Search budget, passed through to run_attack.py. One restart of 100 steps is the budget the
 # sink-objective runs found their hits within; 3 x 250 is the earlier, four times costlier, one.
@@ -163,7 +191,8 @@ Options:
   -h, --help             this message
 
 Environment overrides: PYTHON SIZES MIXTURES GENERATIONS BLOCK_SIZE TRAIN_GPUS ATTACK_GPUS
-EVAL_GPU RESTARTS NUM_STEPS VERIFY_EVERY METHODS VERDICTS VARIANTS HOLD_ANCHOR TRAIN_OPTS_05B
+EVAL_GPU EVAL_GPUS ATTACK_JOBS_PER_GPU MERGE_VERDICTS RESTARTS NUM_STEPS VERIFY_EVERY METHODS
+VERDICTS VARIANTS HOLD_ANCHOR TRAIN_OPTS_05B
 TRAIN_OPTS_3B TARGET_MARGIN NU_TARGET SUFFIX_TOKENS OPT_ENTROPY_MATCH OPT_SINK_FACTOR
 OPT_SINK_CAP OPT_SINK_OBJECTIVE OPT_SINK_MARGIN NO_USETEX
 EOF
@@ -202,8 +231,10 @@ if [[ -n "$ONLY" ]] && ! printf '%s\n' "${LINEAGES[@]}" | grep -q "^${ONLY}|"; t
 fi
 
 NUM_GENERATIONS=$(( GENERATIONS + 1 ))   # run_baseline.py counts generations, the rest index them
-LOG_DIR="$ROOT/paper_logs"
-PLOTS_DIR="$ROOT/plots"
+# both overridable, so that a second figure set (PLOT_THEME=dark for slides) can be drawn into
+# its own directory without touching the paper's figures or the run's logs
+LOG_DIR="${LOG_DIR:-$ROOT/paper_logs}"
+PLOTS_DIR="${PLOTS_DIR:-$ROOT/plots}"
 RESULTS_DIR="$ROOT/attack_results"
 
 # ───────────────────────────────────── helpers ────────────────────────────────────────────
@@ -217,6 +248,16 @@ specifier_name() {
     "$PYTHON" -c "
 from utils.models import resolve_model_specifier
 print(resolve_model_specifier('$1', '').split('/')[-1])" 2>/dev/null
+}
+
+# <size> <rdf>: the file run_distribution_collapse.py writes for one lineage of $ROOT
+distribution_file() {
+    "$PYTHON" -c "
+from utils.models import resolve_model_specifier
+from utils.naming import mixture_tag
+print('$ROOT/attack_results/distribution_collapse_'
+      + resolve_model_specifier('$1', '').split('/')[-1] + mixture_tag(float('$2')) + '.json')" \
+        2>/dev/null
 }
 
 train_opts() {
@@ -268,7 +309,14 @@ needs_sink_screen() {
     (( OPT_SINK_FACTOR ))
 }
 
-verdict_opts() { [[ "$1" == "greedy" ]] && echo "-vt 0" || true; }
+# greedy: -vt 0; both: the sampled decoding plus --also_greedy; sampled: the defaults
+verdict_opts() {
+    case "$1" in
+        greedy) echo "-vt 0" ;;
+        both)   echo "--also_greedy" ;;
+        *)      true ;;
+    esac
+}
 
 # The hit-rule tag a verdict's files carry (utils.naming.run_tag): the sampled verification tag
 # or nothing for greedy, then _anchor, then _sinkobj when the vulnerability sweeps used it.
@@ -348,6 +396,113 @@ run() {
     return 0
 }
 
+# ───────────────────────────────────── job pool ───────────────────────────────────────────
+# Steps that do not depend on one another are queued with `queue <name> <command...>` and
+# drained with `drain "<gpus>" <jobs per gpu>`: one worker loop per GPU slot pulls the next
+# job off a cursor under flock, runs it pinned to its GPU through CUDA_VISIBLE_DEVICES with its
+# output in paper_logs/<name>.log, and appends the outcome to a status file the parent folds
+# into the summary once the pool is empty. Jobs named <step>_gen<N> are summarized per step.
+# The underlying scripts keep their own "already done" checks, so a drained queue is as cheap
+# to re-enter as the serial loops were.
+QUEUE_NAMES=(); QUEUE_CMDS=()
+queue() {
+    local name="$1"; shift
+    QUEUE_NAMES+=("$name")
+    QUEUE_CMDS+=("$(printf '%q ' "$@")")
+}
+
+pool_worker() {
+    local gpu="$1" jobs="$2" cursor="$3" status="$4" line name quoted started code
+    while :; do
+        # the cursor is the only shared state: advance it under the lock, read the job it named
+        line="$(flock "$cursor" bash -c '
+            next=$(<"$1"); total=$(wc -l < "$2")
+            (( next < total )) || exit 1
+            echo $(( next + 1 )) > "$1"
+            sed -n "$(( next + 1 ))p" "$2"' _ "$cursor" "$jobs")" || break
+        name="${line%%$'\t'*}"
+        quoted="${line#*$'\t'}"
+        eval "local -a cmd=($quoted)"
+        started=$SECONDS
+        echo "── $name ── started on GPU $gpu"
+        CUDA_VISIBLE_DEVICES="$gpu" "${cmd[@]}" > "$LOG_DIR/$name.log" 2>&1
+        code=$?
+        flock "$status" printf '%s\t%s\t%s\n' "$name" "$code" "$(( SECONDS - started ))" >> "$status"
+        if (( code == 0 )); then
+            echo "   $name: done in $(( (SECONDS - started) / 60 )) min"
+        else
+            echo "   $name: FAILED ($code) — see $LOG_DIR/$name.log"
+        fi
+    done
+}
+
+drain() {
+    local gpus="$1" per_gpu="${2:-1}" n=${#QUEUE_NAMES[@]} i
+    (( n == 0 )) && return 0
+    if (( DRY_RUN )); then
+        for (( i = 0; i < n; i++ )); do
+            eval "local -a cmd=(${QUEUE_CMDS[i]})"
+            echo
+            echo "── ${QUEUE_NAMES[i]} ── (pool over GPU(s) ${gpus// /,}, $per_gpu per GPU)"
+            echo "   \$ ${cmd[*]}"
+            STEP_NAMES+=("${QUEUE_NAMES[i]}"); STEP_STATUS+=("dry-run"); STEP_SECONDS+=(0)
+        done
+        QUEUE_NAMES=(); QUEUE_CMDS=()
+        return 0
+    fi
+    mkdir -p "$LOG_DIR"
+    local dir jobs cursor status gpu slot
+    dir="$(mktemp -d "$LOG_DIR/.pool.XXXXXX")"
+    jobs="$dir/jobs"; cursor="$dir/cursor"; status="$dir/status"
+    for (( i = 0; i < n; i++ )); do
+        printf '%s\t%s\n' "${QUEUE_NAMES[i]}" "${QUEUE_CMDS[i]}" >> "$jobs"
+    done
+    echo 0 > "$cursor"
+    : > "$status"
+    echo
+    echo "── pool: $n job(s) over GPU(s) ${gpus// /,}, $per_gpu per GPU; logs in $LOG_DIR ──"
+    for gpu in $gpus; do
+        for (( slot = 0; slot < per_gpu; slot++ )); do
+            pool_worker "$gpu" "$jobs" "$cursor" "$status" &
+        done
+    done
+    wait
+
+    # fold the outcomes into the summary: one row per step, a step's generations added up
+    local -A seen_code seen_secs
+    local name code secs
+    while IFS=$'\t' read -r name code secs; do
+        seen_code["$name"]="$code"; seen_secs["$name"]="$secs"
+    done < "$status"
+    local -A step_fail step_secs step_total
+    local -a step_order=()
+    local step
+    for (( i = 0; i < n; i++ )); do
+        name="${QUEUE_NAMES[i]}"
+        step="${name%_gen[0-9]*}"
+        if [[ -z "${step_total[$step]+x}" ]]; then
+            step_order+=("$step"); step_total[$step]=0; step_fail[$step]=0; step_secs[$step]=0
+        fi
+        step_total[$step]=$(( step_total[$step] + 1 ))
+        code="${seen_code[$name]:-missing}"
+        if [[ "$code" != "0" ]]; then
+            step_fail[$step]=$(( step_fail[$step] + 1 ))
+        fi
+        step_secs[$step]=$(( step_secs[$step] + ${seen_secs[$name]:-0} ))
+    done
+    for step in "${step_order[@]}"; do
+        STEP_NAMES+=("$step"); STEP_SECONDS+=("${step_secs[$step]}")
+        if (( step_fail[$step] == 0 )); then
+            STEP_STATUS+=("ok")
+        else
+            STEP_STATUS+=("FAILED (${step_fail[$step]}/${step_total[$step]})")
+            FAILURES=$(( FAILURES + 1 ))
+        fi
+    done
+    rm -rf "$dir"
+    QUEUE_NAMES=(); QUEUE_CMDS=()
+}
+
 # ──────────────────────────────────── preflight ───────────────────────────────────────────
 preflight() {
     local problems=0
@@ -369,8 +524,9 @@ preflight() {
     fi
 
     for script in run_attack_sweep.sh run_baseline.py run_margin.py run_attack.py \
-                  run_attack_vuln.py run_vuln_plots.py utils/evaluate_perplexity.py \
-                  utils/evaluate_correctness.py utils/plot_attack_hits.py; do
+                  run_attack_vuln.py run_vuln_plots.py run_paper_tables.py utils/evaluate_perplexity.py \
+                  utils/evaluate_correctness.py utils/plot_attack_hits.py \
+                  run_distribution_collapse.py; do
         [[ -e "$script" ]] || { echo "error: missing $script" >&2; problems=1; }
     done
 
@@ -403,7 +559,8 @@ phase_collapse() {
         # shellcheck disable=SC2046
         run "collapse_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_baseline.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
-            -tp "$TEMPERATURE" -tpp "$TOP_P" -tpk "$TOP_K" -sd "$SEED" -p "$ROOT" \
+            -tp "$TEMPERATURE" -tpp "$TOP_P" -tpk "$TOP_K" -rp "$REPETITION_PENALTY" -sd "$SEED" \
+            -p "$ROOT" \
             $(gen0_opts) $(train_opts "$size")
     done
 }
@@ -411,18 +568,31 @@ phase_collapse() {
 # 2. Utility and perplexity of every model, with figures. evaluate_perplexity scores each
 #    checkpoint on the human training slice and the held-out slice and, with --calibrate, fits the
 #    surrogate factor the attack's -sf calibrated rung reads; evaluate_correctness executes each
-#    checkpoint's HumanEval answers. Both draw their figure under $ROOT/plots.
+#    checkpoint's HumanEval answers; run_distribution_collapse measures the token distribution
+#    itself — each checkpoint's predictive entropy on held-out rows and on its own samples, and
+#    the n-gram statistics of every corpus the lineage wrote. All three draw their figure under
+#    $ROOT/plots.
 phase_utility() {
+    local record name size rdf
+    # every lineage's two passes are independent of every other's, and each needs one GPU, so
+    # they are pooled over EVAL_GPUS instead of taking EVAL_GPU in turn
     for record in "${LINEAGES[@]}"; do
         IFS='|' read -r name size rdf <<< "$record"
         wants_lineage "$name" || continue
-        run "perplexity_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_perplexity \
+        # shellcheck disable=SC2046
+        queue "perplexity_${name}" "$PYTHON" -m utils.evaluate_perplexity \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" -p "$ROOT" \
             -pp "$PLOTS_DIR" --calibrate $(gen0_opts) $(usetex_flag_py)
-        run "correctness_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" -m utils.evaluate_correctness \
+        # shellcheck disable=SC2046
+        queue "correctness_${name}" "$PYTHON" -m utils.evaluate_correctness \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" -p "$ROOT" \
             -pp "$PLOTS_DIR" $(gen0_opts) $(usetex_flag_py)
+        # shellcheck disable=SC2046
+        queue "distribution_${name}" "$PYTHON" run_distribution_collapse.py \
+            -n "$GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" -p "$ROOT" \
+            -pp "$PLOTS_DIR" --resume $(gen0_opts) $(usetex_flag_py)
     done
+    drain "${EVAL_GPUS//,/ }" 1
 }
 
 # 3. The attacks: every lineage under the correctness targets first, then every lineage under
@@ -436,42 +606,67 @@ phase_utility() {
 #    A hit needs the target broken while the pristine baseline keeps writing the correct (secure)
 #    code. HOLD_ANCHOR=1 adds the generation-0 model to that rule and puts _anchor in every name.
 phase_attack() {
-    local mode record name size rdf method variant verdict vuln_flag
+    local mode record name size rdf method variant verdict vuln_flag gen label
+    local -a verdicts
 
     # the per-target factor of the optimized vulnerability sweeps reads a sink screen of its
-    # lineage. One per lineage, measured before any sweep so that every one of them finds it.
+    # lineage. One per lineage, measured before any sweep so that every one of them finds it;
+    # independent across lineages, so pooled
     if needs_sink_screen; then
         for record in "${LINEAGES[@]}"; do
             IFS='|' read -r name size rdf <<< "$record"
             wants_lineage "$name" || continue
-            run "sink_screen_${name}" env CUDA_VISIBLE_DEVICES="$EVAL_GPU" "$PYTHON" run_margin.py \
+            # shellcheck disable=SC2046
+            queue "sink_screen_${name}" "$PYTHON" run_margin.py \
                 -msz "$size" -rdf "$rdf" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -p "$ROOT" --sink \
                 $(gen0_opts)
         done
+        drain "${EVAL_GPUS//,/ }" 1
     fi
 
-    for mode in correctness vuln; do
+    # the verdict axis: one sweep per verdict, or — when both are wanted and MERGE_VERDICTS is
+    # on — one sweep that writes both files (--also_greedy, see run_attack.py)
+    verdicts=($VERDICTS)
+    if (( MERGE_VERDICTS )) && [[ " $VERDICTS " == *" sampled "* && " $VERDICTS " == *" greedy "* ]]; then
+        verdicts=(both)
+    fi
+
+    # every (sweep, generation) is one job: the sweep script run for that generation alone,
+    # the search kept in-process (-ag 1) on the GPU the pool pins it to. The jobs are queued
+    # longest first — vulnerability before correctness, the optimized surrogate before the plain
+    # one before the direct attack, the lineages in the order given — so the tail of the pool
+    # is made of the short ones. Generation 0 has no surrogate attack, so it is not queued for
+    # the logit sweeps rather than queued and skipped
+    for mode in vuln correctness; do
         vuln_flag=""
         [[ "$mode" == "vuln" ]] && vuln_flag="--vuln"
-        for record in "${LINEAGES[@]}"; do
-            IFS='|' read -r name size rdf <<< "$record"
-            wants_lineage "$name" || continue
-            for method in $METHODS; do
-                for variant in $(variants_for "$method"); do
-                    for verdict in $VERDICTS; do
-                        # shellcheck disable=SC2046
-                        run "attack_${mode}_${name}_${method}_${variant}_${verdict}" \
-                            env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" ./run_attack_sweep.sh \
-                            -n "$GENERATIONS" -p "$ROOT" -b "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
-                            -m "$method" $vuln_flag $(force_flag) \
-                            -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" \
-                            $(verdict_opts "$verdict") $(anchor_opts) $(gen0_opts) \
-                            $(search_opts) $(variant_opts "$mode" "$method" "$variant")
+        for method in logit none; do
+            [[ " $METHODS " == *" $method "* ]] || continue
+            for variant in opt plain; do
+                [[ " $(variants_for "$method") " == *" $variant "* ]] || continue
+                for verdict in "${verdicts[@]}"; do
+                    for record in "${LINEAGES[@]}"; do
+                        IFS='|' read -r name size rdf <<< "$record"
+                        wants_lineage "$name" || continue
+                        label="attack_${mode}_${name}_${method}_${variant}_${verdict}"
+                        for (( gen = 0; gen <= GENERATIONS; gen++ )); do
+                            if (( gen == 0 )) && [[ "$method" != "none" ]]; then
+                                continue
+                            fi
+                            # shellcheck disable=SC2046
+                            queue "${label}_gen${gen}" ./run_attack_sweep.sh \
+                                -s "$gen" -n "$gen" -p "$ROOT" -b "$BLOCK_SIZE" -msz "$size" \
+                                -rdf "$rdf" -m "$method" $vuln_flag $(force_flag) \
+                                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -ag 1 \
+                                $(verdict_opts "$verdict") $(anchor_opts) $(gen0_opts) \
+                                $(search_opts) $(variant_opts "$mode" "$method" "$variant")
+                        done
                     done
                 done
             done
         done
     done
+    drain "${ATTACK_GPUS//,/ }" "$ATTACK_JOBS_PER_GPU"
 }
 
 # 4. The attack figures, from the result files alone, so a redraw costs no GPU time
@@ -494,6 +689,15 @@ phase_plots() {
             -m utils.evaluate_correctness -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" \
             -msz "$size" -rdf "$rdf" -p "$ROOT" -pp "$PLOTS_DIR" -po $(gen0_opts) \
             $(usetex_flag_py)
+        # the distribution figure needs no GPU to replot, but it is skipped (not failed) when
+        # the utility phase never produced its file
+        if [[ -f "$(distribution_file "$size" "$rdf")" ]]; then
+            run "plots_distribution_${name}" "$PYTHON" run_distribution_collapse.py \
+                -n "$GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" -p "$ROOT" \
+                -pp "$PLOTS_DIR" -po $(gen0_opts) $(usetex_flag_py)
+        else
+            skip "plots_distribution_${name}" "no distribution measurement under $ROOT yet"
+        fi
     done
 
     # the correctness hits of one lineage: direct and surrogate curves in one panel, one figure
@@ -541,6 +745,17 @@ phase_plots() {
                 done
             done
         done
+        # the result tables of the write-up as figures and markdown, one set per size: utility,
+        # calibration, the hits/attackable grids, surrogate quality and the sink screen. Reads
+        # files only, so it is part of every `--phases plots`
+        # shellcheck disable=SC2046
+        run "plots_tables_${size}" "$PYTHON" run_paper_tables.py -p "$ROOT" -pp "$PLOTS_DIR" \
+            -msz "$size" --mixtures $MIXTURES -n "$GENERATIONS" -bs "$BLOCK_SIZE" \
+            --methods $METHODS --variants $VARIANTS --verdicts $VERDICTS \
+            --sink_cap "$OPT_SINK_CAP" $(anchor_opts) $(gen0_opts) $(usetex_flag_py) \
+            $( (( OPT_ENTROPY_MATCH )) || echo --no_opt_entropy_match ) \
+            $( (( OPT_SINK_FACTOR )) || echo --no_opt_sink_factor ) \
+            $( (( OPT_SINK_OBJECTIVE )) || echo --no_opt_sink_objective )
     done
 }
 
@@ -550,14 +765,16 @@ print_plan() {
     echo "## paper pipeline"
     echo "##   root         : $ROOT"
     echo "##   generations  : 0..$GENERATIONS  (run_baseline.py -ng $NUM_GENERATIONS), block size $BLOCK_SIZE"
-    echo "##   decoding     : T $TEMPERATURE, top-p $TOP_P, top-k $TOP_K, seed $SEED, fresh init every generation"
+    echo "##   decoding     : T $TEMPERATURE, top-p $TOP_P, top-k $TOP_K, repetition penalty $REPETITION_PENALTY, seed $SEED, fresh init every generation"
     echo "##   mixtures     : $MIXTURES$( [[ " $MIXTURES " == *" 1.0 "* ]] && echo '  (1.0 = non-collapsing control, human data every generation)' )"
     echo "##   phases       : $PHASES"
     echo "##   interpreter  : $PYTHON"
-    echo "##   GPUs         : train $TRAIN_GPUS, attack $ATTACK_GPUS, eval $EVAL_GPU"
+    echo "##   GPUs         : train $TRAIN_GPUS, attack $ATTACK_GPUS ($ATTACK_JOBS_PER_GPU job(s) per GPU),"
+    echo "##                  utility/sink screens $EVAL_GPUS, plots $EVAL_GPU"
     echo "##   search       : $RESTARTS restarts x $NUM_STEPS steps, verify every $VERIFY_EVERY"
-    echo "##   attacks      : correctness then --vuln; methods [$METHODS], variants [$VARIANTS],"
-    echo "##                  verdicts [$VERDICTS]"
+    echo "##   attacks      : --vuln and correctness; methods [$METHODS], variants [$VARIANTS],"
+    echo "##                  verdicts [$VERDICTS]$( (( MERGE_VERDICTS )) && [[ " $VERDICTS " == *" sampled "* && " $VERDICTS " == *" greedy "* ]] && echo ", one search per cell writing both files (MERGE_VERDICTS=1)" )"
+    echo "##                  queued per (sweep, generation) over the attack GPUs, longest first"
     echo "##   hit rule     : target wrong, baseline correct" \
          "$( (( HOLD_ANCHOR )) && echo ', generation-0 anchor correct (HOLD_ANCHOR=1)' )"
     if [[ " $VARIANTS " == *" opt "* ]]; then
