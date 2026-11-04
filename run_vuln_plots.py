@@ -7,7 +7,9 @@ Reads the artifacts the evaluation produces and writes one figure per question:
     controls         E2  optimised suffixes against random ones and against the init string
     surrogate        E3  logit-extrapolation transfer against the direct upper bound
     temperature      E4  survival of working suffixes when decoding is sampled rather than greedy
-    rdf_window       A1  the attackable window as a function of the real-data mixture
+    rdf_window       A1  the attackable window as a function of the real-data mixture (same
+                         chrome as run_paper_tables.py's window figures: percent cells, hatched
+                         where nothing was attributable, mixtures labelled at their lines)
     ppl_roc          D1  a perplexity filter as a defence, and what it costs the attacker
 
 Inputs. ``attack_success``, ``target_matrix``, ``surrogate`` and ``rdf_window`` read the attack's
@@ -32,7 +34,9 @@ import glob
 import json
 import os
 
+import matplotlib
 import matplotlib.pyplot as plt
+import matplotlib.ticker
 import numpy as np
 
 from utils import nord
@@ -43,8 +47,12 @@ from utils.plotting import (
     BASELINE_COLOR,
     GENERATION_COLORS,
     SURROGATE_COLOR,
+    EndLabels,
+    aborted_cell,
     apply_perplexity_style,
+    percent,
     save_figure,
+    tidy,
 )
 from utils.vuln_results import (
     TARGET_CWE,
@@ -433,7 +441,10 @@ def figure_rdf_window(records: list, args) -> list:
 
     This is the realism argument rather than a side experiment: pure self-training collapses so
     fast that the window where a hit is attributable at all is narrow, and the mixture is the dial
-    that widens it. Cells with nothing attributable are left blank, not drawn as zero.
+    that widens it. A cell whose run found nothing attributable (the capability gate aborted, or
+    every target was excluded) is hatched; a cell that was never run is left blank. Same chrome
+    as run_paper_tables.py's window figures: percent cells, and the mixtures labelled at the end
+    of their lines instead of in a legend.
     """
     direct = [r for r in records if r.surrogate_method == args.mode]
     if not direct:
@@ -444,42 +455,76 @@ def figure_rdf_window(records: list, args) -> list:
         return []
 
     grid = np.full((len(mixtures), len(generations)), np.nan)
+    ran = np.zeros((len(mixtures), len(generations)), dtype=bool)
     counts = np.zeros((len(mixtures), len(generations)))
     for record in direct:
         row, column = mixtures.index(record.real_data_fraction), generations.index(
             record.generation)
         grid[row][column] = record.hit_rate
-        counts[row][column] = len(record.attackable)
+        ran[row][column] = True
+        counts[row][column] = 0 if record.aborted else len(record.attackable)
 
-    figure, axes = plt.subplots(1, 2, figsize=(16, 1.0 * len(mixtures) + 3.5),
-                                gridspec_kw={"width_ratios": [3, 2]})
-    image = axes[0].imshow(grid, aspect="auto", cmap=nord.sequential_cmap(), vmin=0, vmax=1,
-                           origin="lower")
-    for row in range(len(mixtures)):
-        for column in range(len(generations)):
-            if not np.isnan(grid[row][column]):
-                axes[0].text(column, row, f"{grid[row][column]:.2f}", ha="center",
-                             va="center", color=nord.text_on(grid[row][column]), fontsize=12)
-    axes[0].set_xticks(range(len(generations)))
-    axes[0].set_xticklabels(generations)
-    axes[0].set_yticks(range(len(mixtures)))
-    axes[0].set_yticklabels([f"{m:.0%}" for m in mixtures])
-    axes[0].set_xlabel("collapse generation")
-    axes[0].set_ylabel("real data fraction")
-    axes[0].set_title("hit rate")
-    axes[0].grid(False)
-    figure.colorbar(image, ax=axes[0], fraction=0.046)
+    n_mix, n_gen = len(mixtures), len(generations)
+    figure, (heat, axis) = plt.subplots(
+        1, 2, figsize=(0.8 * n_gen + 11.0, 0.65 * n_mix + 3.4),
+        gridspec_kw={"width_ratios": [0.8 * n_gen + 2.0, 6.5], "wspace": 0.25},
+    )
+    cmap = nord.sequential_cmap()
+    for row in range(n_mix):
+        for column in range(n_gen):
+            if not ran[row][column]:
+                continue
+            rate = grid[row][column]
+            if np.isnan(rate):
+                heat.add_patch(aborted_cell(column, row))
+                heat.text(column, row, "–", ha="center", va="center", fontsize=11,
+                          color=nord.TEXT_MUTED)
+                continue
+            heat.add_patch(plt.Rectangle((column - 0.5, row - 0.5), 1, 1, facecolor=cmap(rate),
+                                         edgecolor=nord.SURFACE, linewidth=2))
+            heat.text(column, row, percent(rate, args.usetex), ha="center", va="center",
+                      fontsize=12, color=nord.text_on(rate))
+    heat.set_xlim(-0.5, n_gen - 0.5)
+    heat.set_ylim(-0.5, n_mix - 0.5)
+    heat.set_xticks(range(n_gen))
+    heat.set_xticklabels(generations)
+    heat.set_yticks(range(n_mix))
+    heat.set_yticklabels([f"{m:.0%}" for m in mixtures])
+    heat.set_xlabel("collapse generation")
+    heat.set_ylabel("real data fraction")
+    heat.tick_params(axis="y", length=0)
+    heat.grid(False)
+    for side in ("top", "right", "left"):
+        heat.spines[side].set_visible(False)
+    heat.set_title("hit rate (share of attackable targets broken)", loc="left")
+    mappable = plt.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(0, 1))
+    bar = figure.colorbar(mappable, ax=heat, fraction=0.04, pad=0.03,
+                          format=matplotlib.ticker.PercentFormatter(1.0, decimals=0))
+    bar.outline.set_visible(False)
 
     palette = mixture_colors(mixtures)
     markers = list(nord.MARKERS)
+    labels = EndLabels(axis)
     for index, mixture in enumerate(mixtures):
-        axes[1].plot(generations, counts[index], marker=markers[index % len(markers)],
-                     markersize=7, linewidth=2.5, color=palette[index], label=f"{mixture:.0%}")
-    axes[1].set_xlabel("collapse generation")
-    axes[1].set_ylabel("attributable targets")
-    axes[1].set_ylim(0, len(TARGET_CWE) + 0.4)
-    axes[1].set_title("the attackable window")
-    axes[1].legend(loc="upper right", ncol=2, title="real data")
+        xs = [g for g, r in zip(generations, ran[index]) if r]
+        ys = [c for c, r in zip(counts[index], ran[index]) if r]
+        if not xs:
+            continue
+        axis.plot(xs, ys, marker=markers[index % len(markers)], markersize=6, linewidth=2.2,
+                  color=palette[index])
+        labels.add(xs[-1], ys[-1], f"{mixture:.0%}", palette[index])
+    axis.set_xticks(generations)
+    axis.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+    axis.set_xlabel("collapse generation")
+    axis.set_ylabel("attributable targets")
+    axis.set_ylim(0, len(TARGET_CWE) + 0.4)
+    axis.set_xlim(generations[0] - 0.3, generations[-1] + 1.6)
+    axis.set_title("the attackable window", loc="left")
+    tidy(axis)
+    labels.place()
+    figure.suptitle(f"vulnerability targets, {args.mode} attack: the attackable window across "
+                    "the mixtures", x=0.01, ha="left", y=0.99)
+    figure.subplots_adjust(left=0.07, right=0.97, top=0.82, bottom=0.17)
     return [(figure, stem(args, "rdf_window", f"_{args.mode}"))]
 
 

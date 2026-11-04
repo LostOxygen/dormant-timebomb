@@ -250,6 +250,16 @@ from utils.models import resolve_model_specifier
 print(resolve_model_specifier('$1', '').split('/')[-1])" 2>/dev/null
 }
 
+# <size> <rdf>: the sink screen run_margin.py --sink writes for one lineage of $ROOT
+margin_file() {
+    "$PYTHON" -c "
+from utils.models import resolve_model_specifier
+from utils.naming import mixture_tag
+print('$ROOT/attack_results/margin_'
+      + resolve_model_specifier('$1', '').split('/')[-1] + mixture_tag(float('$2')) + '.json')" \
+        2>/dev/null
+}
+
 # <size> <rdf>: the file run_distribution_collapse.py writes for one lineage of $ROOT
 distribution_file() {
     "$PYTHON" -c "
@@ -611,11 +621,17 @@ phase_attack() {
 
     # the per-target factor of the optimized vulnerability sweeps reads a sink screen of its
     # lineage. One per lineage, measured before any sweep so that every one of them finds it;
-    # independent across lineages, so pooled
+    # independent across lineages, so pooled. A screen already on disk is kept unless --force,
+    # so that re-entering the phase after a failed sweep (the 2026-11-03 DNS outage took 92 of
+    # the 3b jobs) costs only the missing cells
     if needs_sink_screen; then
         for record in "${LINEAGES[@]}"; do
             IFS='|' read -r name size rdf <<< "$record"
             wants_lineage "$name" || continue
+            if (( FORCE == 0 )) && [[ -f "$(margin_file "$size" "$rdf")" ]]; then
+                skip "sink_screen_${name}" "screen exists: $(margin_file "$size" "$rdf")"
+                continue
+            fi
             # shellcheck disable=SC2046
             queue "sink_screen_${name}" "$PYTHON" run_margin.py \
                 -msz "$size" -rdf "$rdf" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -p "$ROOT" --sink \
@@ -757,6 +773,19 @@ phase_plots() {
             $( (( OPT_SINK_FACTOR )) || echo --no_opt_sink_factor ) \
             $( (( OPT_SINK_OBJECTIVE )) || echo --no_opt_sink_objective )
     done
+    # the sizes next to each other (since 2026-11-04): the hit-rate heatmaps per size and the
+    # pooled rates per lineage with one bar per size, one figure per suite, verdict and method
+    # under tables_sizes_*. Same flags as the per-size tables, so the cells are the same files
+    if (( $(wc -w <<< "$SIZES") > 1 )) && [[ -z "$ONLY" ]]; then
+        # shellcheck disable=SC2046
+        run "plots_tables_sizes" "$PYTHON" run_paper_tables.py -p "$ROOT" -pp "$PLOTS_DIR" \
+            --compare_sizes $SIZES --mixtures $MIXTURES -n "$GENERATIONS" -bs "$BLOCK_SIZE" \
+            --methods $METHODS --variants $VARIANTS --verdicts $VERDICTS \
+            --sink_cap "$OPT_SINK_CAP" $(anchor_opts) $(gen0_opts) $(usetex_flag_py) \
+            $( (( OPT_ENTROPY_MATCH )) || echo --no_opt_entropy_match ) \
+            $( (( OPT_SINK_FACTOR )) || echo --no_opt_sink_factor ) \
+            $( (( OPT_SINK_OBJECTIVE )) || echo --no_opt_sink_objective )
+    fi
 }
 
 # ─────────────────────────────────── the plan ─────────────────────────────────────────────

@@ -457,9 +457,11 @@ def main(
         if not os.path.isfile(calibration_path):
             raise FileNotFoundError(
                 f"the 'data' method needs a calibrated p_1, but {calibration_path} does not "
-                "exist. Run 'python -m utils.calibrate_surrogate --block_size "
-                f"{block_size} --model_specifier {model_specifier}' first, or pass "
-                "--surrogate_top_p explicitly to skip the calibration"
+                "exist. Move old/utils/calibrate_surrogate.py back to utils/ (archived "
+                "2026-11-04, the grid uses -m logit only) and run 'python -m "
+                f"utils.calibrate_surrogate --block_size {block_size} --model_specifier "
+                f"{model_specifier}' first, or pass --surrogate_top_p explicitly to skip the "
+                "calibration"
             )
         with open(calibration_path, "r", encoding="utf-8") as calibration_handle:
             calibration = json.load(calibration_handle)

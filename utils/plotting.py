@@ -412,3 +412,66 @@ def plot_perplexity_figure(
         f"density of {y_limit_lower:.0e})"
     )
     return span
+
+
+# ───────────────────────── shared chrome of the grid and window figures ─────────────────────
+def percent(rate: float, usetex: bool = False) -> str:
+    """A hit rate as the integer percentage every table and cell prints. Under usetex the sign
+    is a comment character and has to be escaped, or the label ends at the number."""
+    return f"{100 * rate:.0f}" + (r"\%" if usetex else "%")
+
+
+class EndLabels:
+    """Direct labels at the last point of each line, placed after every line is drawn so that
+    labels of lines that end close together are pushed apart instead of overprinting."""
+
+    MIN_GAP_PX = 15
+
+    def __init__(self, axis):
+        self.axis = axis
+        self.entries = []
+
+    def add(self, x, y, text, colour) -> None:
+        self.entries.append((x, y, text, colour))
+
+    def place(self) -> None:
+        if not self.entries:
+            return
+        figure = self.axis.figure
+        figure.canvas.draw()  # the data -> pixel transform needs the final axis limits
+        to_px = self.axis.transData.transform
+        rows = sorted(
+            ((to_px((x, y))[1], x, y, text, colour) for x, y, text, colour in self.entries),
+            key=lambda row: row[0],
+        )
+        # sweep upwards, keeping every label at least MIN_GAP_PX above the one below it
+        placed = []
+        for px_y, x, y, text, colour in rows:
+            if placed and px_y - placed[-1] < self.MIN_GAP_PX:
+                px_y = placed[-1] + self.MIN_GAP_PX
+            placed.append(px_y)
+        # then centre the stack on its original span, so a cluster spreads both ways
+        shift = (sum(r[0] for r in rows) - sum(placed)) / len(rows)
+        for (px_y, x, y, text, colour), target in zip(rows, placed):
+            offset = target + shift - px_y
+            self.axis.annotate(
+                text, (x, y), xytext=(6, offset / figure.dpi * 72), textcoords="offset points",
+                va="center", ha="left", fontsize=11, color=nord.TEXT_MUTED,
+                bbox={"boxstyle": "round,pad=0.15", "fc": nord.SURFACE, "ec": colour,
+                      "lw": 0.8},
+            )
+
+
+def tidy(axis) -> None:
+    """The recessive chrome every panel shares: no top or right spine, grid under the marks."""
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
+    axis.set_axisbelow(True)
+
+
+def aborted_cell(x: float, y: float):
+    """The cell of a generation the capability gate aborted: the neutral fill under a thin
+    hatch, so that it differs from any shade of the hit-rate ramp in either theme (on a dark
+    slide the neutral and the ramp's top end are both dark, and the dash alone is small)."""
+    return plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=nord.NEUTRAL, hatch="///",
+                         edgecolor=nord.TEXT_MUTED, linewidth=0)

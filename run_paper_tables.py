@@ -21,6 +21,19 @@ Figures, all under ``--plots_path`` and prefixed ``tables_``:
                       the lineages against each other: the same hit rates as lines over the
                       generations, one panel per method, and a last panel of the rate pooled over
                       the generations (sum of hits over sum of attackable targets) per lineage
+    window_<suite>_<verdict>_<method>
+                      the attackable window across the mixtures, the twin of run_vuln_plots.py's
+                      rdf_window for both suites and one figure per method (direct, logit_plain,
+                      logit_opt): the mixture-by-generation heatmap of that method's hit rate
+                      beside the attackable-target count per generation, one line per mixture
+                      (the direct attack's capability gate where it ran, the same in every
+                      figure of the set)
+    sizes_<suite>_<verdict>_<method>, sizes_pooled_<suite>_<verdict>
+                      (``--compare_sizes`` only, prefixed ``tables_sizes_``) the model sizes next
+                      to each other: one hit-rate heatmap per size, the same rows and columns as
+                      the window figure, beside the rate pooled over the generations per lineage
+                      as one bar per size; and, per suite and verdict, that pooled panel for
+                      every method in one figure
     calibration       (``--calibration`` only) the extrapolation factor that reproduces each
                       generation's perplexity, the fitted law, and the rules the searches used
     surrogate_quality the logit surrogate as a predictor: real hits, predicted, false alarms,
@@ -33,6 +46,7 @@ blank rather than guessed.
 
 Usage:
     python run_paper_tables.py -p ./runs/fresh -msz 0.5b --mixtures 0.0 0.5 0.8 1.0 -n 9
+    python run_paper_tables.py -p ./runs/fresh --compare_sizes 0.5b 3b    # the sizes side by side
 """
 
 import argparse
@@ -57,7 +71,7 @@ from utils.naming import (
     objective_tag,
     verification_tag,
 )
-from utils.plotting import save_figure
+from utils.plotting import EndLabels, aborted_cell, percent, save_figure, tidy
 
 matplotlib.use("Agg")
 
@@ -207,66 +221,12 @@ def esc(text: str, usetex: bool) -> str:
     return text.replace("_", r"\_") if usetex else text
 
 
-def percent(rate: float, usetex: bool = False) -> str:
-    """A hit rate as the integer percentage every table and cell prints. Under usetex the sign
-    is a comment character and has to be escaped, or the label ends at the number."""
-    return f"{100 * rate:.0f}" + (r"\%" if usetex else "%")
-
-
 def lineage_style(grid: Grid) -> dict:
     """mixture -> (colour, marker): the ordinal frost ramp with a marker beside it."""
     colours = nord.mixture_colors(grid.mixtures)
     return {
         m: (colours[m], nord.MARKERS[i % len(nord.MARKERS)]) for i, m in enumerate(grid.mixtures)
     }
-
-
-class EndLabels:
-    """Direct labels at the last point of each line, placed after every line is drawn so that
-    labels of lines that end close together are pushed apart instead of overprinting."""
-
-    MIN_GAP_PX = 15
-
-    def __init__(self, axis):
-        self.axis = axis
-        self.entries = []
-
-    def add(self, x, y, text, colour) -> None:
-        self.entries.append((x, y, text, colour))
-
-    def place(self) -> None:
-        if not self.entries:
-            return
-        figure = self.axis.figure
-        figure.canvas.draw()  # the data -> pixel transform needs the final axis limits
-        to_px = self.axis.transData.transform
-        rows = sorted(
-            ((to_px((x, y))[1], x, y, text, colour) for x, y, text, colour in self.entries),
-            key=lambda row: row[0],
-        )
-        # sweep upwards, keeping every label at least MIN_GAP_PX above the one below it
-        placed = []
-        for px_y, x, y, text, colour in rows:
-            if placed and px_y - placed[-1] < self.MIN_GAP_PX:
-                px_y = placed[-1] + self.MIN_GAP_PX
-            placed.append(px_y)
-        # then centre the stack on its original span, so a cluster spreads both ways
-        shift = (sum(r[0] for r in rows) - sum(placed)) / len(rows)
-        for (px_y, x, y, text, colour), target in zip(rows, placed):
-            offset = target + shift - px_y
-            self.axis.annotate(
-                text, (x, y), xytext=(6, offset / figure.dpi * 72), textcoords="offset points",
-                va="center", ha="left", fontsize=11, color=nord.TEXT_MUTED,
-                bbox={"boxstyle": "round,pad=0.15", "fc": nord.SURFACE, "ec": colour,
-                      "lw": 0.8},
-            )
-
-
-def tidy(axis) -> None:
-    """The recessive chrome every panel shares: no top or right spine, grid under the marks."""
-    for side in ("top", "right"):
-        axis.spines[side].set_visible(False)
-    axis.set_axisbelow(True)
 
 
 def figure_utility(grid: Grid, usetex: bool, stem: str, tables: list) -> None:
@@ -496,8 +456,7 @@ def figure_attack_grid(grid: Grid, suite: str, verdict: str, usetex: bool, stem:
                 text_row.append("")
                 continue
             if cell["aborted"] or cell["usable"] == 0:
-                axis.add_patch(plt.Rectangle((x - 0.5, yy - 0.5), 1, 1, facecolor=nord.NEUTRAL,
-                                             edgecolor=nord.SURFACE, linewidth=2))
+                axis.add_patch(aborted_cell(x, yy))
                 axis.text(x, yy, "–", ha="center", va="center", fontsize=11,
                           color=nord.TEXT_MUTED)
                 text_row.append("–")
@@ -636,6 +595,279 @@ def figure_rate_comparison(grid: Grid, suite: str, verdict: str, usetex: bool, s
     return True
 
 
+def figure_window(grid: Grid, suite: str, verdict: str, usetex: bool, stem: str,
+                  tables: list) -> list:
+    """The attackable window of one suite under one verdict, across the mixtures: one figure
+    per method, like run_vuln_plots.py's rdf_window.
+
+    Each figure has the mixture-by-generation heatmap of that method's hit rate on the left
+    (percent of the attackable targets broken, hatched where the capability gate aborted, blank
+    where the cell never ran) and the number of attackable targets per generation on the right,
+    one line per mixture. The right panel is the realism argument on its own: pure self-training
+    closes the window within a few generations, and the mixture is the dial that keeps it open.
+    The attackable count is the direct attack's capability gate where that sweep ran (it alone
+    covers generation 0), otherwise the first method that did, so it is the same panel in every
+    figure of the set. Returns the file tags written, empty when nothing was found."""
+    combos = [(m, v) for m in grid.args.methods for v in grid.args.variants
+              if (m, v) in METHOD_LABELS]
+    cells = {
+        (mixture, combo): [grid.attack_cell(mixture, suite, *combo, verdict, g)
+                           for g in grid.generations]
+        for mixture in grid.mixtures for combo in combos
+    }
+    combos = [c for c in combos if any(cells[(m, c)][g] for m in grid.mixtures
+                                       for g in range(len(grid.generations)))]
+    if not combos:
+        return []
+
+    # the window itself, shared by every figure of the set: attackable targets per generation,
+    # read off the direct attack's gate where it ran, else the first method that did
+    order = sorted(combos, key=lambda c: c[0] != "none")
+    counts, table_rows = {}, []
+    for mixture in grid.mixtures:
+        series, text_row = [], [lineage_label(mixture)]
+        for index, generation in enumerate(grid.generations):
+            count = None
+            for combo in order:
+                cell = cells[(mixture, combo)][index]
+                if cell is not None:
+                    count = 0 if cell["aborted"] else cell["usable"]
+                    break
+            text_row.append("" if count is None else str(count))
+            if count is not None:
+                series.append((generation, count))
+        counts[mixture] = series
+        table_rows.append(text_row)
+    peak = max((c for series in counts.values() for _, c in series), default=1)
+
+    n_mix, n_gen = len(grid.mixtures), len(grid.generations)
+    cmap = nord.sequential_cmap()
+    styles = lineage_style(grid)
+    written = []
+    for combo in combos:
+        figure, (heat, axis) = plt.subplots(
+            1, 2, figsize=(0.62 * n_gen + 9.0, 0.5 * n_mix + 2.6),
+            gridspec_kw={"width_ratios": [0.62 * n_gen + 1.6, 5.2], "wspace": 0.25},
+        )
+        draw_rate_heatmap(heat, grid, {m: cells[(m, combo)] for m in grid.mixtures}, usetex)
+        heat.set_ylabel("real data fraction", fontsize=11)
+        heat.set_title("hit rate (share of attackable targets broken)", fontsize=12, loc="left")
+        mappable = plt.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(0, 1))
+        bar = figure.colorbar(mappable, ax=heat, fraction=0.04, pad=0.03,
+                              format=matplotlib.ticker.PercentFormatter(1.0, decimals=0))
+        bar.ax.tick_params(labelsize=10)
+        bar.outline.set_visible(False)
+
+        labels = EndLabels(axis)
+        for mixture in grid.mixtures:
+            series = counts[mixture]
+            if not series:
+                continue
+            colour, marker = styles[mixture]
+            xs, ys = zip(*series)
+            axis.plot(xs, ys, marker=marker, markersize=6, linewidth=2.2, color=colour)
+            labels.add(xs[-1], ys[-1], lineage_label(mixture), colour)
+        axis.set_xticks(grid.generations)
+        axis.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+        axis.set_xlabel("collapse generation")
+        axis.set_ylabel("attackable targets (capability gate)")
+        axis.set_ylim(0, peak * 1.12 + 0.5)
+        axis.set_xlim(grid.generations[0] - 0.3, grid.generations[-1] + 1.6)
+        axis.set_title("the attackable window", fontsize=12, loc="left")
+        tidy(axis)
+        labels.place()
+        figure.suptitle(f"{SUITES[suite]}, {verdict} verdict, {METHOD_LABELS[combo]}: "
+                        "the attackable window across the mixtures", fontsize=14, x=0.01,
+                        ha="left", y=0.99)
+        figure.subplots_adjust(left=0.07, right=0.97, top=0.82, bottom=0.17)
+        tag = METHOD_LABELS[combo].replace(" ", "_")
+        save_figure(figure, f"{stem}_{tag}")
+        plt.close(figure)
+        written.append(tag)
+    tables.append((f"{SUITES[suite]}, {verdict} verdict: attackable targets per generation "
+                   "(capability gate of the direct attack where it ran)",
+                   ["lineage"] + [f"g{g}" for g in grid.generations], table_rows))
+    return written
+
+
+def attack_cells(grid: Grid, suite: str, verdict: str) -> tuple:
+    """{(mixture, combo): [cell per generation]} and the combos that have at least one cell."""
+    combos = [(m, v) for m in grid.args.methods for v in grid.args.variants
+              if (m, v) in METHOD_LABELS]
+    cells = {
+        (mixture, combo): [grid.attack_cell(mixture, suite, *combo, verdict, g)
+                           for g in grid.generations]
+        for mixture in grid.mixtures for combo in combos
+    }
+    combos = [c for c in combos if any(cells[(m, c)][g] for m in grid.mixtures
+                                       for g in range(len(grid.generations)))]
+    return cells, combos
+
+
+def pooled_rate(series: list) -> tuple:
+    """(hits, attackable) summed over the generations that ran, the pooled rate's two counts."""
+    hits = sum(c["hits"] for c in series if c and not c["aborted"] and c["usable"])
+    usable = sum(c["usable"] for c in series if c and not c["aborted"])
+    return hits, usable
+
+
+def draw_rate_heatmap(heat, grid: Grid, series_by_mixture: dict, usetex: bool,
+                      fontsize: float = 10.5) -> None:
+    """The mixture-by-generation hit-rate heatmap on `heat`: percent cells shaded by the rate,
+    hatched where the gate aborted, blank where the cell never ran. Shared by the window
+    figure and the size comparison so the two read identically."""
+    cmap = nord.sequential_cmap()
+    n_gen, n_mix = len(grid.generations), len(grid.mixtures)
+    for y, mixture in enumerate(grid.mixtures):
+        for x, cell in enumerate(series_by_mixture[mixture]):
+            if cell is None:
+                continue
+            if cell["aborted"] or cell["usable"] == 0:
+                heat.add_patch(aborted_cell(x, y))
+                heat.text(x, y, "–", ha="center", va="center", fontsize=fontsize,
+                          color=nord.TEXT_MUTED)
+                continue
+            rate = cell["hits"] / cell["usable"]
+            heat.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=cmap(rate),
+                                         edgecolor=nord.SURFACE, linewidth=2))
+            heat.text(x, y, percent(rate, usetex), ha="center", va="center",
+                      fontsize=fontsize, color=nord.text_on(rate))
+    heat.set_xlim(-0.5, n_gen - 0.5)
+    heat.set_ylim(-0.5, n_mix - 0.5)
+    heat.set_xticks(range(n_gen))
+    heat.set_xticklabels(grid.generations)
+    heat.set_yticks(range(n_mix))
+    heat.set_yticklabels([lineage_label(m) for m in grid.mixtures], fontsize=11)
+    heat.set_xlabel("collapse generation")
+    heat.tick_params(axis="y", length=0)
+    heat.grid(False)
+    for side in ("top", "right", "left"):
+        heat.spines[side].set_visible(False)
+
+
+def size_colors(grids: list) -> dict:
+    """size -> colour: the frost hue, lighter for the smaller model."""
+    return dict(zip([g.size for g in grids],
+                    nord.ramp([nord.NORD8, nord.NORD10], max(len(grids), 1))))
+
+
+def draw_pooled_by_size(axis, grids: list, cells: dict, combo: tuple, mixtures: list,
+                        usetex: bool, legend: bool = True) -> list:
+    """Grouped bars: per lineage, the rate pooled over the generations, one bar per size.
+    Returns one markdown row per lineage, ``rate (hits/attackable)`` per size."""
+    colours = size_colors(grids)
+    width = 0.8 / len(grids)
+    rows = []
+    for mi, mixture in enumerate(mixtures):
+        row = [lineage_label(mixture)]
+        for si, grid in enumerate(grids):
+            x = mi + (si - (len(grids) - 1) / 2) * width
+            series = cells[grid.size].get((mixture, combo)) if mixture in grid.mixtures else None
+            hits, usable = pooled_rate(series) if series else (0, 0)
+            label = grid.size if mi == 0 else None
+            if usable:
+                rate = 100.0 * hits / usable
+                axis.bar(x, rate, width=width, color=colours[grid.size],
+                         edgecolor=nord.SURFACE, linewidth=1, label=label)
+                axis.text(x, rate + 1.5, percent(rate / 100, usetex), ha="center",
+                          va="bottom", fontsize=9, color=nord.TEXT_MUTED)
+                row.append(f"{rate:.1f}% ({hits}/{usable})")
+            else:
+                axis.bar(x, 0, width=width, color=colours[grid.size], label=label)
+                row.append("–")
+        rows.append(row)
+    axis.set_xticks(range(len(mixtures)))
+    axis.set_xticklabels([lineage_label(m) for m in mixtures])
+    axis.set_ylim(0, 104)
+    axis.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(decimals=0))
+    axis.grid(axis="x", visible=False)
+    if legend:
+        axis.legend(fontsize=10, loc="best", title="model size", title_fontsize=10)
+    tidy(axis)
+    return rows
+
+
+def figure_size_comparison(grids: list, suite: str, verdict: str, usetex: bool, stem: str,
+                           tables: list) -> list:
+    """The model sizes next to each other on one suite under one verdict.
+
+    Per method, one figure: a hit-rate heatmap per size (the window figure's heatmap, same rows
+    and columns, so a cell is read the same way in both), sharing one colour scale, beside the
+    rate pooled over the generations per lineage with one bar per size. Then one figure of that
+    pooled panel for every method at once. Each size's cells come from its own result files, so
+    a size whose sweep never ran a cell leaves it blank rather than borrowed. Returns the file
+    tags written, empty when no size has a cell."""
+    cells = {grid.size: attack_cells(grid, suite, verdict)[0] for grid in grids}
+    combos = [(m, v) for m in grids[0].args.methods for v in grids[0].args.variants
+              if (m, v) in METHOD_LABELS
+              and any(c for grid in grids for mixture in grid.mixtures
+                      for c in cells[grid.size][(mixture, (m, v))])]
+    if not combos:
+        return []
+    mixtures = sorted({m for grid in grids for m in grid.mixtures})
+    n_gen = max(len(grid.generations) for grid in grids)
+    n_mix = len(mixtures)
+    written = []
+
+    for combo in combos:
+        n_heat = len(grids)
+        # the colour bar gets a slot of its own so that it cannot sit on the pooled panel's
+        # axis label (a colorbar hung off an axis is placed after the layout, outside it)
+        figure, axes = plt.subplots(
+            1, n_heat + 3, figsize=((0.5 * n_gen + 1.6) * n_heat + 7.0, 0.5 * n_mix + 2.8),
+            gridspec_kw={"width_ratios": [0.5 * n_gen + 1.6] * n_heat + [0.22, 0.9, 4.6],
+                         "wspace": 0.12},
+        )
+        heats, cax, spacer, pooled = (axes[:n_heat], axes[n_heat], axes[n_heat + 1],
+                                      axes[n_heat + 2])
+        spacer.set_axis_off()
+        for heat, grid in zip(heats, grids):
+            series = {m: cells[grid.size][(m, combo)] for m in grid.mixtures}
+            draw_rate_heatmap(heat, grid, series, usetex)
+            heat.set_title(f"{grid.size}: hit rate (share of attackable targets broken)",
+                           fontsize=12, loc="left")
+        heats[0].set_ylabel("real data fraction", fontsize=11)
+        for heat in heats[1:]:
+            heat.set_yticklabels([])
+        mappable = plt.cm.ScalarMappable(cmap=nord.sequential_cmap(),
+                                         norm=matplotlib.colors.Normalize(0, 1))
+        bar = figure.colorbar(mappable, cax=cax,
+                              format=matplotlib.ticker.PercentFormatter(1.0, decimals=0))
+        bar.ax.tick_params(labelsize=10)
+        bar.outline.set_visible(False)
+
+        rows = draw_pooled_by_size(pooled, grids, cells, combo, mixtures, usetex)
+        pooled.set_title("pooled over the generations", fontsize=12, loc="left")
+        pooled.set_ylabel("hit rate (hits / attackable targets)")
+        figure.suptitle(f"{SUITES[suite]}, {verdict} verdict, {METHOD_LABELS[combo]}: "
+                        + " and ".join(g.size for g in grids) + " side by side",
+                        fontsize=14, x=0.01, ha="left", y=0.99)
+        tag = METHOD_LABELS[combo].replace(" ", "_")
+        save_figure(figure, f"{stem}_{suite}_{verdict}_{tag}")
+        plt.close(figure)
+        written.append(f"{suite}_{verdict}_{tag}")
+        tables.append((f"{SUITES[suite]}, {verdict} verdict, {METHOD_LABELS[combo]}: hit rate "
+                       "pooled over the generations per model size (hits / attackable targets)",
+                       ["lineage"] + [g.size for g in grids], rows))
+
+    # every method's pooled panel in one figure
+    figure, axes = plt.subplots(1, len(combos), figsize=(4.8 * len(combos) + 1.0, 5.2),
+                                sharey=True)
+    axes = np.atleast_1d(axes)
+    for index, (axis, combo) in enumerate(zip(axes, combos)):
+        draw_pooled_by_size(axis, grids, cells, combo, mixtures, usetex, legend=index == 0)
+        axis.set_title(METHOD_LABELS[combo], fontsize=15)
+        axis.set_xlabel("lineage")
+    axes[0].set_ylabel("hit rate pooled over the generations")
+    figure.suptitle(f"{SUITES[suite]}, {verdict} verdict: "
+                    + " and ".join(g.size for g in grids) + ", pooled hit rate per lineage",
+                    fontsize=14, x=0.01, ha="left", y=0.99)
+    save_figure(figure, f"{stem}_pooled_{suite}_{verdict}")
+    plt.close(figure)
+    written.append(f"pooled_{suite}_{verdict}")
+    return written
+
+
 def figure_surrogate_quality(grid: Grid, usetex: bool, stem: str, tables: list) -> bool:
     """The logit surrogate as a predictor of its own hits, summed over the generations."""
     variants = [v for v in grid.args.variants if ("logit", v) in METHOD_LABELS]
@@ -759,8 +991,8 @@ def figure_sink_screen(grid: Grid, usetex: bool, stem: str, tables: list) -> boo
 
 
 # ────────────────────────────────── markdown ──────────────────────────────────────────────
-def write_markdown(path: str, grid: Grid, tables: list) -> None:
-    lines = [f"# Result tables: {grid.name}, root `{grid.root}`", ""]
+def write_markdown(path: str, title: str, tables: list) -> None:
+    lines = [f"# Result tables: {title}", ""]
     for title, header, rows in tables:
         lines += [f"## {title}", "", "| " + " | ".join(header) + " |",
                   "|" + "---|" * len(header)]
@@ -772,6 +1004,24 @@ def write_markdown(path: str, grid: Grid, tables: list) -> None:
 
 
 # ───────────────────────────────────── main ───────────────────────────────────────────────
+def compare_sizes(args, usetex: bool, plots: str) -> None:
+    """The ``--compare_sizes`` run: every size's grid read side by side, figures and markdown
+    under ``tables_sizes_*``."""
+    grids = [Grid(args, size) for size in args.compare_sizes]
+    prefix = os.path.join(plots, "tables_sizes")
+    tables: list = []
+    written = []
+    for suite in ("vuln", "correctness"):
+        for verdict in args.verdicts:
+            written += figure_size_comparison(grids, suite, verdict, usetex, prefix, tables)
+    if not args.no_markdown:
+        write_markdown(f"{prefix}.md", ", ".join(g.name for g in grids)
+                       + f", root `{args.path}`", tables)
+        written.append("markdown")
+    print(f"## {TColors.OKBLUE}{TColors.BOLD}tables{TColors.ENDC}: wrote "
+          + ", ".join(written) + f" under {prefix}_*")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -799,13 +1049,20 @@ def main() -> None:
                         help="also draw the surrogate calibration figure (off since 2026-10-29)")
     parser.add_argument("--no_usetex", action="store_true")
     parser.add_argument("--no_markdown", action="store_true")
+    parser.add_argument("--compare_sizes", nargs="+", default=[], metavar="SIZE",
+                        help="draw the model sizes side by side instead of one size's tables: "
+                             "the hit-rate heatmaps and the pooled rates per lineage, one "
+                             "figure per suite, verdict and method under tables_sizes_*")
     args = parser.parse_args()
 
     usetex = not args.no_usetex
     nord.apply_style(usetex, font_size=13)
-    grid = Grid(args, args.model_size)
     plots = args.plots_path or os.path.join(args.path, "plots")
     os.makedirs(plots, exist_ok=True)
+    if args.compare_sizes:
+        compare_sizes(args, usetex, plots)
+        return
+    grid = Grid(args, args.model_size)
     prefix = os.path.join(plots, f"tables_{args.model_size}")
     tables: list = []
     written = []
@@ -825,12 +1082,15 @@ def main() -> None:
             if figure_rate_comparison(grid, suite, verdict, usetex,
                                       f"{prefix}_rates_{suite}_{verdict}", tables):
                 written.append(f"rates_{suite}_{verdict}")
+            for tag in figure_window(grid, suite, verdict, usetex,
+                                     f"{prefix}_window_{suite}_{verdict}", tables):
+                written.append(f"window_{suite}_{verdict}_{tag}")
     if figure_surrogate_quality(grid, usetex, f"{prefix}_surrogate_quality", tables):
         written.append("surrogate_quality")
     if figure_sink_screen(grid, usetex, f"{prefix}_sink_screen", tables):
         written.append("sink_screen")
     if not args.no_markdown:
-        write_markdown(f"{prefix}.md", grid, tables)
+        write_markdown(f"{prefix}.md", f"{grid.name}, root `{grid.root}`", tables)
         written.append("markdown")
     print(f"## {TColors.OKBLUE}{TColors.BOLD}tables{TColors.ENDC}: wrote "
           + ", ".join(written) + f" under {prefix}_*")
