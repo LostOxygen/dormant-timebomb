@@ -219,6 +219,7 @@ from utils.naming import (
     mixture_suffix,
     mixture_tag,
     objective_tag,
+    result_tag,
     verification_tag,
 )
 from utils.utils import (
@@ -253,8 +254,15 @@ RESULTS_PATH: str = "./attack_results/"
 PROGRESS_DISABLED: bool = False
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
 
-# statuses returned by the unit-test harness that count as objectively wrong behaviour
+# statuses returned by the unit-test harness. WRONG_STATUSES is what the hit rule calls "wrong":
+# code that ran and was false (the tests failed, or the function raised under them). A response
+# that held no compiling function, not the one asked for, or never finished (DERAILED_STATUSES) is
+# not wrong code and never a hit — it is counted in the random control's report as a diagnostic
+# only, because a collapsed model derails on appended text far more often than it writes false
+# code, and widening the rule to it measured that rather than the attack (tried and reverted on
+# 2026-11-09: the random-suffix control then beat the surrogate attack on every lineage)
 WRONG_STATUSES: tuple[str, ...] = ("fail", "fail_exception")
+DERAILED_STATUSES: tuple[str, ...] = ("error", "timeout", "crash")
 
 # the alphabet --random_control_match chars draws from: printable ASCII on one line. Deliberately
 # wider than INIT_CHARS (which the restart initializations use) so the control is not restricted to
@@ -1014,6 +1022,15 @@ class SearchConfig:
     seed: int = 1337
     random_control_trials: int = 0
     random_control_match: str = "tokens"
+    # draw the control for every selected task, whatever the capability gate said of it. For a
+    # control-only pass (-ns 0) whose file serves several cells: the sampled gate is itself a
+    # draw, so two runs of one generation disagree on the marginal targets, and a control cut
+    # to this run's gate would miss targets another cell attacked. The reader cuts it to its
+    # own cell's attackable set
+    random_control_ungated: bool = False
+    # also decode the surrogate in every random trial and record its status. Off: the control's
+    # verdict never reads it, and the decode doubles the cost of a trial in a surrogate run
+    random_control_surrogate: bool = False
     # read the greedy verdict next to the sampled one in every behavioural check, so that one
     # search writes both result files. The search itself is unchanged: greedy decoding draws
     # nothing from any RNG. See `ContrastiveGCG.verify` and `main`
@@ -1192,18 +1209,28 @@ class RandomControlReport:
         n_trials: random suffixes actually verified, over all tasks
         n_hits: of those, how many were selective hits — the number that must be 0
         n_collapsed_broken: how many broke the collapsed model, hit or not
+        n_collapsed_derailed: of the broken ones, how many derailed it (error/timeout/crash) rather
+            than making it emit false code — the whole of the difference between the two hit rules
         n_baseline_broken: how many broke the pristine baseline, i.e. were not selective
         n_unstable: draws that never survived the retokenization filter, see random_control
         control_chars_mean: mean character length of the drawn suffixes
         search_chars_mean: mean character length of the suffixes the search verified, so the two
             lengths can be compared rather than assumed equal
+        search_checks_mean: mean number of behavioural checks the search ran per task, the budget
+            `trials_requested` is to be compared with: a task's search "hit" is any of its checks
+            hitting, the control's is any of its trials, and the two are only on one footing when
+            the counts match (--restarts * ceil(--num_steps / --verify_every))
         control_objective_mean: mean contrastive objective of the drawn suffixes, in the same units
             as TaskOutcome.best_objective — how much the search moved
         per_task: task name -> its own counts
         hits: the full records of any random suffix that succeeded
         skipped: why the control did not run, empty when it did
+        ungated: --random_control_ungated, the control was drawn for every selected task rather
+            than for the tasks this run's capability gate kept; ``per_task`` then has to be cut
+            to an attackable set by whoever reads it
     """
 
+    ungated: bool = False
     trials_requested: int = 0
     match: str = "tokens"
     reference_tokens: int = 0
@@ -1211,10 +1238,12 @@ class RandomControlReport:
     n_trials: int = 0
     n_hits: int = 0
     n_collapsed_broken: int = 0
+    n_collapsed_derailed: int = 0
     n_baseline_broken: int = 0
     n_unstable: int = 0
     control_chars_mean: float | None = None
     search_chars_mean: float | None = None
+    search_checks_mean: float | None = None
     control_objective_mean: float | None = None
     per_task: dict[str, dict] = field(default_factory=dict)
     hits: list[dict] = field(default_factory=list)
@@ -1720,7 +1749,7 @@ class ContrastiveGCG:
 
     def verify(
         self, task: AttackTask, before_str: str, after_str: str, suffix: str,
-        decoding: Decoding | None = None,
+        decoding: Decoding | None = None, with_surrogate: bool = True,
     ) -> dict[str, str]:
         """Decodes with both models and decides correctness behaviourally.
 
@@ -1739,6 +1768,11 @@ class ContrastiveGCG:
         verification stream, so the sampled verdicts stay exactly what a sampled-only run
         produces; an explicit sampled decoding uses the verification stream like the default.
 
+        `with_surrogate=False` leaves the surrogate out of the decode. The verdict does not need
+        it (`is_selective_hit` reads the real models only); the search's checks keep it for the
+        agreement statistics, the random control drops it by default, where it was half of every
+        trial's cost and fed nothing. The result then carries no ``surrogate_*`` keys.
+
         Returns:
             dict: per decoded model ``{label}_status`` (the majority), ``{label}_statuses`` (one
                 per sample), ``{label}_pass_rate``, ``{label}_wrong_rate``, and ``{label}_raw`` /
@@ -1748,6 +1782,8 @@ class ContrastiveGCG:
         result = {}
         greedy_override = decoding is not None and decoding.greedy
         for label, model in self._verified_models():
+            if label == "surrogate" and not with_surrogate:
+                continue
             with (self._preserved_rng() if greedy_override else self._verification_rng()):
                 judged = judge_model(
                     model, self.tokenizer, prompt, task, self.cfg,
@@ -2115,7 +2151,13 @@ class ContrastiveGCG:
                 cand_ids = self._ids(suffix)
                 total = self.objective(cand_ids, segs)["total"][0].item()
 
-            verdict = self.verify(task, before_str, after_str, suffix)
+            # the surrogate is not decoded here by default (since 2026-11-12): the control's
+            # verdict is the real models', and in a surrogate run that decode was more than half
+            # of every trial (measured at 0.5b on the vulnerability suite: ~33 s a trial with
+            # it, ~15 s without). --random_control_surrogate brings it and its status back
+            with_surrogate = self.cfg.random_control_surrogate
+            verdict = self.verify(task, before_str, after_str, suffix,
+                                  with_surrogate=with_surrogate)
             hit = self.is_selective_hit(verdict)
             record = {
                 "trial": trial,
@@ -2129,7 +2171,7 @@ class ContrastiveGCG:
                 "collapsed_status": verdict["collapsed_status"],
                 "hit": hit,
             }
-            if self.transfer_mode:
+            if "surrogate_status" in verdict:
                 record["surrogate_status"] = verdict["surrogate_status"]
             if hit:
                 # the raw completions only for a hit: the run's conclusion now depends on this one
@@ -2140,6 +2182,34 @@ class ContrastiveGCG:
                         for key, value in verdict.items()
                         if key.endswith(("_raw", "_code"))
                     }
+                )
+            greedy_column = ""
+            if self.cfg.also_greedy:
+                # the greedy verdict of the same draw, read the way the checks read theirs: a
+                # greedy decode draws nothing and runs under _preserved_rng, so the sampled
+                # verdicts above and below are exactly a sampled-only run's. The keys are
+                # prefixed here and renamed by `random_control_view` when the greedy file is
+                # assembled, so each file reads as its own run's control
+                greedy_verdict = self.verify(task, before_str, after_str, suffix, GREEDY_DECODING,
+                                             with_surrogate=with_surrogate)
+                greedy_hit = self.is_selective_hit(greedy_verdict)
+                record["greedy_baseline_status"] = greedy_verdict["baseline_status"]
+                record["greedy_collapsed_status"] = greedy_verdict["collapsed_status"]
+                record["greedy_hit"] = greedy_hit
+                if "surrogate_status" in greedy_verdict:
+                    record["greedy_surrogate_status"] = greedy_verdict["surrogate_status"]
+                if greedy_hit:
+                    record.update(
+                        {
+                            f"greedy_{key}": value
+                            for key, value in greedy_verdict.items()
+                            if key.endswith(("_raw", "_code"))
+                        }
+                    )
+                greedy_column = (
+                    f" | greedy: baseline={greedy_verdict['baseline_status']} "
+                    f"collapsed={greedy_verdict['collapsed_status']}"
+                    + (f" {TColors.FAIL}hit{TColors.ENDC}" if greedy_hit else "")
                 )
             records.append(record)
 
@@ -2152,7 +2222,7 @@ class ContrastiveGCG:
             print(
                 f"##   [{task.name}] trial {trial + 1}/{trials}: baseline="
                 f"{verdict['baseline_status']} collapsed={verdict['collapsed_status']} "
-                f"objective={total:.3f} -> {marker}{unstable_note}"
+                f"objective={total:.3f} -> {marker}{unstable_note}{greedy_column}"
             )
             if hit:
                 print(f"##     suffix: {suffix!r}")
@@ -2160,20 +2230,24 @@ class ContrastiveGCG:
         return records
 
     def random_control_report(
-        self, records: dict[str, list[dict]], outcomes: list[TaskOutcome]
+        self, records: dict[str, list[dict]], outcomes: list[TaskOutcome], greedy: bool = False,
     ) -> RandomControlReport:
         """Aggregates the random control and puts its suffix lengths beside the search's own.
 
         Args:
             records (dict): task name -> the records `random_control` returned for it
-            outcomes (list[TaskOutcome]): the finished outcomes, read for the length comparison
-                only — the search's verified suffixes are the thing "the same length" refers to
+            outcomes (list[TaskOutcome]): the finished outcomes, read for the length and the
+                check-count comparison only — the search's verified suffixes are the thing "the
+                same length" and "the same number of tries" refer to
+            greedy (bool): read the greedy verdict of every trial (an --also_greedy run's second
+                file) instead of the sampled one
 
         Returns:
             RandomControlReport: the counts, the two mean lengths and any hit's full record
         """
         n_tokens, n_chars = self.reference_lengths()
         report = RandomControlReport(
+            ungated=self.cfg.random_control_ungated,
             trials_requested=self.cfg.random_control_trials,
             match=self.cfg.random_control_match,
             reference_tokens=n_tokens,
@@ -2181,19 +2255,29 @@ class ContrastiveGCG:
         )
 
         control_lengths, objectives = [], []
+        checks = {o.task: len(o.verifications) for o in outcomes if not o.skipped}
+        # under --also_greedy the control ran on the union of the two gates' usable sets; each
+        # file reports the trials of the tasks its own gate kept, like its own run would
+        # (an ungated control is for cells with other gates than this run's and keeps every task)
+        if any(o.skipped for o in outcomes) and not self.cfg.random_control_ungated:
+            records = {name: recs for name, recs in records.items() if name in checks}
         for name, task_records in records.items():
+            task_records = random_control_view(task_records, greedy)
             counts = {
                 "n_trials": len(task_records),
                 "n_hits": sum(1 for r in task_records if r["hit"]),
                 "n_collapsed_broken": sum(
                     1 for r in task_records if r["collapsed_status"] in WRONG_STATUSES
                 ),
+                "n_collapsed_derailed": sum(
+                    1 for r in task_records if r["collapsed_status"] in DERAILED_STATUSES
+                ),
                 "n_baseline_broken": sum(
                     1 for r in task_records if r["baseline_status"] != "pass"
                 ),
                 "n_unstable": sum(1 for r in task_records if not r["retokenizes"]),
             }
-            report.per_task[name] = counts
+            report.per_task[name] = {**counts, "n_search_checks": checks.get(name, 0)}
             for key, value in counts.items():
                 setattr(report, key, getattr(report, key) + value)
             report.hits.extend(r for r in task_records if r["hit"])
@@ -2215,6 +2299,8 @@ class ContrastiveGCG:
         ]
         if searched:
             report.search_chars_mean = sum(searched) / len(searched)
+        if checks:
+            report.search_checks_mean = sum(checks.values()) / len(checks)
         return report
 
     # ── main loop ──
@@ -2706,6 +2792,38 @@ class ContrastiveGCG:
         return ok
 
 
+def random_control_view(records: list, greedy: bool) -> list:
+    """One verdict's view of the random control's trial records.
+
+    Under --also_greedy every trial carries both verdicts, the greedy one under ``greedy_*``
+    keys. The sampled file drops those; the greedy file takes them under the plain names and
+    drops the sampled ones, so a trial record reads the same whichever decoding the run was
+    filed under. Without the flag there are no ``greedy_*`` keys and the view is the identity.
+
+    Args:
+        records (list): the records `ContrastiveGCG.random_control` returned for one task
+        greedy (bool): which verdict's statuses to report
+
+    Returns:
+        list: the records as a single-verdict run would have written them
+    """
+    view = []
+    for record in records:
+        plain = {k: v for k, v in record.items() if not k.startswith("greedy_")}
+        if greedy and "greedy_hit" in record:
+            # the sampled verdict's statuses and completions make way for the greedy ones
+            plain = {
+                k: v for k, v in plain.items()
+                if k not in ("baseline_status", "collapsed_status", "surrogate_status", "hit")
+                and not k.endswith(("_raw", "_code"))
+            }
+            plain.update(
+                {k[len("greedy_"):]: v for k, v in record.items() if k.startswith("greedy_")}
+            )
+        view.append(plain)
+    return view
+
+
 def verdict_view(
     outcomes: list, capability: CapabilityReport, low_headroom: dict, no_exec: bool,
     greedy: bool,
@@ -2755,6 +2873,7 @@ def verdict_view(
             key: value for key, value in outcome.__dict__.items()
             if not key.startswith("greedy_")
         }
+        fields["random_controls"] = random_control_view(outcome.random_controls, greedy)
         if greedy:
             fields["successes"] = list(outcome.greedy_successes)
             fields["weak_hits"] = list(outcome.greedy_weak_hits)
@@ -3242,8 +3361,10 @@ def main(
     no_exec: bool = False,
     stop_on_success: bool = False,
     max_wrong_loss: float = float("inf"),
-    random_control_trials: int = 0,
+    random_control_trials: int = -1,
     random_control_match: str = "tokens",
+    random_control_ungated: bool = False,
+    random_control_surrogate: bool = False,
     min_capability: float = 0.6,
     min_usable_tasks: int = 1,
     skip_capability_check: bool = False,
@@ -3254,6 +3375,7 @@ def main(
     surrogate_model_path: str = "",
     first_collapsed_path: str = "",
     sink_factor_file: str = "",
+    result_tag_value: str = "",
     sink_offset: float = 0.0,
     sink_cap: float = 0.0,
     sink_run_level: bool = False,
@@ -3324,9 +3446,16 @@ def main(
             otherwise it is logged as a weak hit and the search continues. inf (default) is the
             plain argmax-flip rule
         random_control_trials (int): unoptimized suffixes of the search's own length to verify per
-            attackable task before the search — the run's null hypothesis. 0 disables it
+            attackable task before the search — the run's null hypothesis. Negative (the default)
+            takes as many as the search gets behavioural checks per task, restarts *
+            ceil(num_steps / verify_every), so every run carries the control on the search's own
+            footing; 0 disables it
         random_control_match (str): what "the same length" means for those suffixes, "tokens"
             (the search's own unit) or "chars"
+        random_control_ungated (bool): draw the control for every selected task, whatever the
+            capability gate said (a control-only pass that serves several cells)
+        random_control_surrogate (bool): also decode the surrogate in every random trial. Off by
+            default: the verdict is the real models', and the decode doubles a trial's cost
         min_capability (float): fraction of clean tasks the ``-sf auto`` probe requires of a
             surrogate rung; it no longer gates the run
         min_usable_tasks (int): how many attackable tasks the capability gate needs before the
@@ -3355,6 +3484,9 @@ def main(
         zeta_sink (float): weight of that break term
         kappa_prefix (float): weight of the stay-on-task term, the model under attack's mean
             cross-entropy of the shared prefix
+        result_tag_value (str): --result_tag, appended to the result file name (and the greedy
+            twin's) for a setup the other tags do not spell, such as a surrogate anchored on
+            another root's generation 0 through --first_collapsed_path
         sink_factor_file (str): the run_margin.py --sink factor file to read for
             ``--surrogate_factor sink``; defaults to the one beside the attack results
         sink_offset (float): added to every per-target factor the affine law solves, so the
@@ -3381,8 +3513,8 @@ def main(
         attack_gpus (int): how many of the visible GPUs to shard the (task, restart) units over.
             0 uses all of them, 1 keeps the search in this process
         also_greedy (bool): read the greedy verdict next to the sampled one in every check and
-            write both result files from this one search. Needs a sampled verification; refused
-            with --stop_on_success and --random_control_trials, which are verdict-specific
+            write both result files from this one search; the random control's trials are read
+            both ways too. Needs a sampled verification; refused with --stop_on_success
         share_base_forward (bool): in logit transfer mode, read the hold baseline's candidate
             losses off the surrogate's own base forward. --no_share_base_forward turns it off
         check_shared_forward (bool): run `ContrastiveGCG.check_shared_forward` on the first
@@ -3406,6 +3538,16 @@ def main(
     worker = bool(shard_units)
     global PROGRESS_DISABLED
     PROGRESS_DISABLED = worker
+    # the random-suffix control is part of every run (since 2026-11-11): left to its default it
+    # gets as many tries per task as the search gets behavioural checks, which is the budget at
+    # which "any check hit" and "any random trial hit" are the same question. Resolved here so
+    # that the handoff, the banner and the result file all carry the number. A probe-only run
+    # (--num_steps 0) has no checks and so no trials; -rct 0 turns the control off
+    random_control_auto = random_control_trials < 0
+    if random_control_auto:
+        random_control_trials = (
+            restarts * -(-num_steps // max(verify_every, 1)) if num_steps > 0 else 0
+        )
     shard = decode_units(shard_units) if worker else []
     inherited: dict = read_json(handoff_file) if worker else {}
     if list_tasks:
@@ -3639,6 +3781,7 @@ def main(
             + objective_tag(sink_objective)
             + (f"{factor_mode_tag(surrogate_factor)}{entropy_tag(entropy_match)}"
                f"_{surrogate_method}_surrogate" if transfer else "")
+            + result_tag(result_tag_value)
         )
 
     stem = stem_for(verification_tag(verify_temperature, verify_top_p, verify_top_k, verify_samples))
@@ -3713,8 +3856,22 @@ def main(
             f"{num_steps} x {restarts}"
         )
         print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Random-suffix control{TColors.ENDC}: "
+            + (
+                f"{random_control_trials} unoptimized suffix(es) per attackable task"
+                + (" (one per behavioural check of the search)" if random_control_auto else "")
+                if random_control_trials > 0
+                else "off" + (" (no search steps)" if random_control_auto else
+                              " (--random_control_trials 0)")
+            )
+        )
+        print(
             f"## {TColors.OKBLUE}{TColors.BOLD}Search Width / topk / n_replace{TColors.ENDC}: "
             f"{search_width} / {topk} / {n_replace}"
+        )
+        print(
+            f"## {TColors.OKBLUE}{TColors.BOLD}Hit rule{TColors.ENDC}: collapsed status in "
+            f"{{{', '.join(WRONG_STATUSES)}}}, baseline pass"
         )
         hold_label = "base" if collapsed_generation == 0 or not hold_anchor else "{base,anchor}"
         if ratio_margin > 0:
@@ -3852,12 +4009,6 @@ def main(
                 f"{TColors.ENDC}: stopping on the sampled hit would cut the greedy file's "
                 f"search short of what a greedy-only run performs"
             )
-        if random_control_trials > 0:
-            raise SystemExit(
-                f"{TColors.FAIL}--also_greedy cannot be combined with --random_control_trials"
-                f"{TColors.ENDC}: the control is verified under one decoding and would be "
-                f"missing from the other file"
-            )
 
     tokenizer = AutoTokenizer.from_pretrained(model_specifier)
     tokenizer = configure_pad_token(tokenizer)
@@ -3895,6 +4046,8 @@ def main(
         max_wrong_loss=max_wrong_loss,
         random_control_trials=random_control_trials,
         random_control_match=random_control_match,
+        random_control_ungated=random_control_ungated,
+        random_control_surrogate=random_control_surrogate,
         seed=seed,
         also_greedy=also_greedy,
         share_base_forward=share_base_forward,
@@ -4197,7 +4350,14 @@ def main(
     # changes nothing about the search that follows
     random_records: dict[str, list[dict]] = {}
     random_skipped = ""
-    if not proceed:
+    # ungated: every selected task whose references passed their own self-test, whatever the
+    # gate said and even when the gate stopped the run (see SearchConfig.random_control_ungated)
+    control_tasks = attackable
+    if random_control_ungated:
+        control_tasks = [
+            t for t in selected if "invalid" not in capability.per_task.get(t.name, {})
+        ]
+    if not proceed and not random_control_ungated:
         random_skipped = "the run was stopped by the capability gate"
     elif random_control_trials <= 0:
         random_skipped = "--random_control_trials 0"
@@ -4205,7 +4365,7 @@ def main(
         # same reasoning as the gate's and the factor probe's --no_exec branch: the control's whole
         # output is a behavioural verdict, and without execution there is none to have
         random_skipped = "--no_exec: nothing to verify a random suffix against"
-    elif not attackable:
+    elif not control_tasks:
         random_skipped = "no task survived the capability probe"
 
     if random_skipped:
@@ -4231,7 +4391,17 @@ def main(
             "##   a hit here would mean the length alone is enough and the search is not what "
             "found it"
         )
-        for task in attackable:
+        if transfer and not random_control_surrogate:
+            print(
+                "##   the surrogate is not decoded for these trials: the control's verdict is the "
+                "real models' (--random_control_surrogate adds it back)"
+            )
+        if random_control_ungated:
+            print(
+                f"##   ungated: drawn for all {len(control_tasks)} selected task(s), of which this "
+                f"run's gate kept {len(attackable)}"
+            )
+        for task in control_tasks:
             random_records[task.name] = attack.random_control(task, random_control_trials)
         print(_hr() + "\n")
 
@@ -4351,9 +4521,19 @@ def main(
         )
     random_stats = attack.random_control_report(random_records, outcomes)
     random_stats.skipped = random_skipped
-    if also_greedy and capability.aborted and not skip_capability_check:
+    if (also_greedy and capability.aborted and not skip_capability_check
+            and not random_control_ungated):
         # what the sampled-only run says when its gate stopped it
         random_stats.skipped = "the run was stopped by the capability gate"
+    greedy_random: RandomControlReport | None = None
+    if also_greedy:
+        # the same draws under the greedy verdict, for the greedy file
+        greedy_random = attack.random_control_report(random_records, greedy_outcomes, greedy=True)
+        greedy_random.skipped = (
+            "the run was stopped by the capability gate"
+            if greedy_capability.aborted and not skip_capability_check
+            and not random_control_ungated else random_skipped
+        )
 
     # ──────────────────────────── report and save ─────────────────────────
     print(f"\n## {TColors.BOLD}{TColors.HEADER}{TColors.UNDERLINE}Summary{TColors.ENDC} " + _hr(11))
@@ -4430,10 +4610,22 @@ def main(
             f"{random_stats.n_trials}"
         )
         print(
-            f"##   collapsed model made objectively wrong by chance: "
+            f"##   collapsed model made wrong by chance: "
             f"{random_stats.n_collapsed_broken} of {random_stats.n_trials} "
-            f"(fail/fail_exception; error and timeout do not count, same rule as a real hit)"
+            f"({'/'.join(WRONG_STATUSES)}, the same rule as a real hit; "
+            f"{random_stats.n_collapsed_derailed} of them derailed rather than false)"
         )
+        if random_stats.search_checks_mean is not None:
+            print(
+                f"##   tries per task: control {random_stats.trials_requested}, search "
+                f"{random_stats.search_checks_mean:.1f} behavioural check(s) — the two hit rates "
+                f"are on one footing only when these match"
+            )
+        if greedy_random is not None:
+            print(
+                f"##   greedy verdict of the same draws: {greedy_random.n_hits} selective hit(s) "
+                f"of {greedy_random.n_trials}, collapsed wrong {greedy_random.n_collapsed_broken}"
+            )
         print(
             f"##   baseline no longer correct: {random_stats.n_baseline_broken} of "
             f"{random_stats.n_trials} — those cannot be selective whatever the collapsed model did"
@@ -4579,6 +4771,7 @@ def main(
             "surrogate_factor_probe": factor_probe or None,
             "surrogate_model": surrogate_description if transfer else None,
             "first_collapsed_model": first_collapsed_dir or None,
+            "result_tag": result_tag(result_tag_value) or None,
             # the anchor as a condition of the hit: its checkpoint under --hold_anchor, or
             # null for the default two-sided rule (and for a generation-0 attack)
             "anchor_model": anchor_dir or None,
@@ -4648,11 +4841,6 @@ def main(
     if also_greedy:
         # the greedy file: the greedy gate, the greedy checks, and a config that reads as the
         # greedy run's own (-vt 0, no twin), so every consumer files it under the greedy rule
-        greedy_random = attack.random_control_report({}, greedy_outcomes)
-        greedy_random.skipped = (
-            "the run was stopped by the capability gate"
-            if greedy_capability.aborted and not skip_capability_check else random_skipped
-        )
         greedy_surrogate = None
         if transfer:
             greedy_surrogate = attack.surrogate_report(greedy_outcomes)
@@ -4857,6 +5045,18 @@ if __name__ == "__main__":
         default="",
         help="the run_margin.py --sink factor file --surrogate_factor sink reads (default: "
         "sink_factor_{model}{mixture}.json beside the attack results)",
+    )
+    parser.add_argument(
+        "--result_tag",
+        "-rt",
+        dest="result_tag_value",
+        type=str,
+        default="",
+        help="tag appended to the result file name (one underscore, then lower-case letters and "
+        "digits, e.g. _splitanchor) for a setup none of the other tags spell — above all a "
+        "surrogate anchored on another root's generation 0 via --first_collapsed_path, which "
+        "would otherwise be filed over the lineage's own run. run_attack_sweep.sh and "
+        "run_paper_tables.py take the same value to find the files (default: none)",
     )
     parser.add_argument(
         "--first_collapsed_path",
@@ -5130,13 +5330,32 @@ if __name__ == "__main__":
         "--random_control_trials",
         "-rct",
         type=int,
-        default=0,
+        default=-1,
         help="verify N unoptimized suffixes per attackable task before the search: random strings "
         "of the same length, drawn from the same alphabet and judged by the same verifier, so a "
         "hit among them counts exactly as much as a hit from the search and means this run cannot "
-        "separate the search from chance. An equal-budget comparison is --restarts * ceil("
-        "--num_steps / --verify_every) trials, the number of behavioural checks the search gets. "
-        "0 disables it (default: 0)",
+        "separate the search from chance. The default (-1) is the equal-budget comparison, "
+        "--restarts * ceil(--num_steps / --verify_every) trials, the number of behavioural checks "
+        "the search gets, so every run carries its control; 0 disables it",
+    )
+    parser.add_argument(
+        "--random_control_ungated",
+        "-rcu",
+        action="store_true",
+        help="draw the --random_control_trials for every selected task, whatever the capability "
+        "gate said of it and even when the gate stopped the run. For a control-only pass (-ns 0, "
+        "see run_paper.sh --phases control) whose file serves several cells of one generation: "
+        "the sampled gate is itself a draw, so those cells disagree on the marginal targets, and "
+        "the reader cuts the control to its own cell's attackable set",
+    )
+    parser.add_argument(
+        "--random_control_surrogate",
+        "-rcs",
+        action="store_true",
+        help="also decode the surrogate in every random-control trial and record its status "
+        "there (transfer mode). Off by default: the control's verdict is decided by the real "
+        "collapsed model and the baseline alone, and the surrogate decode was more than half of "
+        "a trial's cost. The search's own checks always decode the surrogate",
     )
     parser.add_argument(
         "--random_control_match",
@@ -5204,8 +5423,8 @@ if __name__ == "__main__":
         "and write both result files from this one search. The search is identical either way "
         "(verification runs on its own RNG stream and greedy decoding draws nothing), so the two "
         "files are what a sampled run and a greedy run of this cell write, for the price of one "
-        "search plus one extra decode per model per check. Needs a sampled verification; refused "
-        "with --stop_on_success and --random_control_trials",
+        "search plus one extra decode per model per check, and the random control's trials are "
+        "read both ways too. Needs a sampled verification; refused with --stop_on_success",
     )
     parser.add_argument(
         "--no_share_base_forward",

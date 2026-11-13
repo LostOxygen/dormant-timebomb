@@ -66,6 +66,11 @@ EVAL_GPU="${EVAL_GPU:-0}"
 RESTARTS="${RESTARTS:-3}"
 NUM_STEPS="${NUM_STEPS:-250}"
 VERIFY_EVERY="${VERIFY_EVERY:-10}"
+# The random-suffix control of every sweep (since 2026-11-11). auto leaves it to run_attack.py's
+# default, one unoptimized suffix per behavioural check of the search and target; a number
+# pins it, 0 turns it off.
+RANDOM_TRIALS="${RANDOM_TRIALS:-auto}"
+random_opts() { [[ "$RANDOM_TRIALS" == "auto" ]] || echo "-rct $RANDOM_TRIALS"; }
 
 # Search-objective knobs, all defaulting to the behaviour the results on disk were produced with.
 # NOTE: none of these reach the result file name, so turning one on and re-running a cell
@@ -100,6 +105,7 @@ TEMPERATURES="${TEMPERATURES:-0,0.3,0.5,0.7,1.0}"
 # the generation repetition penalty of every collapse and extrapolation run (1.2 = repo default,
 # 1.05 = Qwen2.5's own, 1.0 = off); a non-default value needs its own roots
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
+MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-128}"   # run_baseline.py / run_extrapolation.py --min_new_tokens
 SURVIVAL_SAMPLES="${SURVIVAL_SAMPLES:-16}"
 TRAJECTORY_EVERY="${TRAJECTORY_EVERY:-10}"
 
@@ -376,7 +382,7 @@ phase_collapse() {
         run "collapse_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_baseline.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" \
             -rdf "$rdf" -tp "$temp" -tpp "$top_p" -tpk "$top_k" -rp "$REPETITION_PENALTY" -sd "$seed" \
-            -p "$path" $(init_flag "$init") $(gen0_flag "$init")
+            --min_new_tokens "$MIN_NEW_TOKENS" -p "$path" $(init_flag "$init") $(gen0_flag "$init")
     done
 }
 
@@ -406,7 +412,7 @@ phase_extrapolation() {
         [[ "$name" == "$PRIMARY" ]] || continue   # one cell is enough for the surrogate figure
         run "extrapolation_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_extrapolation.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$MODEL_SIZE" -rdf "$rdf" \
-            -tp "$temp" -tpp "$top_p" -tpk "$top_k" -rp "$REPETITION_PENALTY" -m logit -p "$path"
+            -tp "$temp" -tpp "$top_p" -tpk "$top_k" -rp "$REPETITION_PENALTY" --min_new_tokens "$MIN_NEW_TOKENS" -m logit -p "$path"
     done
 }
 
@@ -435,12 +441,12 @@ phase_attack() {
             run "attack_${name}_${method}_sampled" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
                 ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
                 -msz "$MODEL_SIZE" -rdf "$rdf" -m "$method" --vuln $(force_flag) \
-                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" $(gen0_flag "$init") \
+                -- $(random_opts) -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" $(gen0_flag "$init") \
                 $(search_opts) $(surrogate_opts "$method") $(margin_opts "$path" "$rdf")
             run "attack_${name}_${method}_greedy" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
                 ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
                 -msz "$MODEL_SIZE" -rdf "$rdf" -m "$method" --vuln $(force_flag) \
-                -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -vt 0 $(gen0_flag "$init") \
+                -- $(random_opts) -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -vt 0 $(gen0_flag "$init") \
                 $(search_opts) $(surrogate_opts "$method") $(margin_opts "$path" "$rdf")
         done
     done
@@ -463,13 +469,13 @@ phase_ablation() {
         run "ablation_factor_n${n}" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
             ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
             -msz "$MODEL_SIZE" -rdf "$rdf" -m logit --vuln $(force_flag) \
-            -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf "$n"
+            -- $(random_opts) -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf "$n"
     done
     for policy in auto calibrated; do
         run "ablation_factor_${policy}" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
             ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
             -msz "$MODEL_SIZE" -rdf "$rdf" -m logit --vuln $(force_flag) \
-            -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf "$policy"
+            -- $(random_opts) -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf "$policy"
     done
 
     # 2. plain forward transfer: what a suffix optimized on generation 0 reaches on generation n,
@@ -479,14 +485,14 @@ phase_ablation() {
     run "ablation_forward_transfer" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
         ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
         -msz "$MODEL_SIZE" -rdf "$rdf" -m logit --vuln $(force_flag) \
-        -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf 1
+        -- $(random_opts) -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -sf 1
 
     # 3. the three-sided hit rule: the stricter claim that the suffix is specific to *later*
     #    collapse rather than to any descendant of the base model. Files are tagged _anchor.
     run "ablation_hold_anchor" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
         ./run_attack_sweep.sh -n "$GENERATIONS" -p "$path" -b "$BLOCK_SIZE" \
         -msz "$MODEL_SIZE" -rdf "$rdf" -m none --vuln $(force_flag) \
-        -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -ha
+        -- $(random_opts) -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -ha
 
     # 4. the margin-aware search, in its own root (--max_wrong_loss is not part of the file name,
     #    so it would otherwise overwrite the plain run of the same cell). The root shares the
@@ -501,7 +507,7 @@ phase_ablation() {
     run "ablation_margin_aware" env CUDA_VISIBLE_DEVICES="$ATTACK_GPUS" \
         ./run_attack_sweep.sh -n "$GENERATIONS" -p "$mwl_root" -b "$BLOCK_SIZE" \
         -msz "$MODEL_SIZE" -rdf "$rdf" -m none --vuln $(force_flag) \
-        -- -r "$RESTARTS" -ns "$MWL_STEPS" -ve "$VERIFY_EVERY" -mwl "$MAX_WRONG_LOSS"
+        -- $(random_opts) -r "$RESTARTS" -ns "$MWL_STEPS" -ve "$VERIFY_EVERY" -mwl "$MAX_WRONG_LOSS"
 }
 
 # Survival against temperature, and the cost curve in search steps. Both read an attack result

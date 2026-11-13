@@ -434,6 +434,75 @@ def extract_suffixes(results_file: str) -> list:
     return candidates
 
 
+# how a random-suffix control candidate is marked in the suffix file and in every verification
+# record: its `origin` starts with this. utils/verify_transfer.py copies the origin through
+# untouched, so the marker needs no support there
+RANDOM_ORIGIN: str = "random control"
+
+
+def is_random(record: dict) -> bool:
+    """Whether a suffix-file entry or verification record is a random-suffix control."""
+    return str(record.get("origin", "")).startswith(RANDOM_ORIGIN)
+
+
+def extract_random_suffixes(results_file: str, tasks: set, per_task: int) -> list:
+    """The attack's own random-suffix control trials, as transfer candidates.
+
+    The floor a transfer rate is read against: an *unoptimized* suffix of the search's length,
+    verified on every (run, generation) cell beside the optimized ones. If random suffixes break
+    run B at generation g as often as the transferred ones do, the suffix carried nothing across
+    the runs. The strings are the ones run_attack.py drew for its control on run A (same
+    alphabet, same length, same retokenization constraint), restricted to the tasks that have an
+    optimized candidate so that both rates are over the same tasks.
+
+    Args:
+        results_file (str): run_attack.py's JSON output for run A
+        tasks (set): the tasks that have at least one optimized candidate
+        per_task (int): how many of each task's trials to take, in trial order; 0 takes none
+
+    Returns:
+        list: {"task", "suffix", "origin"} dicts, empty when the attack ran without its control
+    """
+    if per_task <= 0:
+        return []
+    with open(results_file, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    randoms, seen = [], set()
+    for outcome in data.get("results") or []:
+        if outcome["task"] not in tasks:
+            continue
+        for trial in (outcome.get("random_controls") or [])[:per_task]:
+            key = (outcome["task"], trial["suffix"])
+            if key in seen:
+                continue
+            seen.add(key)
+            randoms.append(
+                {
+                    "task": outcome["task"],
+                    "suffix": trial["suffix"],
+                    "origin": f"{RANDOM_ORIGIN} trial {trial.get('trial')}",
+                }
+            )
+    return randoms
+
+
+def tally_random(records: list) -> dict:
+    """The random-suffix control of one (run, generation) cell.
+
+    Random suffixes have no anchor to reproduce on, so there is no `void`: the denominator is
+    the trials on tasks the cell's model still solves unaided (the verifier's own
+    transferred/held outcomes), the same exclusion of `inconclusive` the transfer rate makes.
+    """
+    hits = sum(1 for r in records if r["outcome"] == "transferred")
+    decidable = sum(1 for r in records if r["outcome"] in ("transferred", "held"))
+    return {
+        "n_candidates": len(records),
+        "n_transferred": hits,
+        "n_decidable": decidable,
+        "rate": (hits / decidable) if decidable else None,
+    }
+
+
 def sweep_run(
     label: str,
     path: str,
@@ -538,7 +607,8 @@ def summarize(sweeps: dict, seed_a: int, seed_b: int, attacked: int) -> dict:
     Every (run, generation) cell gets its own denominator, because capability differs per cell and
     a pooled rate would silently weight the generations by how capable they happened to be.
     """
-    anchor = {(r["task"], r["suffix"]): r for r in sweeps["a"][attacked]["records"]}
+    anchor = {(r["task"], r["suffix"]): r for r in sweeps["a"][attacked]["records"]
+              if not is_random(r)}
 
     rows = []
     by_run = {}
@@ -546,7 +616,12 @@ def summarize(sweeps: dict, seed_a: int, seed_b: int, attacked: int) -> dict:
         by_run[label] = {}
         for generation in sorted(sweeps[label]):
             cell_rows = []
+            # the random-suffix control travels in the same verification files and is tallied on
+            # its own: no anchor, no void, and never part of the transfer rows
+            random_records = [r for r in sweeps[label][generation]["records"] if is_random(r)]
             for record in sweeps[label][generation]["records"]:
+                if is_random(record):
+                    continue
                 key = (record["task"], record["suffix"])
                 reproduced = anchor.get(key, {}).get("outcome") == "transferred"
                 if not reproduced:
@@ -573,11 +648,12 @@ def summarize(sweeps: dict, seed_a: int, seed_b: int, attacked: int) -> dict:
                 )
             by_run[label][generation] = {
                 **tally(cell_rows),
+                "random": tally_random(random_records),
                 "model": sweeps[label][generation]["summary"]["collapsed_model"],
             }
             rows.extend(cell_rows)
 
-    anchor_records = sweeps["a"][attacked]["records"]
+    anchor_records = [r for r in sweeps["a"][attacked]["records"] if not is_random(r)]
     return {
         "seed_run_a": seed_a,
         "seed_run_b": seed_b,
@@ -622,6 +698,7 @@ def main(
     human_generation_zero: bool = False,
     model_specifier: str = "",
     model_size: str = "",
+    random_transfer_trials: int = 10,
 ) -> None:
     """Runs the whole cross-run transfer experiment.
 
@@ -799,12 +876,28 @@ def main(
             f"--collapsed_generation where the model is still capable enough to be selectively "
             f"broken"
         )
+    # the random-suffix control of the sweep: the attack's own unoptimized trials on the same
+    # tasks, frozen into the same file and verified in every cell beside the optimized suffixes
+    randoms = extract_random_suffixes(
+        results_a, {c["task"] for c in candidates}, random_transfer_trials
+    )
     with open(suffix_file, "w", encoding="utf-8") as handle:
-        json.dump(candidates, handle, indent=2)
+        json.dump(candidates + randoms, handle, indent=2)
     print(
         f"\n## {TColors.OKGREEN}{len(candidates)} verified suffix(es){TColors.ENDC} across "
         f"{len({c['task'] for c in candidates})} task(s) -> {suffix_file}"
     )
+    if randoms:
+        print(
+            f"## {TColors.OKBLUE}random-suffix control{TColors.ENDC}: {len(randoms)} unoptimized "
+            f"suffix(es) of the attack's own control on the same task(s), verified in every cell"
+        )
+    elif random_transfer_trials > 0:
+        print(
+            f"## {TColors.WARNING}no random-suffix control{TColors.ENDC}: {results_a} carries no "
+            f"random trials (an attack result from before 2026-11-11, or -rct 0 in "
+            f"--attack_extra). Re-run the attack with --force to get the sweep's floor"
+        )
 
     # ── stage 4: collapse run B, the held out run ──────────────────────────────────────────────
     # trained only now, after the suffixes exist and are frozen. Nothing that produced them could
@@ -894,19 +987,23 @@ def main(
         f"##   A = the run the suffix was found on, B = the independent run"
     )
 
+    # `rand`: the random-suffix control of the cell, unoptimized suffixes that break it over
+    # the ones it could be broken by; the floor the rate beside it is read against
     print(
-        f"##\n##   {'gen':>4}   {'A: works':>9} {'held':>5} {'?':>3} {'rate':>6}   "
-        f"{'B: works':>9} {'held':>5} {'?':>3} {'rate':>6}"
+        f"##\n##   {'gen':>4}   {'A: works':>9} {'held':>5} {'?':>3} {'rate':>6} {'rand':>6}   "
+        f"{'B: works':>9} {'held':>5} {'?':>3} {'rate':>6} {'rand':>6}"
     )
     for generation in swept:
         cells = []
         for label in ("a", "b"):
             stats = report["by_run"][label][generation]
             rate = stats["transfer_rate"]
+            floor = (stats.get("random") or {}).get("rate")
             cells.append(
                 f"{stats['n_transferred']:>9} {stats['n_held']:>5} "
                 f"{stats['n_inconclusive']:>3} "
-                f"{('n/a' if rate is None else f'{rate:.0%}'):>6}"
+                f"{('n/a' if rate is None else f'{rate:.0%}'):>6} "
+                f"{('n/a' if floor is None else f'{floor:.0%}'):>6}"
             )
         marker = (
             f"  {TColors.BOLD}<- attacked{TColors.ENDC}"
@@ -927,6 +1024,13 @@ def main(
         f"{'n/a' if matched_rate is None else f'{matched_rate:.0%}'}{TColors.ENDC} "
         f"({matched.get('n_transferred', 0)}/{matched.get('n_decidable', 0)} decidable)"
     )
+    matched_random = matched.get("random") or {}
+    if matched_random.get("n_decidable"):
+        print(
+            f"##   random-suffix control at the same cell: {matched_random['rate']:.0%} "
+            f"({matched_random['n_transferred']}/{matched_random['n_decidable']} unoptimized "
+            f"suffixes break run B there) — the floor that transfer rate is read against"
+        )
     inconclusive = ", ".join(
         f"{totals[label]['n_inconclusive']} in run {label.upper()}"
         for label in ("a", "b")
@@ -1138,6 +1242,16 @@ if __name__ == "__main__":
         default="",
         help="extra arguments appended verbatim to the run_attack.py invocation, e.g. "
         "\"--min_capability 0.3\"",
+    )
+    parser.add_argument(
+        "--random_transfer_trials",
+        "-rtt",
+        type=int,
+        default=10,
+        help="the sweep's random-suffix control: this many of the attack's own unoptimized "
+        "control suffixes per task (run_attack.py --random_control_trials, on by default) are "
+        "verified in every (run, generation) cell beside the optimized ones, and each cell "
+        "reports the rate at which they break it. 0 turns the control off (default: 10)",
     )
     args = parser.parse_args()
     main(**vars(args))

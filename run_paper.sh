@@ -42,6 +42,30 @@
 # 101 of its 137 hours in the attack phase with half of the search steps replaying the other
 # verdict's trajectory and one card busy while three idled during the utility phase.
 #
+# The null control (since 2026-11-09). RANDOM_TRIALS unoptimized suffixes per attackable target
+# are verified before every search as the second control (--random_control_trials): the same
+# length, alphabet, verifier and hit rule as the search, and by default as many tries as the
+# search gets behavioural checks (RESTARTS * NUM_STEPS / VERIFY_EVERY), so a cell's rate and
+# its random-suffix rate are on one footing. The tables and the attack figures draw the random
+# rate beside the attack's. RANDOM_TRIALS=0 turns the control off; a cell run without it has no
+# control in its file until it is re-run with --force.
+#
+# The control without the search (since 2026-11-10): `--phases control`. A grid searched before
+# the control existed does not need its searches redone to get one. The control decodes the real
+# checkpoint and the baseline and never a surrogate, so it is one measurement per (lineage,
+# suite, generation) whatever the method: the phase queues the direct attack with zero search
+# steps (-ns 0) and the same RANDOM_TRIALS, filed under --result_tag _rct beside the direct
+# result (utils.naming.CONTROL_TAG), CONTROL_JOBS_PER_GPU at a time per card. Its task list is
+# every target attackable in at least one searched cell of the generation, drawn ungated
+# (--random_control_ungated): the sampled gate is itself a draw, so the cells of one generation
+# disagree on the marginal targets and a control cut to one run's gate would miss some. A
+# generation no cell could attack gets no job. The tables and the hits figures read a cell's
+# control from that file whenever the cell's own file carries none, cut to the cell's own gate.
+# A default phase since 2026-11-11, between attack and plots, so that every grid ends with a
+# control in every cell: it queues a job only for a generation in which a searched cell lacks
+# its own control, which is none on a grid searched from scratch and the whole grid on one
+# searched before 2026-11-09.
+#
 # Usage:
 #   ./run_paper.sh --dry-run                  # print the whole plan, run nothing
 #   ./run_paper.sh --list                     # one line per lineage and phase, then exit
@@ -49,6 +73,8 @@
 #   ./run_paper.sh --phases collapse,utility  # a subset, in the order above
 #   ./run_paper.sh --only 0.5b-rdf0.5         # one lineage
 #   ./run_paper.sh --phases plots --force     # redraw every figure
+#   ./run_paper.sh --phases control,plots     # the random-suffix control of a finished grid
+#                                             # (no search), then every figure redrawn
 #
 # NOTE on the roots. The checkpoint names do not carry the weight lineage, so the fresh-init
 # lineages and the recursive ones every result before 2026-10-15 was measured on live in separate
@@ -84,11 +110,27 @@ TOP_K="${TOP_K:-20}"
 # it. A value other than the default tags the run-level names _rp<value> and needs its own ROOT,
 # since the checkpoint names do not carry it (run_baseline.py refuses the mix)
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.2}"
+# the generation's length floor (run_baseline.py --min_new_tokens): the end token is suppressed
+# for this many new tokens. Like the penalty it is a run-level tag off the default and one root
+# holds one value
+MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-128}"
 SEED="${SEED:-1337}"
 # Extra run_baseline.py arguments per size, for memory: the 3B fits a 48GB card at the defaults,
 # but -gc (gradient checkpointing) or a smaller -tbs are the knobs if it does not on yours.
 TRAIN_OPTS_05B="${TRAIN_OPTS_05B:-}"
 TRAIN_OPTS_3B="${TRAIN_OPTS_3B:-}"
+# The disjoint-data experiment (since 2026-11-10, run_data_split_experiment.sh). BASELINE_EXTRA is
+# appended to every run_baseline.py call (e.g. "--data_split b"). ANCHOR_ROOT, when set, makes
+# every logit sweep build its surrogate from *that* root's generation 0 (-fcp) instead of
+# $ROOT's own, read the sink screen from there (run_margin.py --sink over its generation 0
+# alone), and file its results under RESULT_TAG (default _splitanchor) beside the lineage's
+# own surrogate files; the direct sweeps do not depend on the anchor and stay untagged in both
+# passes. The plots phase then draws the tables only, under the tag: the per-lineage and the
+# vulnerability figures read the untagged files and belong to the lineage's own pass.
+BASELINE_EXTRA="${BASELINE_EXTRA:-}"
+ANCHOR_ROOT="${ANCHOR_ROOT:-}"
+RESULT_TAG="${RESULT_TAG:-}"
+[[ -n "$ANCHOR_ROOT" && -z "$RESULT_TAG" ]] && RESULT_TAG="_splitanchor"
 
 # GPUs. Training and dataset generation fan out over several devices; the attack shards its
 # (task, restart) units over whatever it can see; the single-model measurements want one card.
@@ -103,6 +145,9 @@ EVAL_GPU="${EVAL_GPU:-0}"
 # startup transient of up to ~34GB, so stagger or accept the odd OOM backoff).
 EVAL_GPUS="${EVAL_GPUS:-$ATTACK_GPUS}"
 ATTACK_JOBS_PER_GPU="${ATTACK_JOBS_PER_GPU:-1}"
+# the control-only phase holds two models and no gradients (~3GB at 0.5b, ~14GB at 3b) and its
+# unbatched decodes leave most of a card idle, so several fit
+CONTROL_JOBS_PER_GPU="${CONTROL_JOBS_PER_GPU:-2}"
 # One search per cell, both verdicts read off it (--also_greedy): the greedy and the sampled
 # sweep of a cell run the identical GCG trajectory and differ only in how the checks decode,
 # so the pair costs one search plus one extra decode per check. 0 restores one sweep per
@@ -151,6 +196,8 @@ OPT_SINK_FACTOR="${OPT_SINK_FACTOR:-1}"
 OPT_SINK_CAP="${OPT_SINK_CAP:-2.5}"     # the entropy-matched surrogate's measured ceiling
 OPT_SINK_OBJECTIVE="${OPT_SINK_OBJECTIVE:-1}"
 OPT_SINK_MARGIN="${OPT_SINK_MARGIN:-2.0}"
+# the null hypothesis of every attack, see the header
+RANDOM_TRIALS="${RANDOM_TRIALS:-auto}"        # --random_control_trials per attackable target; auto = RESTARTS * NUM_STEPS / VERIFY_EVERY, 0 = off
 
 # Search-objective knobs that apply to every variant. Neither reaches a file name, so turning one
 # on and re-running a cell overwrites the cell it is being compared against: use another -p.
@@ -162,7 +209,7 @@ SUFFIX_TOKENS="${SUFFIX_TOKENS:-0}"
 
 NO_USETEX="${NO_USETEX:-0}"             # 1 draws figures without a TeX install
 
-PHASES_ALL="collapse,utility,attack,plots"
+PHASES_ALL="collapse,utility,attack,control,plots"
 PHASES="${PHASES:-$PHASES_ALL}"
 
 ONLY=""
@@ -181,7 +228,9 @@ perplexity, then attacks every model: correctness targets first, then the vulner
 Options:
   -p, --path PATH        run root (default: ./runs/fresh — see the note in the script header)
   -n, --generations N    highest generation index; lineages train 0..N (default: 9)
-      --phases LIST      comma separated subset of: collapse, utility, attack, plots
+      --phases LIST      comma separated subset of: collapse, utility, attack, control, plots
+                         (control: the random-suffix control, without a search, of every cell
+                         whose own search ran without one)
       --only NAME        restrict to one lineage, e.g. 0.5b-rdf0.5 (see --list)
       --force            redo work whose output already exists
       --dry-run          print every command without running it
@@ -191,10 +240,11 @@ Options:
   -h, --help             this message
 
 Environment overrides: PYTHON SIZES MIXTURES GENERATIONS BLOCK_SIZE TRAIN_GPUS ATTACK_GPUS
-EVAL_GPU EVAL_GPUS ATTACK_JOBS_PER_GPU MERGE_VERDICTS RESTARTS NUM_STEPS VERIFY_EVERY METHODS
+EVAL_GPU EVAL_GPUS ATTACK_JOBS_PER_GPU CONTROL_JOBS_PER_GPU MERGE_VERDICTS RESTARTS NUM_STEPS VERIFY_EVERY METHODS
 VERDICTS VARIANTS HOLD_ANCHOR TRAIN_OPTS_05B
 TRAIN_OPTS_3B TARGET_MARGIN NU_TARGET SUFFIX_TOKENS OPT_ENTROPY_MATCH OPT_SINK_FACTOR
-OPT_SINK_CAP OPT_SINK_OBJECTIVE OPT_SINK_MARGIN NO_USETEX
+OPT_SINK_CAP OPT_SINK_OBJECTIVE OPT_SINK_MARGIN RANDOM_TRIALS NO_USETEX BASELINE_EXTRA
+ANCHOR_ROOT RESULT_TAG REPETITION_PENALTY MIN_NEW_TOKENS
 EOF
 }
 
@@ -250,15 +300,44 @@ from utils.models import resolve_model_specifier
 print(resolve_model_specifier('$1', '').split('/')[-1])" 2>/dev/null
 }
 
-# <size> <rdf>: the sink screen run_margin.py --sink writes for one lineage of $ROOT
+# <size> <rdf>: the sink screen run_margin.py --sink writes for one lineage of $ROOT — or of
+# $ANCHOR_ROOT, whose generation 0 the surrogate is then built from
 margin_file() {
     "$PYTHON" -c "
 from utils.models import resolve_model_specifier
 from utils.naming import mixture_tag
-print('$ROOT/attack_results/margin_'
+print('${ANCHOR_ROOT:-$ROOT}/attack_results/margin_'
       + resolve_model_specifier('$1', '').split('/')[-1] + mixture_tag(float('$2')) + '.json')" \
         2>/dev/null
 }
+# <size> <rdf>: the per-target factor file beside it, read by -sf sink
+sink_file() {
+    "$PYTHON" -c "
+from utils.models import resolve_model_specifier
+from utils.naming import mixture_tag
+print('${ANCHOR_ROOT:-$ROOT}/attack_results/sink_factor_'
+      + resolve_model_specifier('$1', '').split('/')[-1] + mixture_tag(float('$2')) + '.json')" \
+        2>/dev/null
+}
+# <size> <rdf>: $ANCHOR_ROOT's merged generation-0 checkpoint for one mixture
+anchor_checkpoint() {
+    "$PYTHON" -c "
+from utils.models import resolve_model_specifier
+from utils.naming import mixture_suffix
+print('$ANCHOR_ROOT/model_outputs/model_0_bs${BLOCK_SIZE}_'
+      + resolve_model_specifier('$1', '').split('/')[-1]
+      + mixture_suffix(float('$2'), 0, $HUMAN_GEN0 == 1) + '_fp16')" 2>/dev/null
+}
+# <method> <mode> <variant> <size> <rdf>: the ANCHOR_ROOT flags of one logit sweep
+anchor_root_opts() {
+    local method="$1" mode="$2" variant="$3" size="$4" rdf="$5"
+    [[ -n "$ANCHOR_ROOT" && "$method" != "none" ]] || return 0
+    printf '%s ' -fcp "$(anchor_checkpoint "$size" "$rdf")" --result_tag "$RESULT_TAG"
+    if [[ "$mode" == "vuln" && "$variant" == "opt" ]] && (( OPT_SINK_FACTOR )); then
+        printf '%s ' --sink_factor_file "$(sink_file "$size" "$rdf")"
+    fi
+}
+result_tag_opts() { [[ -n "$RESULT_TAG" ]] && echo "--result_tag $RESULT_TAG" || true; }
 
 # <size> <rdf>: the file run_distribution_collapse.py writes for one lineage of $ROOT
 distribution_file() {
@@ -318,6 +397,18 @@ needs_sink_screen() {
     [[ " $METHODS " == *" logit "* ]] || return 1
     (( OPT_SINK_FACTOR ))
 }
+
+# the random-suffix control: as many tries per target as the search gets behavioural checks
+random_trials() {
+    if [[ "$RANDOM_TRIALS" == "auto" ]]; then
+        echo $(( RESTARTS * ( (NUM_STEPS + VERIFY_EVERY - 1) / VERIFY_EVERY ) ))
+    else
+        echo "$RANDOM_TRIALS"
+    fi
+}
+# always spelled out: run_attack.py's own default is the control on (one trial per check), so
+# RANDOM_TRIALS=0 has to say 0 rather than nothing
+random_opts() { echo "-rct $(random_trials)"; }
 
 # greedy: -vt 0; both: the sampled decoding plus --also_greedy; sampled: the defaults
 verdict_opts() {
@@ -540,6 +631,20 @@ preflight() {
         [[ -e "$script" ]] || { echo "error: missing $script" >&2; problems=1; }
     done
 
+    # a foreign-anchor pass needs that root's generation-0 checkpoint for every lineage in scope
+    if [[ -n "$ANCHOR_ROOT" ]] && has_phase attack; then
+        local record name size rdf ckpt
+        for record in "${LINEAGES[@]}"; do
+            IFS='|' read -r name size rdf <<< "$record"
+            wants_lineage "$name" || continue
+            ckpt="$(anchor_checkpoint "$size" "$rdf")"
+            if [[ ! -d "$ckpt" ]]; then
+                echo "error: ANCHOR_ROOT holds no generation 0 for $name: $ckpt" >&2
+                problems=1
+            fi
+        done
+    fi
+
     # a fresh-init collapse must not land on a root that holds a recursive lineage. run_baseline.py
     # refuses the individual run, but it is better to know before the first hour of training
     if has_phase collapse && [[ -d "$ROOT/generated_datasets" ]]; then
@@ -570,8 +675,8 @@ phase_collapse() {
         run "collapse_${name}" env CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" "$PYTHON" run_baseline.py \
             -ng "$NUM_GENERATIONS" -bs "$BLOCK_SIZE" -msz "$size" -rdf "$rdf" \
             -tp "$TEMPERATURE" -tpp "$TOP_P" -tpk "$TOP_K" -rp "$REPETITION_PENALTY" -sd "$SEED" \
-            -p "$ROOT" \
-            $(gen0_opts) $(train_opts "$size")
+            --min_new_tokens "$MIN_NEW_TOKENS" -p "$ROOT" \
+            $(gen0_opts) $(train_opts "$size") $BASELINE_EXTRA
     done
 }
 
@@ -633,8 +738,12 @@ phase_attack() {
                 continue
             fi
             # shellcheck disable=SC2046
+            # under ANCHOR_ROOT the screen measures that root's generation 0, the anchor the
+            # surrogate is then built from; the later generations live in $ROOT and are not
+            # part of the affine law's two points
             queue "sink_screen_${name}" "$PYTHON" run_margin.py \
-                -msz "$size" -rdf "$rdf" -n "$GENERATIONS" -bs "$BLOCK_SIZE" -p "$ROOT" --sink \
+                -msz "$size" -rdf "$rdf" -n "$( [[ -n "$ANCHOR_ROOT" ]] && echo 0 || echo "$GENERATIONS" )" \
+                -bs "$BLOCK_SIZE" -p "${ANCHOR_ROOT:-$ROOT}" --sink \
                 $(gen0_opts)
         done
         drain "${EVAL_GPUS//,/ }" 1
@@ -675,6 +784,8 @@ phase_attack() {
                                 -rdf "$rdf" -m "$method" $vuln_flag $(force_flag) \
                                 -- -r "$RESTARTS" -ns "$NUM_STEPS" -ve "$VERIFY_EVERY" -ag 1 \
                                 $(verdict_opts "$verdict") $(anchor_opts) $(gen0_opts) \
+                                $(random_opts) \
+                                $(anchor_root_opts "$method" "$mode" "$variant" "$size" "$rdf") \
                                 $(search_opts) $(variant_opts "$mode" "$method" "$variant")
                         done
                     done
@@ -685,12 +796,90 @@ phase_attack() {
     drain "${ATTACK_GPUS//,/ }" "$ATTACK_JOBS_PER_GPU"
 }
 
+# 3b. The random-suffix control without the search, for the cells whose sweeps were searched
+#     before the control existed. One job per (suite, lineage, generation) that has such a
+#     cell: the direct attack at zero steps, so the gate, the draws and the verifier are
+#     run_attack.py's own, written under the control tag beside the direct result. Both
+#     verdicts come off one job, as in the attack phase. --force redoes existing files.
+#     The targets of a job are the ones attackable in any of those cells
+#     (run_paper_tables.py --control_tasks, which spells the cells the way the tables read
+#     them and leaves out the cells that carry their own control).
+phase_control() {
+    local mode record name size rdf verdict vuln_flag gen trials tag suite line tasks dead=0
+    local -a verdicts
+    local -A targets=()
+    trials="$(random_trials)"
+    if (( trials <= 0 )); then
+        skip "control" "RANDOM_TRIALS=0"
+        return
+    fi
+    tag="$("$PYTHON" -c 'from utils.naming import CONTROL_TAG; print(CONTROL_TAG)')"
+    verdicts=($VERDICTS)
+    if (( MERGE_VERDICTS )) && [[ " $VERDICTS " == *" sampled "* && " $VERDICTS " == *" greedy "* ]]; then
+        verdicts=(both)
+    fi
+    # the targets per (lineage, suite, generation), read off the searched cells
+    for record in "${LINEAGES[@]}"; do
+        IFS='|' read -r name size rdf <<< "$record"
+        wants_lineage "$name" || continue
+        # shellcheck disable=SC2046
+        while read -r suite gen tasks; do
+            [[ "$suite" == "vuln" || "$suite" == "correctness" ]] || continue
+            targets["$name|$suite|$gen"]="$tasks"
+        done < <("$PYTHON" run_paper_tables.py -p "$ROOT" -msz "$size" --mixtures "$rdf" \
+                    -n "$GENERATIONS" -bs "$BLOCK_SIZE" --methods $METHODS --variants $VARIANTS \
+                    --verdicts $VERDICTS --sink_cap "$OPT_SINK_CAP" $(anchor_opts) $(gen0_opts) \
+                    $(result_tag_opts) \
+                    $( (( OPT_ENTROPY_MATCH )) || echo --no_opt_entropy_match ) \
+                    $( (( OPT_SINK_FACTOR )) || echo --no_opt_sink_factor ) \
+                    $( (( OPT_SINK_OBJECTIVE )) || echo --no_opt_sink_objective ) \
+                    --control_tasks 2>/dev/null)
+    done
+    # the vulnerability cells are the long ones (up to 25 targets, 256 new tokens per decode)
+    for mode in vuln correctness; do
+        vuln_flag=""
+        [[ "$mode" == "vuln" ]] && vuln_flag="--vuln"
+        for verdict in "${verdicts[@]}"; do
+            for record in "${LINEAGES[@]}"; do
+                IFS='|' read -r name size rdf <<< "$record"
+                wants_lineage "$name" || continue
+                for (( gen = 0; gen <= GENERATIONS; gen++ )); do
+                    tasks="${targets["$name|$mode|$gen"]:--}"
+                    if [[ "$tasks" == "-" ]]; then
+                        dead=$(( dead + 1 ))
+                        continue
+                    fi
+                    # shellcheck disable=SC2046
+                    queue "control_${mode}_${name}_${verdict}_gen${gen}" ./run_attack_sweep.sh \
+                        -s "$gen" -n "$gen" -p "$ROOT" -b "$BLOCK_SIZE" -msz "$size" \
+                        -rdf "$rdf" -m none $vuln_flag $(force_flag) \
+                        -- -r "$RESTARTS" -ns 0 -ve "$VERIFY_EVERY" -ag 1 \
+                        $(verdict_opts "$verdict") $(anchor_opts) $(gen0_opts) \
+                        -rct "$trials" --random_control_ungated -t "$tasks" \
+                        --result_tag "$tag" $(search_opts)
+                done
+            done
+        done
+    done
+    echo
+    echo "── control: $dead (suite, lineage, generation) cell(s) need no job: every searched cell" \
+         "carries its own control, or none has an attackable target ──"
+    drain "${ATTACK_GPUS//,/ }" "$CONTROL_JOBS_PER_GPU"
+}
+
 # 4. The attack figures, from the result files alone, so a redraw costs no GPU time
 #    (`--phases plots --force`). The correctness hits are drawn per lineage, the vulnerability
 #    figures per size and hit rule: runs under different rules are different claims and are never
 #    averaged into one panel.
 phase_plots() {
     local record name size rdf specifier variant verdict tag method em label
+    if [[ -n "$ANCHOR_ROOT" ]]; then
+        # a foreign-anchor pass: only the tables read the tagged surrogate files. The utility,
+        # per-lineage and vulnerability figures describe the lineage itself and its own pass
+        skip "plots_lineage_figures" "ANCHOR_ROOT pass; the tables under $RESULT_TAG are drawn"
+        phase_plots_tables
+        return
+    fi
     # the utility figures first, redrawn from the cached evaluations (-po) so that
     # `--phases plots` is the whole figure set and not only the attack half. Both scripts import
     # unsloth at module scope, so they need a visible GPU even to replot
@@ -761,13 +950,24 @@ phase_plots() {
                 done
             done
         done
-        # the result tables of the write-up as figures and markdown, one set per size: utility,
-        # calibration, the hits/attackable grids, surrogate quality and the sink screen. Reads
-        # files only, so it is part of every `--phases plots`
+    done
+    phase_plots_tables
+}
+
+# the result tables of the write-up as figures and markdown, one set per size: utility,
+# calibration, the hits/attackable grids, surrogate quality and the sink screen. Reads files
+# only, so it is part of every `--phases plots`; under ANCHOR_ROOT it is the whole plots phase
+phase_plots_tables() {
+    local size
+    for size in $SIZES; do
+        if [[ -n "$ONLY" && "$ONLY" != "${size}-"* ]]; then
+            continue
+        fi
         # shellcheck disable=SC2046
         run "plots_tables_${size}" "$PYTHON" run_paper_tables.py -p "$ROOT" -pp "$PLOTS_DIR" \
             -msz "$size" --mixtures $MIXTURES -n "$GENERATIONS" -bs "$BLOCK_SIZE" \
-            --methods $METHODS --variants $VARIANTS --verdicts $VERDICTS \
+            --methods $METHODS --variants $VARIANTS --verdicts $VERDICTS $(result_tag_opts) \
+            -rp "$REPETITION_PENALTY" --min_new_tokens "$MIN_NEW_TOKENS" \
             --sink_cap "$OPT_SINK_CAP" $(anchor_opts) $(gen0_opts) $(usetex_flag_py) \
             $( (( OPT_ENTROPY_MATCH )) || echo --no_opt_entropy_match ) \
             $( (( OPT_SINK_FACTOR )) || echo --no_opt_sink_factor ) \
@@ -780,7 +980,8 @@ phase_plots() {
         # shellcheck disable=SC2046
         run "plots_tables_sizes" "$PYTHON" run_paper_tables.py -p "$ROOT" -pp "$PLOTS_DIR" \
             --compare_sizes $SIZES --mixtures $MIXTURES -n "$GENERATIONS" -bs "$BLOCK_SIZE" \
-            --methods $METHODS --variants $VARIANTS --verdicts $VERDICTS \
+            --methods $METHODS --variants $VARIANTS --verdicts $VERDICTS $(result_tag_opts) \
+            -rp "$REPETITION_PENALTY" --min_new_tokens "$MIN_NEW_TOKENS" \
             --sink_cap "$OPT_SINK_CAP" $(anchor_opts) $(gen0_opts) $(usetex_flag_py) \
             $( (( OPT_ENTROPY_MATCH )) || echo --no_opt_entropy_match ) \
             $( (( OPT_SINK_FACTOR )) || echo --no_opt_sink_factor ) \
@@ -794,7 +995,7 @@ print_plan() {
     echo "## paper pipeline"
     echo "##   root         : $ROOT"
     echo "##   generations  : 0..$GENERATIONS  (run_baseline.py -ng $NUM_GENERATIONS), block size $BLOCK_SIZE"
-    echo "##   decoding     : T $TEMPERATURE, top-p $TOP_P, top-k $TOP_K, repetition penalty $REPETITION_PENALTY, seed $SEED, fresh init every generation"
+    echo "##   decoding     : T $TEMPERATURE, top-p $TOP_P, top-k $TOP_K, repetition penalty $REPETITION_PENALTY, min new tokens $MIN_NEW_TOKENS, seed $SEED, fresh init every generation"
     echo "##   mixtures     : $MIXTURES$( [[ " $MIXTURES " == *" 1.0 "* ]] && echo '  (1.0 = non-collapsing control, human data every generation)' )"
     echo "##   phases       : $PHASES"
     echo "##   interpreter  : $PYTHON"
@@ -806,6 +1007,10 @@ print_plan() {
     echo "##                  queued per (sweep, generation) over the attack GPUs, longest first"
     echo "##   hit rule     : target wrong, baseline correct" \
          "$( (( HOLD_ANCHOR )) && echo ', generation-0 anchor correct (HOLD_ANCHOR=1)' )"
+    echo "##   null control : $(random_trials) random suffix(es) per attackable target and cell (RANDOM_TRIALS=$RANDOM_TRIALS)"
+    has_phase control && echo "##   control phase: the control alone, no search, for the cells searched without one; $CONTROL_JOBS_PER_GPU job(s) per GPU"
+    [[ -n "$BASELINE_EXTRA" ]] && echo "##   collapse     : run_baseline.py gets '$BASELINE_EXTRA' (BASELINE_EXTRA)"
+    [[ -n "$ANCHOR_ROOT" ]] && echo "##   anchor       : surrogates built from $ANCHOR_ROOT's generation 0 (ANCHOR_ROOT), results tagged $RESULT_TAG"
     if [[ " $VARIANTS " == *" opt "* ]]; then
         echo "##   opt variant  : entropy match $OPT_ENTROPY_MATCH; vuln also sink factor" \
              "$OPT_SINK_FACTOR (cap $OPT_SINK_CAP), sink objective $OPT_SINK_OBJECTIVE" \
@@ -847,7 +1052,7 @@ fi
 
 mkdir -p "$LOG_DIR" "$PLOTS_DIR"
 
-for phase in collapse utility attack plots; do
+for phase in collapse utility attack control plots; do
     has_phase "$phase" || continue
     echo
     echo "════════════════════════════════════════════════════════════"

@@ -287,7 +287,7 @@ print(anchor_tag(anchor_held_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; th
     echo "error: could not resolve the anchor tag from the passthrough arguments" >&2
     exit 2
 fi
-# the sixth tag: which objective the search optimized. Same mechanism
+# the fifth tag: which objective the search optimized. Same mechanism
 if ! OBJECTIVE_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
         'import sys
 from utils.naming import objective_tag, sink_objective_from_argv
@@ -302,6 +302,16 @@ if ! ENTROPY_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
 from utils.naming import entropy_match_from_argv, entropy_tag
 print(entropy_tag(entropy_match_from_argv(sys.argv[1:])))' "${EXTRA_ARGS[@]}")"; then
     echo "error: could not resolve the entropy tag from the passthrough arguments" >&2
+    exit 2
+fi
+
+# the last tag: a caller-chosen --result_tag for a setup the other tags do not spell (a
+# surrogate anchored on another root's generation 0). Same mechanism; it ends the name
+if ! RESULT_TAG="$(PYTHONPATH="$SCRIPT_DIR" "$PYTHON" -c \
+        'import sys
+from utils.naming import result_tag_from_argv
+print(result_tag_from_argv(sys.argv[1:]))' "${EXTRA_ARGS[@]}")"; then
+    echo "error: could not resolve the result tag from the passthrough arguments" >&2
     exit 2
 fi
 
@@ -400,13 +410,13 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     fi
     if (( DIRECT_SWEEP == 1 )) || (( gen == 0 )); then
         run_method="none"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}.json"
-        greedy_result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${RESULT_TAG}.json"
+        greedy_result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${RESULT_TAG}.json"
         label="generation $gen (no surrogate, direct against the real checkpoint)"
     else
         run_method="$SURROGATE_METHOD"
-        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate.json"
-        greedy_result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate.json"
+        result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate${RESULT_TAG}.json"
+        greedy_result_file="$RESULTS_DIR/attack_gen${gen}_${SPECIFIER_NAME}${MIXTURE_TAG}${TARGET_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${FACTOR_TAG}${ENTROPY_TAG}_${SURROGATE_METHOD}_surrogate${RESULT_TAG}.json"
         factor_label="n = $((gen + 1))"
         if [[ -n "$FACTOR_TAG" ]]; then
             factor_label="n from -sf $SURROGATE_FACTOR, at most $((gen + 1))"
@@ -421,7 +431,7 @@ for (( gen = START_GENERATION; gen <= NUM_GENERATIONS; gen++ )); do
     if [[ "$run_method" != "none" ]]; then
         log_tag="${FACTOR_TAG}${ENTROPY_TAG}"
     fi
-    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${log_tag}_${run_method}.log"
+    log_file="$LOG_DIR/attack_gen${gen}${MIXTURE_TAG}${TARGET_TAG}${DECODING_TAG}${anchor_tag_for_gen}${OBJECTIVE_TAG}${log_tag}_${run_method}${RESULT_TAG}.log"
 
     echo
     echo "== $label =="
@@ -485,7 +495,8 @@ echo
 echo "############################################################"
 echo "## sweep summary  (total $(( SECONDS - STARTED_AT ))s)"
 echo "############################################################"
-printf '## %-5s %-10s %-11s %-9s %s\n' gen run capability hits note
+# random: attackable targets an unoptimized suffix broke / targets the control covered
+printf '## %-5s %-10s %-11s %-9s %-9s %s\n' gen run capability hits random note
 
 for (( i = 0; i < ${#STATUS_GENS[@]}; i++ )); do
     gen="${STATUS_GENS[$i]}"
@@ -493,6 +504,7 @@ for (( i = 0; i < ${#STATUS_GENS[@]}; i++ )); do
     file="${STATUS_FILES[$i]}"
     capability="-"
     hits="-"
+    random="-"
     note=""
 
     # only read the result file for runs that actually produced one. A failed generation may
@@ -505,7 +517,7 @@ for (( i = 0; i < ${#STATUS_GENS[@]}; i++ )); do
 
     if [[ -n "$file" && -f "$file" ]]; then
         # the results file is written even when the capability gate stops the run
-        read -r capability hits note < <(
+        read -r capability hits random note < <(
             "$PYTHON" - "$file" "$HIT_LABEL" <<'PY'
 import json, sys
 
@@ -517,16 +529,22 @@ solved, probed = len(probe.get("collapsed_solved") or []), probe.get("n_probed")
 capability = f"{solved}/{probed}" if probed else "not-probed"
 hits = sum(len(r.get("successes") or []) for r in report.get("results") or [])
 note = "gate-aborted" if report.get("aborted") else (sys.argv[2] if hits else "no-hit")
-print(capability, hits, note)
+usable = set(probe.get("usable") or [])
+control = {name: counts for name, counts
+           in ((report.get("random_control") or {}).get("per_task") or {}).items()
+           if name in usable}
+broken = sum(1 for counts in control.values() if counts.get("n_hits", 0) > 0)
+random = f"{broken}/{len(control)}" if control else "-"
+print(capability, hits, random, note)
 PY
-        ) || { capability="?"; hits="?"; note="unreadable-result"; }
+        ) || { capability="?"; hits="?"; random="?"; note="unreadable-result"; }
     elif [[ "$code" == "skipped" ]]; then
         note="surrogate anchor"
     elif [[ "$code" == "ok" || "$code" == "cached" ]]; then
         note="no result file written"
     fi
 
-    printf '## %-5s %-10s %-11s %-9s %s\n' "$gen" "$code" "$capability" "$hits" "$note"
+    printf '## %-5s %-10s %-11s %-9s %-9s %s\n' "$gen" "$code" "$capability" "$hits" "$random" "$note"
 done
 
 echo "############################################################"

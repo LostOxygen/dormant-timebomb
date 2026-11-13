@@ -55,6 +55,7 @@ import os
 import statistics
 
 import matplotlib
+import matplotlib.lines
 import matplotlib.pyplot as plt
 import matplotlib.ticker
 import numpy as np
@@ -63,12 +64,18 @@ from utils import nord
 from utils.colors import TColors
 from utils.models import resolve_model_specifier
 from utils.naming import (
+    DEFAULT_MIN_NEW_TOKENS,
+    DEFAULT_REPETITION_PENALTY,
     anchor_tag,
+    control_file,
     entropy_tag,
     factor_mode_tag,
     gen_zero_tag,
     mixture_tag,
+    min_tokens_tag,
     objective_tag,
+    penalty_tag,
+    result_tag,
     verification_tag,
 )
 from utils.plotting import EndLabels, aborted_cell, percent, save_figure, tidy
@@ -144,7 +151,8 @@ class Grid:
         path = os.path.join(
             self.datasets,
             f"perplexity_dict_bs{self.args.block_size}_{self.name}{self.init}{self.gen0}"
-            f"{mixture_tag(mixture)}.pt",
+            f"{mixture_tag(mixture)}{penalty_tag(self.args.repetition_penalty)}"
+            f"{min_tokens_tag(self.args.min_new_tokens)}.pt",
         )
         if not os.path.exists(path):
             return []
@@ -190,23 +198,73 @@ class Grid:
                 f"{factor_mode_tag('sink') if sink_factor else ''}{entropy_tag(entropy)}"
                 f"_{method}_surrogate" if transfer else ""
             )
+            # the surrogate cells of a foreign-anchor pass (run_paper.sh ANCHOR_ROOT) carry the
+            # tag; the direct attack has no anchor and is the same file in both passes
+            + (result_tag(args.result_tag) if transfer else "")
         )
         return os.path.join(self.results, f"{stem}.json")
 
     def attack_cell(self, mixture, suite, method, variant, verdict, generation) -> dict | None:
-        """{usable, hits, aborted, surrogate_quality} of one cell, or None when it was never run."""
+        """{usable, hits, aborted, surrogate_quality, random_*} of one cell, or None when it was
+        never run. The ``random_*`` keys are the cell's random-suffix control (run_attack.py
+        --random_control_trials), read on the same footing as the hits: ``random_hits`` is the
+        number of attackable targets at least one unoptimized suffix broke, ``random_trial_hits``
+        / ``random_trials`` the trial-level counts behind it, and ``random_tasks`` how many
+        attackable targets the control covered (0 when the cell ran without it). A cell searched
+        without the control takes it from the lineage's control-only pass (run_paper.sh --phases
+        control, `utils.naming.control_file` of the direct cell) when that exists: the control
+        decodes the real checkpoint and the baseline only, so it is the same measurement for
+        every method of the generation, and it is still cut to this cell's own attackable set."""
         payload = read_json(
             self.result_path(mixture, suite, method, variant, verdict, generation)
         )
         if payload is None:
             return None
         probe = payload.get("capability_probe") or {}
+        usable = set(probe.get("usable") or [])
+        control = ((payload.get("random_control") or {}).get("per_task") or {})
+        if not control:
+            separate = read_json(control_file(
+                self.result_path(mixture, suite, "none", "plain", verdict, generation)
+            ))
+            control = (((separate or {}).get("random_control") or {}).get("per_task") or {})
+        control = {task: counts for task, counts in control.items() if task in usable}
         return {
-            "usable": len(probe.get("usable") or []),
+            "usable": len(usable),
             "hits": sum(1 for row in payload.get("results") or [] if row.get("successes")),
             "aborted": bool(payload.get("aborted")),
             "surrogate_quality": payload.get("surrogate_quality") or {},
+            "random_tasks": len(control),
+            "random_hits": sum(1 for counts in control.values() if counts.get("n_hits", 0) > 0),
+            "random_trial_hits": sum(counts.get("n_hits", 0) for counts in control.values()),
+            "random_trials": sum(counts.get("n_trials", 0) for counts in control.values()),
         }
+
+    def control_tasks(self, mixture: float, suite: str, generation: int) -> list:
+        """The targets a control-only pass has to cover at one generation: every target that is
+        attackable in at least one searched cell of it that carries no random-suffix control of
+        its own, over the methods, variants and verdicts. The cells disagree under the sampled
+        verdict (its gate is a draw of a five-sample majority, and the surrogate cells draw it
+        differently from the direct one), so the union is what lets one control file serve all
+        of them; each reader then cuts it to its own cell. In the suite's own target order, []
+        when no cell of the generation was searched or every one has its own control."""
+        usable: set = set()
+        order: list = []
+        for method in self.args.methods:
+            for variant in self.args.variants:
+                if method == "none" and variant != "plain":
+                    continue
+                for verdict in self.args.verdicts:
+                    payload = read_json(
+                        self.result_path(mixture, suite, method, variant, verdict, generation)
+                    ) or {}
+                    probe = payload.get("capability_probe") or {}
+                    # the gate probes the suite in its own order, which the task list keeps
+                    order += [name for name in probe.get("per_task") or {} if name not in order]
+                    if (payload.get("random_control") or {}).get("per_task"):
+                        continue        # searched with its own control
+                    usable |= set(probe.get("usable") or [])
+        return [name for name in order if name in usable] + sorted(usable - set(order))
 
     def sink_screen(self, mixture: float) -> dict | None:
         payload = read_json(os.path.join(
@@ -445,29 +503,43 @@ def figure_attack_grid(grid: Grid, suite: str, verdict: str, usetex: bool, stem:
             y += gap
         ys.append(y)
         y += 1.0
+    # the random-suffix control, where the cells carry one: the same share for unoptimized
+    # suffixes, small under the rate so the two read together
+    with_random = any(has_random(cell) for row in rows for cell in row)
     figure, axis = plt.subplots(figsize=(1.05 * n_cols + 4.2, 0.52 * n_rows + 2.4))
     cmap = nord.sequential_cmap()
-    table_rows = []
+    table_rows, random_rows = [], []
     for index, cells in enumerate(rows):
         text_row = [labels[index][0], labels[index][1]]
+        random_row = [labels[index][0], labels[index][1]]
         for column, cell in enumerate(cells):
             x, yy = column, ys[index]
             if cell is None:
                 text_row.append("")
+                random_row.append("")
                 continue
             if cell["aborted"] or cell["usable"] == 0:
                 axis.add_patch(aborted_cell(x, yy))
                 axis.text(x, yy, "–", ha="center", va="center", fontsize=11,
                           color=nord.TEXT_MUTED)
                 text_row.append("–")
+                random_row.append("–")
                 continue
             rate = cell["hits"] / cell["usable"]
             axis.add_patch(plt.Rectangle((x - 0.5, yy - 0.5), 1, 1, facecolor=cmap(rate),
                                          edgecolor=nord.SURFACE, linewidth=2))
-            axis.text(x, yy, percent(rate, usetex), ha="center", va="center", fontsize=10.5,
-                      color=nord.text_on(rate))
+            if has_random(cell):
+                axis.text(x, yy - 0.1, percent(rate, usetex), ha="center", va="center",
+                          fontsize=10.5, color=nord.text_on(rate))
+                axis.text(x, yy + 0.3, percent(random_rate(cell), usetex), ha="center",
+                          va="center", fontsize=7, color=nord.text_on(rate))
+            else:
+                axis.text(x, yy, percent(rate, usetex), ha="center", va="center",
+                          fontsize=10.5, color=nord.text_on(rate))
             text_row.append(f"{percent(rate)} (n={cell['usable']})")
+            random_row.append(random_cell_text(cell))
         table_rows.append(text_row)
+        random_rows.append(random_row)
     axis.set_xlim(-0.5, n_cols - 0.5)
     axis.set_ylim(ys[-1] + 0.5, -0.5)
     axis.set_xticks(range(n_cols))
@@ -490,13 +562,22 @@ def figure_attack_grid(grid: Grid, suite: str, verdict: str, usetex: bool, stem:
     bar.set_label("hit rate", fontsize=11)
     bar.ax.tick_params(labelsize=10)
     bar.outline.set_visible(False)
-    axis.text(n_cols - 0.5, ys[-1] + 1.1, "– : capability gate aborted (no attackable target)",
+    note = "– : capability gate aborted (no attackable target)"
+    if with_random:
+        note += f";  small: {RANDOM_LABEL}, the same share for unoptimized suffixes"
+    # below the axis label, so a long note does not run into it
+    axis.text(1.0, -0.2 - 1.2 / (0.52 * n_rows + 2.4), note, transform=axis.transAxes,
               ha="right", va="top", fontsize=9.5, color=nord.TEXT_MUTED)
     save_figure(figure, stem)
     plt.close(figure)
     tables.append((f"{SUITES[suite]}, {verdict} verdict: hit rate per generation "
                    "(n = attackable targets)",
                    ["lineage", "method"] + [f"g{g}" for g in grid.generations], table_rows))
+    if with_random:
+        tables.append((f"{SUITES[suite]}, {verdict} verdict: {RANDOM_LABEL} per generation "
+                       "(share of the attackable targets an unoptimized suffix broke; "
+                       "trials = random hits / random suffixes verified)",
+                       ["lineage", "method"] + [f"g{g}" for g in grid.generations], random_rows))
     return True
 
 
@@ -522,6 +603,7 @@ def figure_rate_comparison(grid: Grid, suite: str, verdict: str, usetex: bool, s
             return np.nan
         return 100.0 * cell["hits"] / cell["usable"]
 
+    with_random = any(has_random(c) for series in cells.values() for c in series)
     styles = lineage_style(grid)
     n_panels = len(combos) + 1
     figure, axes = plt.subplots(1, n_panels, figsize=(5.4 * n_panels + 1.2, 5.6))
@@ -537,13 +619,25 @@ def figure_rate_comparison(grid: Grid, suite: str, verdict: str, usetex: bool, s
                       label=lineage_label(mixture))
             last = int(np.max(np.flatnonzero(~np.isnan(rates))))
             labels[index].add(grid.generations[last], rates[last], lineage_label(mixture), colour)
+            # the null beside the result: the same share for unoptimized suffixes of the same
+            # length, dashed in the lineage's colour so the gap between the two is the attack
+            random = np.array([100.0 * random_rate(c) for c in cells[(mixture, combo)]])
+            if not np.all(np.isnan(random)):
+                axis.plot(grid.generations, random, linestyle=(0, (3, 2)), linewidth=1.3,
+                          color=colour, alpha=0.85, marker=marker, markersize=3.5,
+                          markerfacecolor=nord.SURFACE)
         axis.set_title(METHOD_LABELS[combo], fontsize=15)
         axis.set_xlabel("collapse generation")
         axis.set_xticks(grid.generations)
         axis.set_ylim(-4, 104)
         axis.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(decimals=0))
         axis.margins(x=0.12)
-        axis.legend(fontsize=10, loc="best")
+        handles, names = axis.get_legend_handles_labels()
+        if with_random:
+            handles.append(matplotlib.lines.Line2D([], [], color=nord.TEXT_MUTED,
+                                                   linestyle=(0, (3, 2)), linewidth=1.3))
+            names.append(f"dashed: {RANDOM_LABEL}")
+        axis.legend(handles, names, fontsize=10, loc="best")
         tidy(axis)
     axes[0].set_ylabel("hit rate (share of attackable targets broken)")
 
@@ -551,10 +645,11 @@ def figure_rate_comparison(grid: Grid, suite: str, verdict: str, usetex: bool, s
     axis = axes[-1]
     n_lineages = len(grid.mixtures)
     width = 0.8 / n_lineages
-    table_rows = []
+    table_rows, random_rows = [], []
     for li, mixture in enumerate(grid.mixtures):
         colour, _ = styles[mixture]
         row = [lineage_label(mixture)]
+        random_row = [lineage_label(mixture)]
         for ci, combo in enumerate(combos):
             hits = sum(c["hits"] for c in cells[(mixture, combo)]
                        if c and not c["aborted"] and c["usable"])
@@ -572,14 +667,29 @@ def figure_rate_comparison(grid: Grid, suite: str, verdict: str, usetex: bool, s
                 axis.bar(x, 0, width=width, color=colour,
                          label=lineage_label(mixture) if ci == 0 else None)
                 row.append("–")
+            # the pooled random-suffix rate as a dark tick across the bar: the part of the bar
+            # above it is what the search added over chance
+            random_hits, random_tasks = pooled_random(cells[(mixture, combo)])
+            if random_tasks:
+                level = 100.0 * random_hits / random_tasks
+                axis.plot([x - width / 2, x + width / 2], [level, level], color=nord.TEXT,
+                          linewidth=2.2, solid_capstyle="butt", zorder=3)
+                random_row.append(f"{level:.1f}% ({random_hits}/{random_tasks})")
+            else:
+                random_row.append("–")
         table_rows.append(row)
+        random_rows.append(random_row)
     axis.set_xticks(range(len(combos)))
     axis.set_xticklabels([METHOD_LABELS[c] for c in combos])
     axis.set_ylim(0, 104)
     axis.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(decimals=0))
     axis.set_title("pooled over the generations", fontsize=15)
     axis.set_xlabel("method")
-    axis.legend(fontsize=10, loc="best", title="lineage", title_fontsize=10)
+    handles, names = axis.get_legend_handles_labels()
+    if with_random:
+        handles.append(matplotlib.lines.Line2D([], [], color=nord.TEXT, linewidth=2.2))
+        names.append(RANDOM_LABEL)
+    axis.legend(handles, names, fontsize=10, loc="best", title="lineage", title_fontsize=10)
     axis.grid(axis="x", visible=False)
     tidy(axis)
 
@@ -592,6 +702,10 @@ def figure_rate_comparison(grid: Grid, suite: str, verdict: str, usetex: bool, s
     tables.append((f"{SUITES[suite]}, {verdict} verdict: hit rate pooled over the generations "
                    "(hits / attackable targets)",
                    ["lineage"] + [METHOD_LABELS[c] for c in combos], table_rows))
+    if with_random:
+        tables.append((f"{SUITES[suite]}, {verdict} verdict: {RANDOM_LABEL} pooled over the "
+                       "generations (targets an unoptimized suffix broke / targets covered)",
+                       ["lineage"] + [METHOD_LABELS[c] for c in combos], random_rows))
     return True
 
 
@@ -711,6 +825,37 @@ def pooled_rate(series: list) -> tuple:
     return hits, usable
 
 
+def has_random(cell) -> bool:
+    """Whether a cell ran the random-suffix control over at least one attackable target."""
+    return bool(cell) and not cell["aborted"] and cell.get("random_tasks", 0) > 0
+
+
+def random_rate(cell) -> float:
+    """The random-suffix control's rate of a cell, on the hit rate's footing: the share of the
+    attackable targets at least one unoptimized suffix broke. NaN without a control."""
+    if not has_random(cell):
+        return np.nan
+    return cell["random_hits"] / cell["random_tasks"]
+
+
+def pooled_random(series: list) -> tuple:
+    """(targets broken by a random suffix, targets the control covered) over the generations."""
+    hits = sum(c["random_hits"] for c in series if has_random(c))
+    tasks = sum(c["random_tasks"] for c in series if has_random(c))
+    return hits, tasks
+
+
+def random_cell_text(cell) -> str:
+    """The markdown spelling of a cell's random control: ``rate (k/n; trials h/T)``."""
+    if not has_random(cell):
+        return ""
+    return (f"{percent(random_rate(cell))} ({cell['random_hits']}/{cell['random_tasks']}; "
+            f"trials {cell['random_trial_hits']}/{cell['random_trials']})")
+
+
+RANDOM_LABEL: str = "random-suffix control"
+
+
 def draw_rate_heatmap(heat, grid: Grid, series_by_mixture: dict, usetex: bool,
                       fontsize: float = 10.5) -> None:
     """The mixture-by-generation hit-rate heatmap on `heat`: percent cells shaded by the rate,
@@ -730,8 +875,15 @@ def draw_rate_heatmap(heat, grid: Grid, series_by_mixture: dict, usetex: bool,
             rate = cell["hits"] / cell["usable"]
             heat.add_patch(plt.Rectangle((x - 0.5, y - 0.5), 1, 1, facecolor=cmap(rate),
                                          edgecolor=nord.SURFACE, linewidth=2))
-            heat.text(x, y, percent(rate, usetex), ha="center", va="center",
-                      fontsize=fontsize, color=nord.text_on(rate))
+            if has_random(cell):
+                # the random-suffix control's share, small under the rate (see has_random)
+                heat.text(x, y - 0.1, percent(rate, usetex), ha="center", va="center",
+                          fontsize=fontsize, color=nord.text_on(rate))
+                heat.text(x, y + 0.3, percent(random_rate(cell), usetex), ha="center",
+                          va="center", fontsize=fontsize * 0.66, color=nord.text_on(rate))
+            else:
+                heat.text(x, y, percent(rate, usetex), ha="center", va="center",
+                          fontsize=fontsize, color=nord.text_on(rate))
     heat.set_xlim(-0.5, n_gen - 0.5)
     heat.set_ylim(-0.5, n_mix - 0.5)
     heat.set_xticks(range(n_gen))
@@ -752,14 +904,19 @@ def size_colors(grids: list) -> dict:
 
 
 def draw_pooled_by_size(axis, grids: list, cells: dict, combo: tuple, mixtures: list,
-                        usetex: bool, legend: bool = True) -> list:
-    """Grouped bars: per lineage, the rate pooled over the generations, one bar per size.
-    Returns one markdown row per lineage, ``rate (hits/attackable)`` per size."""
+                        usetex: bool, legend: bool = True, random_rows: list | None = None) -> list:
+    """Grouped bars: per lineage, the rate pooled over the generations, one bar per size, with
+    the pooled random-suffix control as a dark tick across each bar (the part of the bar above
+    it is what the search added over chance). Returns one markdown row per lineage, ``rate
+    (hits/attackable)`` per size; ``random_rows``, when given, is filled with the control's
+    rows in the same layout, and left empty when no cell carries a control."""
     colours = size_colors(grids)
     width = 0.8 / len(grids)
     rows = []
+    control_rows, with_random = [], False
     for mi, mixture in enumerate(mixtures):
         row = [lineage_label(mixture)]
+        control_row = [lineage_label(mixture)]
         for si, grid in enumerate(grids):
             x = mi + (si - (len(grids) - 1) / 2) * width
             series = cells[grid.size].get((mixture, combo)) if mixture in grid.mixtures else None
@@ -775,15 +932,32 @@ def draw_pooled_by_size(axis, grids: list, cells: dict, combo: tuple, mixtures: 
             else:
                 axis.bar(x, 0, width=width, color=colours[grid.size], label=label)
                 row.append("–")
+            random_hits, random_tasks = pooled_random(series) if series else (0, 0)
+            if random_tasks:
+                with_random = True
+                level = 100.0 * random_hits / random_tasks
+                axis.plot([x - width / 2, x + width / 2], [level, level], color=nord.TEXT,
+                          linewidth=2.2, solid_capstyle="butt", zorder=3)
+                control_row.append(f"{level:.1f}% ({random_hits}/{random_tasks})")
+            else:
+                control_row.append("–")
         rows.append(row)
+        control_rows.append(control_row)
     axis.set_xticks(range(len(mixtures)))
     axis.set_xticklabels([lineage_label(m) for m in mixtures])
     axis.set_ylim(0, 104)
     axis.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(decimals=0))
     axis.grid(axis="x", visible=False)
     if legend:
-        axis.legend(fontsize=10, loc="best", title="model size", title_fontsize=10)
+        handles, names = axis.get_legend_handles_labels()
+        if with_random:
+            handles.append(matplotlib.lines.Line2D([], [], color=nord.TEXT, linewidth=2.2))
+            names.append(RANDOM_LABEL)
+        axis.legend(handles, names, fontsize=10, loc="best", title="model size",
+                    title_fontsize=10)
     tidy(axis)
+    if random_rows is not None and with_random:
+        random_rows.extend(control_rows)
     return rows
 
 
@@ -836,7 +1010,9 @@ def figure_size_comparison(grids: list, suite: str, verdict: str, usetex: bool, 
         bar.ax.tick_params(labelsize=10)
         bar.outline.set_visible(False)
 
-        rows = draw_pooled_by_size(pooled, grids, cells, combo, mixtures, usetex)
+        control_rows: list = []
+        rows = draw_pooled_by_size(pooled, grids, cells, combo, mixtures, usetex,
+                                   random_rows=control_rows)
         pooled.set_title("pooled over the generations", fontsize=12, loc="left")
         pooled.set_ylabel("hit rate (hits / attackable targets)")
         figure.suptitle(f"{SUITES[suite]}, {verdict} verdict, {METHOD_LABELS[combo]}: "
@@ -849,6 +1025,11 @@ def figure_size_comparison(grids: list, suite: str, verdict: str, usetex: bool, 
         tables.append((f"{SUITES[suite]}, {verdict} verdict, {METHOD_LABELS[combo]}: hit rate "
                        "pooled over the generations per model size (hits / attackable targets)",
                        ["lineage"] + [g.size for g in grids], rows))
+        if control_rows:
+            tables.append((f"{SUITES[suite]}, {verdict} verdict, {METHOD_LABELS[combo]}: "
+                           f"{RANDOM_LABEL} pooled over the generations per model size (targets "
+                           "an unoptimized suffix broke / targets covered)",
+                           ["lineage"] + [g.size for g in grids], control_rows))
 
     # every method's pooled panel in one figure
     figure, axes = plt.subplots(1, len(combos), figsize=(4.8 * len(combos) + 1.0, 5.2),
@@ -1008,7 +1189,7 @@ def compare_sizes(args, usetex: bool, plots: str) -> None:
     """The ``--compare_sizes`` run: every size's grid read side by side, figures and markdown
     under ``tables_sizes_*``."""
     grids = [Grid(args, size) for size in args.compare_sizes]
-    prefix = os.path.join(plots, "tables_sizes")
+    prefix = os.path.join(plots, f"tables_sizes{result_tag(args.result_tag)}")
     tables: list = []
     written = []
     for suite in ("vuln", "correctness"):
@@ -1038,7 +1219,18 @@ def main() -> None:
     parser.add_argument("--variants", nargs="+", default=["plain", "opt"])
     parser.add_argument("--verdicts", nargs="+", default=["sampled", "greedy"])
     parser.add_argument("--hold_anchor", "-ha", action="store_true")
+    parser.add_argument("--result_tag", type=str, default="",
+                        help="read the surrogate cells written under run_attack.py --result_tag "
+                             "(a surrogate anchored on another root's generation 0; run_paper.sh "
+                             "ANCHOR_ROOT) and put the tag on every figure and table name. The "
+                             "direct cells are untagged in both passes (default: none)")
     parser.add_argument("--human_generation_zero", "-hg0", action="store_true")
+    parser.add_argument("--repetition_penalty", "-rp", type=float,
+                        default=DEFAULT_REPETITION_PENALTY,
+                        help="the lineages' generation decoding penalty; with --min_new_tokens "
+                             "it spells the stage-1 perplexity cache the corpus-perplexity row "
+                             "reads (run-level tags _rp / _min)")
+    parser.add_argument("--min_new_tokens", "-mint", type=int, default=DEFAULT_MIN_NEW_TOKENS)
     parser.add_argument("--recursive_init", "-ri", action="store_true")
     parser.add_argument("--no_opt_entropy_match", dest="opt_entropy_match", action="store_false")
     parser.add_argument("--no_opt_sink_factor", dest="opt_sink_factor", action="store_false")
@@ -1053,7 +1245,20 @@ def main() -> None:
                         help="draw the model sizes side by side instead of one size's tables: "
                              "the hit-rate heatmaps and the pooled rates per lineage, one "
                              "figure per suite, verdict and method under tables_sizes_*")
+    parser.add_argument("--control_tasks", action="store_true",
+                        help="draw nothing: print, per suite and generation of the first "
+                             "--mixtures value, the targets attackable in at least one searched "
+                             "cell, as `suite generation task,task,...`. What run_paper.sh "
+                             "--phases control hands a control-only job as its task list")
     args = parser.parse_args()
+
+    if args.control_tasks:
+        grid = Grid(args, args.model_size)
+        for suite in ("vuln", "correctness"):
+            for generation in grid.generations:
+                tasks = grid.control_tasks(grid.mixtures[0], suite, generation)
+                print(suite, generation, ",".join(tasks) or "-")
+        return
 
     usetex = not args.no_usetex
     nord.apply_style(usetex, font_size=13)
@@ -1063,7 +1268,7 @@ def main() -> None:
         compare_sizes(args, usetex, plots)
         return
     grid = Grid(args, args.model_size)
-    prefix = os.path.join(plots, f"tables_{args.model_size}")
+    prefix = os.path.join(plots, f"tables_{args.model_size}{result_tag(args.result_tag)}")
     tables: list = []
     written = []
 

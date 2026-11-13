@@ -26,7 +26,7 @@ import os
 import re
 from dataclasses import dataclass, field
 
-from utils.naming import anchor_tag, objective_tag, verification_tag
+from utils.naming import CONTROL_TAG, anchor_tag, objective_tag, verification_tag
 
 # statuses, mirrored from run_attack.WRONG_STATUSES / run_attack_vuln so this module stays
 # import-light. A mismatch would be caught by check_status_vocabulary() below
@@ -165,6 +165,34 @@ class AttackRecord:
     hold_anchor: bool = False
     sink_objective: bool = False
     entropy_match: bool = False
+    # run_attack.py --result_tag: "" for the lineage's own runs, e.g. "_splitanchor" for a
+    # surrogate anchored on another root's generation 0 (run_paper.sh ANCHOR_ROOT)
+    result_tag: str = ""
+    # the random-suffix control (run_attack.py --random_control_trials), target -> its counts
+    # (n_trials, n_hits, ...): the run's own, or, for a run searched without one, the control-only
+    # pass of its generation, which `load_records` attaches. Read through the properties below,
+    # which cut it to this run's own attackable targets
+    random_control: dict = field(default_factory=dict)
+
+    @property
+    def random_tasks(self) -> list:
+        """Attackable targets the random-suffix control covered, in file order."""
+        return [name for name in self.attackable if name in self.random_control]
+
+    @property
+    def random_hits(self) -> list:
+        """Of those, the targets at least one unoptimized suffix broke."""
+        return [name for name in self.random_tasks
+                if self.random_control[name].get("n_hits", 0) > 0]
+
+    @property
+    def random_rate(self) -> float:
+        """The control on the hit rate's footing: targets a random suffix broke over the targets
+        it covered; NaN when the run has no control, so that a missing control is a gap."""
+        covered = len(self.random_tasks)
+        if not covered:
+            return float("nan")
+        return len(self.random_hits) / covered
 
     @property
     def run_tag(self) -> str:
@@ -267,6 +295,8 @@ def load_record(path: str) -> AttackRecord:
         hold_anchor=bool(report.get("hold_anchor", False)),
         sink_objective=bool(config.get("sink_objective", False)),
         entropy_match=bool(report.get("entropy_match") or False),
+        result_tag=report.get("result_tag") or "",
+        random_control=(report.get("random_control") or {}).get("per_task") or {},
     )
 
 
@@ -277,6 +307,7 @@ def load_records(
     real_data_fraction: float | None = None,
     run_tag: str | None = None,
     entropy_match: bool | None = None,
+    result_tag: str | None = "",
 ) -> list:
     """Reads every vulnerability result under `results_dir`, optionally filtered.
 
@@ -295,17 +326,37 @@ def load_records(
             puts two different surrogates for one generation in the same panel. Direct runs have
             no surrogate to rescale, so they survive either filter and stay in the figure as the
             white-box reference both families are read against
+        result_tag (str | None): keep only the *surrogate* runs written under this
+            run_attack.py --result_tag; "" (the default) keeps the lineage's own surrogate runs
+            and drops a foreign-anchor pass's files, which the RESULT_GLOB matches too. Direct
+            runs have no anchor and survive either value. None keeps every run. A control-only
+            pass (`utils.naming.CONTROL_TAG`, no search in the file) is dropped under every
+            value but its own tag
 
     Returns:
         list: AttackRecords sorted by (model, mixture, method, generation)
     """
-    records = []
+    loaded = []
     for path in sorted(glob.glob(os.path.join(results_dir, RESULT_GLOB))):
         try:
-            record = load_record(path)
+            loaded.append(load_record(path))
         except (ValueError, json.JSONDecodeError, KeyError):
             # a truncated file from an interrupted run is skipped rather than aborting a figure
             continue
+    # a run searched without the random-suffix control takes the control-only pass of its
+    # generation (run_paper.sh --phases control). That pass decodes the real checkpoint and the
+    # baseline only, so it is keyed by what decides its verdicts — model, mixture, generation,
+    # decoding and anchor rule — and serves every method and objective of the generation
+    def control_key(record: AttackRecord) -> tuple:
+        return (record.specifier_name, round(record.real_data_fraction, 9), record.generation,
+                record.verification_tag, record.hold_anchor)
+
+    controls = {control_key(r): r.random_control for r in loaded
+                if r.result_tag == CONTROL_TAG and r.random_control}
+    records = []
+    for record in loaded:
+        if not record.random_control:
+            record.random_control = controls.get(control_key(record), {})
         if specifier_name and record.specifier_name != specifier_name:
             continue
         if surrogate_method and record.surrogate_method != surrogate_method:
@@ -320,6 +371,13 @@ def load_records(
                 continue
         if (entropy_match is not None and record.surrogate_method != "none"
                 and record.entropy_match != entropy_match):
+            continue
+        if (result_tag is not None and record.surrogate_method != "none"
+                and record.result_tag != result_tag):
+            continue
+        # a control-only pass (run_paper.sh --phases control) is a direct run with no search at
+        # all: its file holds the random-suffix control and nothing a hit figure may count
+        if record.result_tag == CONTROL_TAG and result_tag != CONTROL_TAG:
             continue
         records.append(record)
     records.sort(

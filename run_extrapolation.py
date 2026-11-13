@@ -39,7 +39,13 @@ from utils.colors import TColors
 from utils.plotting import plot_perplexity_figure
 from utils.utils import report_block_size
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
-from utils.naming import DEFAULT_REPETITION_PENALTY, factor_mode_tag, mixture_suffix, mixture_tag
+from utils.naming import (
+    DEFAULT_MIN_NEW_TOKENS,
+    DEFAULT_REPETITION_PENALTY,
+    factor_mode_tag,
+    mixture_suffix,
+    mixture_tag,
+)
 from utils.extrapolation import (
     METHODS,
     METHOD_LABELS,
@@ -153,6 +159,7 @@ def main(
     top_p: float = 0.8,
     top_k: int = 20,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
     load_in_4bit: bool = False,
     perplexity_load_in_4bit: bool = False,
 ) -> None:
@@ -672,6 +679,8 @@ def main(
                         str(top_k),
                         "--repetition_penalty",
                         str(repetition_penalty),
+                        "--min_new_tokens",
+                        str(min_new_tokens),
                         "--path",
                         str(path),
                         # names the shard it writes; the base_subdataset it reads is the untagged
@@ -1103,6 +1112,16 @@ if __name__ == "__main__":
         help="repetition penalty of the generation. Same constraint as --temperature: it has "
         "to be the value the run_baseline.py run was sampled with, which is in that run's "
         f"banner and, when not the default, in its _rp tag (default: {DEFAULT_REPETITION_PENALTY:g})",
+    )
+    parser.add_argument(
+        "--min_new_tokens",
+        "-mint",
+        type=int,
+        default=DEFAULT_MIN_NEW_TOKENS,
+        help="length floor of the generation: the end token is suppressed for this many new "
+        "tokens. Same constraint as --repetition_penalty: it has to be the value the "
+        "run_baseline.py run was sampled with, which is in that run's banner and, when not the "
+        f"default, in its _min tag (default: {DEFAULT_MIN_NEW_TOKENS})",
     )
     parser.add_argument(
         "--load_in_4bit",

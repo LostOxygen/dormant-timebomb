@@ -455,6 +455,40 @@ and the width of the window (first generation with a hit to the last generation 
 attackable target) is a function of the mixture and of the verification tag, i.e. of the deployment
 decoding.
 
+## 6. The collapse ablation: what collapse itself contributes
+
+Two measurements over a finished grid, no new search (`run_collapse_ablation.py`,
+`run_collapse_ablation.sh` for the whole grid):
+
+```bash
+# every hit of the sampled logit-opt family in the rdf 0.5 lineage, re-verified under that
+# family's own verdict against generations 0..9 of its lineage and of the control
+$PY run_collapse_ablation.py --mode survival -msz 0.5b -rdf 0.5 -n 9 -p $RUN \
+    --family logit_opt_sampled --score_mixtures 0.5 1.0
+# the lineage against the surrogate's ray at every target's security decision
+$PY run_collapse_ablation.py --mode geometry -msz 0.5b -rdf 0.5 -n 9 -p $RUN
+# the figures, one or several sizes
+$PY run_collapse_ablation.py --mode plot --sizes 0.5b -p $RUN -pp $RUN/plots
+# the grid at once: one survival job per (lineage, family), one geometry job per lineage,
+# pooled over the GPUs, then the figures
+SIZES="0.5b 3b" ./run_collapse_ablation.sh -y
+```
+
+The survival measurement answers whether any hit is attributable to collapse: a hit that
+re-verifies on the generation `g` it was found on and spares the control's generation `g` (the
+same training rounds on real data, no collapse) is collapse-specific; one that breaks the
+control there too came from ordinary drift. Scoring the control on the collapsed lineages
+(`SCORE_MIXTURES=all`) adds the reverse direction, and the collapse effect is the gap between
+the two, since hits are narrow along every lineage. Against generation 0 of the own lineage
+(the attacker's fine-tune) the same split says only whether a hit is new since the first
+fine-tune; the control's share there is drift, not collapse, and the figure is secondary
+(`ablation_specificity_gen0_*`). The geometry measurement answers why the
+surrogate works where it does: the cosine of `l_g - l_base` to `l_0 - l_base` at the decision,
+the KL-nearest position on the ray against the `g + 1` the plain surrogate assumes and the cap the
+optimized one uses, the KL of the real generation to the ray and to the surrogate the attack
+used, and the decision margin against the affine law. Figures under `$RUN/plots/ablation_*`,
+tables in `ablation_collapse.md`.
+
 ## Order and cost
 
 | step | needs | cost (0.5B, one 48 GB GPU unless noted) |
@@ -468,6 +502,7 @@ decoding.
 | 4b cost curve | 2 | 10 to 30 min per task and restart at `--every 10` |
 | 4c eval pipeline | 2 | ~3 h per random-control unit, 80 units in the four-mixture grid; sharded two workers per visible GPU by default (`--jobs`), ~16 h on four cards, five days serial |
 | 5 window | 1, 2 | plots only |
+| 6 collapse ablation | 0, 2 | survival: 1 to 2 h per (lineage, family) on the 0.5b, several on the 3b, one checkpoint load per (lineage, generation) and one sampled decode per (hit, checkpoint); geometry: minutes per lineage; pooled over the GPUs |
 
 Do not edit `run_attack_sweep.sh` or `run_vuln_eval.sh` in place while one of them is running:
 bash reads a running script by byte offset. Writing the new version to a temporary file and

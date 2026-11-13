@@ -247,6 +247,7 @@ second slice costs another scoring pass and not a second sweep over the generati
 | `--calibration_steps` | `-cs` | int | `6` | Search steps per generation. |
 | `--real_data_fraction` | `-rdf` | float | `0.0` | The mixture the run used; part of the checkpoint names from generation 1 on. |
 | `--repetition_penalty` | `-rp` | float | `1.2` | Repetition penalty of the dataset generation, pinned on both engines (since 2026-11-03 a flag; `utils.naming.DEFAULT_REPETITION_PENALTY` holds the default). `1.0` disables it, Qwen2.5 ships `1.05`. A non-default value tags the run-level artifacts `_rp<value>`; the checkpoint names do not carry it, so one root holds one value and a run at another value is refused where the lineage already exists. |
+| `--min_new_tokens` | `-mint` | int | `128` | Length floor of the dataset generation: the end token is suppressed for this many new tokens on both engines, so every sampled response is at least this long (a flag since 2026-11-10; `utils.naming.DEFAULT_MIN_NEW_TOKENS`). A third of the human responses are shorter than the default, so the floor removes the short tail from every synthetic corpus wherever the model would write short answers; `16` is about the shortest human response, `0` lets a response end at once. A non-default value tags the run-level artifacts `_min<value>` after the `_rp` tag, and one root holds one value. `run_paper.sh` passes `MIN_NEW_TOKENS`. |
 | `--load_in_4bit` | `-q4` | flag | off | Quantize the scored models — off, since that puts quantization noise into the number. |
 | `--plot_only` | `-po` | flag | off | Replot from the cached measurements without loading a model. |
 
@@ -600,6 +601,7 @@ python run_extrapolation.py [-dx DEVICE] [-dbs DATASET_BATCH_SIZE] [-ng NUM_GENE
 | `--continue_from_generation` | `-cfg` | int | `0` | Skip generations below this index. |
 | `--dataset_size` | `-dsz` | int | `0` | Samples to use from the upstream 50k dataset; `0` uses all of it. **Must match step 1** — both take the same front slice, which is what makes their histograms comparable. |
 | `--repetition_penalty` | `-rp` | float | `1.2` | Repetition penalty of the generation; must be the value the step 1 run was sampled with (its banner, or its `_rp` tag when not the default). |
+| `--min_new_tokens` | `-mint` | int | `128` | Length floor of the generation; must be the value the step 1 run was sampled with (its banner, or its `_min` tag when not the default). |
 | `--real_data_fraction` | `-rdf` | float | `0.0` | The `-rdf` of the step 1 run this comparison is filed against, in `[0, 1)`. It namespaces what *this* step writes — the corpora of generations 1+, the perplexity cache and the figure — so a comparison against a mixed run cannot be replotted as an unmixed one. It changes nothing about what is computed: the surrogate is built from `model_0`, which every mixture trains identically, so step 2 always approximates the untempered self-training trajectory and is only a like-for-like comparison against an `-rdf 0` step 1. |
 | `--path` | `-p` | str | `""` (cwd) | Root directory for `generated_datasets/` and `model_outputs/`; must match step 1. |
 
@@ -873,7 +875,10 @@ The gate establishes that a hit is *attributable to the adversarial input*. It d
 that the hit is attributable to the **search** — that a suffix of this size does not do the same job
 by accident. `--random_control_trials N` measures exactly that, and is the run's failsafe: before any
 optimization, N unoptimized suffixes per attackable task are drawn and put through the pipeline the
-search's own hits go through.
+search's own hits go through. **It is on by default** (since 2026-11-11): left alone, every run
+draws one unoptimized suffix per behavioural check the search gets, `--restarts * ceil(--num_steps
+/ --verify_every)`, and `-rct 0` turns it off. Every experiment driver therefore carries it, and
+every figure that shows a hit rate shows the control beside it.
 
 Everything about them is the search's: the alphabet (the token vocabulary minus the non-ASCII and
 special tokens, so `--allow_non_ascii` applies here too), the length (`--random_control_match`), the
@@ -906,6 +911,46 @@ for the runs whose hits you intend to publish, e.g. `-rct 5` as a cheap sanity c
 equal-budget figure as the real control. `--no_exec` skips it, for the same reason it skips the gate:
 without executing the code there is no verdict to have.
 
+Since 2026-11-09 `run_paper.sh` runs the control in every attack cell (`RANDOM_TRIALS`, default
+`auto`: as many trials per target as the search gets behavioural checks, `RESTARTS *
+ceil(NUM_STEPS / VERIFY_EVERY)`, so the two "any of my tries hit" rates are on one footing; the
+report records `search_checks_mean` beside `trials_requested`), under both verdicts of an
+`--also_greedy` run, and the figures draw it as the second control beside the result: a dashed
+line per lineage in `run_paper_tables.py`'s rate panels, a dark tick across each pooled bar, a
+small second number in the heatmap cells and its own markdown tables, and a dashed series under
+each method's curve in `utils/plot_attack_hits.py`. The random-suffix rate is the number a cell's
+rate is read against: a cell whose search does no better than its random trials has shown
+nothing about the attack at that budget.
+
+Since 2026-11-11 the control is in every other attack figure and experiment as well:
+
+| where | how the control appears |
+|---|---|
+| `run_paper_tables.py --compare_sizes` | the dark tick across each size's pooled bar, plus its own markdown table |
+| `utils/plot_attack_hits.py`, per-target grid | a dot on every cell an unoptimized suffix broke too |
+| `run_vuln_plots.py` `attack_success`, `surrogate` | dashed, in the series' own colour |
+| `run_vuln_plots.py` `target_matrix`, `rdf_window` | the dot per cell; the small second number per cell |
+| `run_collapse_ablation.py --mode plot` | a `random` row under every survival matrix (unoptimized suffixes that are a hit on the scored generation, per trial) and the same floor dashed in the "also breaks the control" panel |
+| `run_transfer_experiment.py` | `--random_transfer_trials` (10) of the attack's own random suffixes per task are verified in every (run, generation) cell; the report has `random` per cell and the console grid a `rand` column |
+| `run_attack_sweep.sh` | a `random` column in the sweep summary |
+
+A figure draws nothing for a cell that has no control anywhere, so a missing control is a gap
+and never a zero.
+
+A grid that was searched before the control existed does not need its searches redone.
+`./run_paper.sh --phases control,plots` runs the control alone — per suite, lineage and
+generation one direct attack at zero steps (`-ns 0 -rct N --result_tag _rct`), which is the
+capability gate plus the random trials — and redraws every figure. The control decodes the real
+checkpoint and the baseline only, so the one `..._rct.json` file beside a generation's direct
+result serves all of its methods, and the tables and the hits figures read it whenever a cell's
+own file carries no control, cut to that cell's own attackable set. The pass draws the control
+for every target that is attackable in at least one searched cell of the generation, whatever
+its own gate says (`--random_control_ungated`): the sampled gate is itself a draw, so the cells
+of one generation disagree on the marginal targets. The phase is part of `run_paper.sh`'s
+default phases and only queues a generation in which a searched cell lacks its own control, so
+it costs nothing on a grid searched from scratch. `CONTROL_JOBS_PER_GPU` (default 2) sets how
+many of these jobs share a card.
+
 ### Usage
 
 ```
@@ -929,6 +974,7 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--surrogate_factor` | `-sf` | float or `auto` | `0.0` | Extrapolation factor `n` the surrogate stands for. `0.0` derives it as `--collapsed_generation + 1`, which is the factor matching the validated checkpoint. `auto` measures it instead — see [Choosing `n`](#choosing-n-surrogate_factor-auto). |
 | `--surrogate_model_path` | `-smp` | str | built | Prebuilt surrogate to use instead of building one, e.g. step 2's `model_scaled_n<n>_*` directory (`lora` only). |
 | `--first_collapsed_path` | `-fcp` | str | resolved | Explicit path to the generation-0 model the surrogate is built from. The `lora` method needs the **adapter**, not the merged `_fp16` copy. |
+| `--result_tag` | `-rt` | str | none | A caller-chosen tag at the very end of the result file name (one underscore, then lower-case letters and digits, e.g. `_splitanchor`) for a setup the other tags do not spell, above all a surrogate anchored on another root's generation 0 through `--first_collapsed_path`, which would otherwise be filed over the lineage's own run. `run_attack_sweep.sh` reads it out of the passthrough and `run_paper_tables.py --result_tag` reads the cells; `run_paper.sh ANCHOR_ROOT` sets it. |
 | `--block_size` | `-bs` | int | auto | Effective block size baked into the checkpoint names. Omit to auto-discover by globbing; required only when several block sizes exist side by side. |
 | `--model_size` | `-msz` | str | `0.5b` | Parameter count off the Qwen2.5-Coder ladder (`0.5b` … `32b`), shorthand for `--model_specifier`; must be the size the collapse run used, since its short name is part of the checkpoint directories this resolves. |
 | `--model_specifier` | `-ms` | str | `unsloth/Qwen2.5-Coder-0.5B-Instruct` | Baseline model, and the tokenizer used for both models. |
@@ -955,13 +1001,15 @@ python run_attack.py [-dx DEVICE] [-cg COLLAPSED_GENERATION] [-bs BLOCK_SIZE]
 | `--no_exec` | `-ne` | flag | off | Never execute generated code. Disables behavioural verification **and the capability gate**, leaving loss-only scoring that does **not** establish wrong behaviour. |
 | `--hold_anchor` | `-ha` | flag | off | Also require the generation-0 model to keep writing correct code, i.e. the three-sided rule. Off by default: that model is the attacker's own fine-tune and the surrogate's instrument, not a deployment the suffix has to spare. Files are tagged `_anchor`. `--no_anchor`/`-na` is the default and is accepted as a no-op. |
 | `--stop_on_success` | `-sos` | flag | off | Stop a task as soon as a selective hit is verified. |
-| `--random_control_trials` | `-rct` | int | `0` | Verify N **unoptimized** suffixes per attackable task before the search — the run's own null hypothesis. See [The random control](#the-random-control). `0` disables it. |
+| `--random_control_trials` | `-rct` | int | `-1` | Verify N **unoptimized** suffixes per attackable task before the search — the run's own null hypothesis. See [The random control](#the-random-control). `-1` (default) takes one per behavioural check of the search, `--restarts * ceil(--num_steps / --verify_every)`; `0` disables it. |
+| `--random_control_ungated` | `-rcu` | flag | off | Draw the control for every selected task whatever the capability gate said, and even when the gate stopped the run. For a control-only pass (`-ns 0`) whose file serves several cells; see `run_paper.sh --phases control`. |
+| `--random_control_surrogate` | `-rcs` | flag | off | Also decode the surrogate in every random-control trial and record its status (transfer mode). Off by default: the control's verdict is decided by the real collapsed model and the baseline alone, and the decode doubles a trial's cost. The search's own checks always decode the surrogate. |
 | `--random_control_match` | `-rcm` | `tokens`/`chars` | `tokens` | What "the same length" means for those suffixes: `tokens` draws `--optim_str_init`'s token count from the alphabet the search samples in, `chars` draws a printable-ASCII string of its character length. |
 | `--min_usable_tasks` | `-mut` | int | `1` | How many attackable tasks (collapsed model and baseline both solve the clean prompt) the gate needs before the attack starts, whatever the size of the suite. Below this the run is stopped. |
 | `--min_capability` | `-mcap` | float | `0.2` | Fraction of clean tasks a surrogate rung must solve for `--surrogate_factor auto` to accept it. It no longer gates the run. |
 | `--skip_capability_check` | `-scc` | flag | off | Do not stop the run when the capability probe fails. Per-task exclusion of tasks the collapsed model already gets wrong still applies. |
 | `--attack_gpus` | `-ag` | int | `0` | GPUs to shard the search over. `0` uses every visible one, `1` keeps it in this process. See [Sharding the search](#sharding-the-search-over-the-gpus). |
-| `--also_greedy` | `-vg` | flag | off | Read the greedy verdict (`-vt 0`) next to the sampled one in every behavioural check and write both result files from this one search. The search is the same either way (verification has its own RNG stream and greedy decoding draws nothing), so the two files are what a sampled run and a greedy run of the cell write, for one search plus one extra decode per model per check. Needs a sampled verification; refused with `--stop_on_success` and `--random_control_trials`. `run_paper.sh` uses it whenever `VERDICTS` lists both. |
+| `--also_greedy` | `-vg` | flag | off | Read the greedy verdict (`-vt 0`) next to the sampled one in every behavioural check and write both result files from this one search. The search is the same either way (verification has its own RNG stream and greedy decoding draws nothing), so the two files are what a sampled run and a greedy run of the cell write, for one search plus one extra decode per model per check, and the random control's trials are read both ways too. Needs a sampled verification; refused with `--stop_on_success`. `run_paper.sh` uses it whenever `VERDICTS` lists both. |
 | `--no_share_base_forward` | | flag | sharing on | In logit transfer mode the hold baseline is the surrogate's own base module, so its candidate losses are read off the forward the surrogate runs anyway (a third of the candidate scoring under the sink objective, a quarter under the default one). Bit-identical to the separate forward; this flag restores the separate one. |
 | `--check_shared_forward` | | flag | off | Instead of searching, evaluate one candidate batch of the first attackable task with the shared base forward on and off and exit non-zero unless every objective term and the gradient are `torch.equal`. |
 
@@ -1390,3 +1438,81 @@ The console mirrors all of it, and reports one model short of a hit live during 
 ## one model short [add] step 1: gen2 did not break | baseline=pass  gen0=pass  gen2=pass
 ## SELECTIVE HIT [add] step 1: baseline=pass  gen0=pass  gen2=fail_exception | suffix='...'
 ```
+
+## Step 4: The collapse ablation with `run_collapse_ablation.py`
+
+The grid's own numbers say the non-collapsing control (`-rdf 1.0`) is the most attackable lineage
+under the logit surrogate, so the attack as measured exploits iterated fine-tuning and collapse
+mainly shrinks the window. This step asks what collapse itself contributes, with no new search:
+
+* **Survival (`--mode survival`).** Every verified hit of one attack family in one lineage is
+  re-verified, under the family's own verdict (the result file's decoding, `judge_model`'s
+  majority, the baseline re-decoded under the same suffix, `is_selective_hit` on the pair), against
+  every generation 0..N of its own lineage and of the control (`--score_mixtures`). A hit that
+  re-verifies on the generation `g` it was found on but spares the control's generation `g`, a
+  model with the same number of training rounds on real data and no collapse, is
+  *collapse-specific*: ordinary drift between checkpoints did not produce it. With
+  `--score_mixtures` covering the collapsed lineages the control's own hits are classified the
+  other way round too, and the collapse effect is the gap between the two directions, since hits
+  are narrow along any lineage. The secondary reference is generation 0 of the own lineage, the
+  attacker's fine-tune: a hit that spares it is *new since the first fine-tune*, which the
+  control's share shows to be mostly drift, not collapse.
+  A pair is scored on a generation only where that generation and the baseline solve the clean
+  prompt, the grid's capability gate. The sampled verdict is one draw of a 5-sample majority taken
+  at the best of many checks, so a share of the recorded hits does not reproduce; the figures show
+  that share separately and classify only the re-verified ones.
+* **Geometry (`--mode geometry`).** The surrogate assumes `l_g − l_base` is collinear with
+  `l_0 − l_base`. At every target's security decision (the position where the secure and insecure
+  continuations first differ, in the base model's own answer, the sink screen's context) the script
+  measures per generation the cosine of the two deltas in centred log-probability space (over the
+  full vocabulary and over the head any of the three models puts mass on), the least-squares and
+  the KL-nearest position on the ray (what the plain surrogate sets to `g + 1` and the optimized
+  one to the capped root), the KL of the real generation to the ray, to the plain tilt and to the
+  surrogate the attack actually used, and the single-token decision margin against the affine
+  law's prediction, which is exact at one position. The same numbers are taken at `--positions`
+  code positions before the decision.
+
+```bash
+./run_collapse_ablation.sh                    # a finished run_paper.sh grid: measure and draw
+SIZES="0.5b 3b" ./run_collapse_ablation.sh -y
+./run_collapse_ablation.sh --phases plots --force
+python run_collapse_ablation.py --mode survival -msz 0.5b -rdf 0.5 -n 9 -p ./runs/fresh \
+    --family logit_opt_sampled --score_mixtures 0.5 1.0
+python run_collapse_ablation.py --mode geometry -msz 0.5b -rdf 0.5 -n 9 -p ./runs/fresh
+python run_collapse_ablation.py --mode plot --sizes 0.5b 3b -p ./runs/fresh -pp ./runs/fresh/plots
+```
+
+| flag | type | default | description |
+|---|---|---|---|
+| `--mode` | choice | `survival` | `survival`, `geometry` or `plot`. |
+| `--family` | str | `logit_opt_sampled` | survival: `{none\|logit}_{plain\|opt}_{sampled\|greedy}[_anchor]`, the family whose hits are re-verified. |
+| `--score_mixtures` | list | own and `1.0` | survival: the lineages every hit is scored against. |
+| `--num_samples`, `-ns` | int | the family's | survival: samples per verdict; the default keeps the attack's own rule. |
+| `--limit` | int | `0` | survival: score only the first N pairs (smoke tests). |
+| `--positions` | int | `32` | geometry: code positions before the decision also measured. |
+| `--head` | int | `64` | geometry: the head-restricted cosine reads the union of each model's top-K tokens. |
+| `--families` | list | `none_plain_sampled logit_opt_sampled` | plot: the families drawn; the first is read against the geometry. |
+| `--sizes` | list | `-msz` | plot: the sizes drawn, side by side when more than one. |
+| `--force` | flag | off | redo a file that exists (survival otherwise resumes checkpoint by checkpoint). |
+
+The survival files are `attack_results/survival_matrix_{model}{mix}_{family}.json` (every
+verdict with its per-sample statuses, the clean verdicts of every checkpoint, the baseline's
+verdicts under every suffix), the geometry files `attack_results/geometry_{model}{mix}.json`.
+`--mode plot` draws, per size and family, `plots/ablation_survival_matrix_*` (found-at by
+scored-on heatmaps per lineage, the diagonal outlined), `ablation_specificity_*` (per source
+generation, the hits split into collapse-specific against the control at the same generation,
+generic, gate-excluded there and not re-verified; the reverse direction where the control was
+scored on the lineages; pooled shares with Wilson intervals), `ablation_specificity_gen0_*` (the
+same split against generation 0 of the own lineage, the control's share dashed as the drift floor),
+`ablation_transfer_*` (the breadth of each hit across its lineage as an ECDF, and the share of
+the collapsed lineages' hits that also break the control at the same or any generation); per
+size, `ablation_geometry_ray_*` (head cosine, KL-nearest position against `g + 1` and the cap,
+KL to the ray at and before the decision), `ablation_geometry_margin_*` (measured decision margin
+against the affine law at the fitted position and at `g + 1`, the error per generation),
+`ablation_geometry_hits_*` (hit rate of the attackable cells by quartile of the cosine and of
+the KL to the ray); across sizes and families, `ablation_specificity_pooled` (and `_gen0`) and
+`ablation_geometry_sizes`; and every table as `ablation_collapse.md`.
+`run_collapse_ablation.sh` queues the measurements of a grid over `GPUS` (one survival job per
+lineage and family, one geometry job per lineage), then draws; `--only`, `--phases`, `--force`,
+`--dry-run` and `--list` as in `run_paper.sh`, and `FAMILIES`, `SCORE_MIXTURES` (`"own control"`
+or `"all"`), `LIMIT` and the `OPT_*` file-name knobs as environment overrides.

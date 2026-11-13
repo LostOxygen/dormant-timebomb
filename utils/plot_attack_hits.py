@@ -39,12 +39,13 @@ import os
 import re
 
 import matplotlib as mpl
+import matplotlib.lines
 import matplotlib.pyplot as plt
 
 from utils import nord
 from utils.colors import TColors
 from utils.models import add_model_arguments, resolve_model_specifier
-from utils.naming import ANCHOR_TAG, entropy_tag, factor_mode_tag, mixture_tag
+from utils.naming import ANCHOR_TAG, control_file, entropy_tag, factor_mode_tag, mixture_tag
 
 # the method colours every figure shares (utils/nord.py): blue for the direct attack on the real
 # checkpoint, orange for the logit surrogate, red for the weight-space one
@@ -116,11 +117,14 @@ def result_file(
     )
 
 
-def read_cell(path: str) -> dict | None:
+def read_cell(path: str, control_path: str = "") -> dict | None:
     """Reduces one result file to the numbers the figure needs.
 
     Args:
         path (str): the result file to read
+        control_path (str): the generation's control-only file (`utils.naming.control_file` of the
+            direct cell, written by run_paper.sh --phases control), read for the random-suffix
+            control when the result file itself was searched without one
 
     Returns:
         dict | None: the hit count, the usable/broken counts behind it, the search budget and the
@@ -153,6 +157,18 @@ def read_cell(path: str) -> dict | None:
     # only usable tasks can carry a success: the others were excluded before the search, and a
     # "hit" on a task the collapsed model already failed measures collapse, not the attack
     broken = [name for name in usable if per_task.get(name, 0) > 0]
+    # the random-suffix control (run_attack.py --random_control_trials), on the same footing: the
+    # usable tasks at least one unoptimized suffix of the search's length broke
+    control = (data.get("random_control") or {}).get("per_task") or {}
+    if not control and control_path and os.path.isfile(control_path):
+        with open(control_path, encoding="utf-8") as handle:
+            control = (json.load(handle).get("random_control") or {}).get("per_task") or {}
+    control = {name: counts for name, counts in control.items() if name in usable}
+    random_broken = [name for name, counts in control.items() if counts.get("n_hits", 0) > 0]
+    # the per-target grid marks the targets an unoptimized suffix broke as well
+    for name in random_broken:
+        if name in targets:
+            targets[name]["random"] = True
 
     return {
         "aborted": bool(data.get("aborted")),
@@ -162,6 +178,10 @@ def read_cell(path: str) -> dict | None:
         "n_broken": len(broken),
         "n_hits": sum(count for name, count in per_task.items() if name in usable),
         "rate": len(broken) / len(usable) if usable else None,
+        "n_random_tasks": len(control),
+        "n_random_broken": len(random_broken),
+        "n_random_hits": sum(counts.get("n_hits", 0) for counts in control.values()),
+        "n_random_trials": sum(counts.get("n_trials", 0) for counts in control.values()),
         "targets": targets,
         "factor": data.get("surrogate_factor"),
         "checkpoint": os.path.basename(data.get("collapsed_model", "")),
@@ -200,7 +220,10 @@ def collect(
             cell = read_cell(
                 result_file(
                     results_dir, generation, specifier_name, method, tag, factor_tag, run_tag
-                )
+                ),
+                control_file(
+                    result_file(results_dir, generation, specifier_name, "none", tag, "", run_tag)
+                ),
             )
             if cell is not None:
                 cells[method][generation] = cell
@@ -310,6 +333,20 @@ def print_table(cells: dict[str, dict[int, dict]], generations: range) -> None:
             f"## {SERIES_LABELS[method]:>26s}: {hits} adversarial inputs over all generations, "
             f"on {broken}/{usable} usable tasks ({share})"
         )
+        random_broken, random_tasks = pooled_random(cells[method])
+        if random_tasks:
+            print(
+                f"## {'random-suffix control':>26s}: an unoptimized suffix broke "
+                f"{random_broken}/{random_tasks} of those tasks "
+                f"({random_broken / random_tasks:.0%})"
+            )
+
+
+def pooled_random(series: dict[int, dict]) -> tuple[int, int]:
+    """(tasks a random suffix broke, tasks the control covered) over every generation that ran."""
+    broken = sum(cell.get("n_random_broken", 0) for cell in series.values())
+    tasks = sum(cell.get("n_random_tasks", 0) for cell in series.values())
+    return broken, tasks
 
 
 def pooled(series: dict[int, dict]) -> tuple[int, int, int]:
@@ -375,6 +412,7 @@ def plot_target_matrix(
         figsize=(max(6.0, 0.8 * len(shown) + 3.5),
                  0.45 * len(targets) * len(methods) + 2.4),
     )
+    with_random = False
     for row, method in enumerate(methods):
         axis = axes[row][0]
         for y, target in enumerate(targets):
@@ -391,6 +429,13 @@ def plot_target_matrix(
                 if entry["outcome"] == "hit":
                     axis.text(x, y, str(entry["n_hits"]), ha="center", va="center",
                               color=nord.OUTCOME_TEXT["hit"], fontsize=11)
+                # the random-suffix control: a dot where an unoptimized suffix broke this
+                # target at this generation too, so a hit there says little about the search
+                if entry.get("random"):
+                    with_random = True
+                    axis.plot(x + 0.32, y - 0.3, marker="o", markersize=5,
+                              markerfacecolor=nord.NORD0, markeredgecolor="white",
+                              markeredgewidth=0.9, linestyle="none", zorder=3)
         axis.set_xlim(-0.5, len(shown) - 0.5)
         axis.set_ylim(len(targets) - 0.5, -0.5)
         axis.set_xticks(range(len(shown)))
@@ -403,7 +448,15 @@ def plot_target_matrix(
 
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=OUTCOME_COLORS[key])
                for key in OUTCOME_LABELS]
-    figure.legend(handles, list(OUTCOME_LABELS.values()), loc="lower center", ncol=2,
+    names = list(OUTCOME_LABELS.values())
+    covered = any(cell.get("n_random_tasks", 0) for method in methods
+                  for cell in cells[method].values())
+    if with_random or covered:
+        handles.append(mpl.lines.Line2D([], [], marker="o", markersize=5,
+                                        markerfacecolor=nord.NORD0, markeredgecolor="white",
+                                        linestyle="none"))
+        names.append("random-suffix control: an unoptimized suffix broke it too")
+    figure.legend(handles, names, loc="lower center", ncol=3 if len(names) > 4 else 2,
                   frameon=False)
     figure.suptitle(title)
     figure.tight_layout(rect=(0, 0.1, 1, 0.97))
@@ -482,8 +535,34 @@ def plot(
             color=SERIES_COLORS[method],
             label=f"{SERIES_LABELS[method]} — {hits} in total",
         )
+        # the null beside it, in the same units: random suffixes of the search's length that
+        # were selective hits, dashed in the method's colour, where the cell ran the control.
+        # The search's count is over its behavioural checks, the control's over its trials, and
+        # run_paper.sh gives the two the same number of tries per task
+        random_points = [
+            (generation, cell["n_random_hits"])
+            for generation, cell in sorted(series.items())
+            if cell["rate"] is not None and cell.get("n_random_tasks", 0) > 0
+        ]
+        if random_points:
+            random_hits = sum(p[1] for p in random_points)
+            random_broken, random_tasks = pooled_random(series)
+            ceiling = max(ceiling, max(p[1] for p in random_points))
+            top.plot(
+                [p[0] for p in random_points],
+                [p[1] for p in random_points],
+                marker=MARKERS[method],
+                markersize=5,
+                markerfacecolor=nord.SURFACE,
+                linewidth=1.3,
+                linestyle=(0, (3, 2)),
+                color=SERIES_COLORS[method],
+                alpha=0.85,
+                label=f"random-suffix control ({SERIES_LABELS[method]}) — {random_hits} in "
+                      f"total, on {random_broken}/{random_tasks} tasks",
+            )
 
-    top.set_ylabel("adversarial inputs found")
+    top.set_ylabel("adversarial inputs found\n(solid: the search; dashed: random suffixes)")
     # headroom for the legend, and a floor below 0 so a zero sits on the axis rather than under it
     top.set_ylim(-0.04 * ceiling, 1.35 * ceiling)
     top.set_title(title)

@@ -49,7 +49,7 @@ from transformers import (
 
 from utils.colors import TColors
 from utils.models import DEFAULT_MODEL_SPECIFIER
-from utils.naming import DEFAULT_REPETITION_PENALTY, mixture_suffix
+from utils.naming import DEFAULT_MIN_NEW_TOKENS, DEFAULT_REPETITION_PENALTY, mixture_suffix
 from utils.extrapolation import (
     METHODS,
     dataset_suffix,
@@ -284,6 +284,13 @@ parser.add_argument(
     f"is compared against. 1.0 disables it (default: {REPETITION_PENALTY:g})",
 )
 parser.add_argument(
+    "--min_new_tokens",
+    type=int,
+    default=DEFAULT_MIN_NEW_TOKENS,
+    help="number of new tokens the end token is suppressed for; has to match the "
+    f"run_baseline.py run this stage is compared against (default: {DEFAULT_MIN_NEW_TOKENS})",
+)
+parser.add_argument(
     "--real_data_fraction",
     "-rdf",
     type=float,
@@ -330,6 +337,7 @@ temperature = args.temperature
 top_p = args.top_p
 top_k = args.top_k
 repetition_penalty = args.repetition_penalty
+min_new_tokens = max(0, args.min_new_tokens)
 real_data_fraction = args.real_data_fraction
 human_generation_zero = args.human_generation_zero
 load_in_4bit = args.load_in_4bit
@@ -568,7 +576,7 @@ for start in tqdm(
         # sampling distortion rather than of the model, and since it divides the logit of every
         # token already in the context, its severity grows with the response length and therefore
         # aliases onto the collapse trend rather than being a constant offset
-        min_new_tokens=128,
+        min_new_tokens=min_new_tokens,
         max_new_tokens=block_size,
         use_cache=True,
         **sampling_kwargs,

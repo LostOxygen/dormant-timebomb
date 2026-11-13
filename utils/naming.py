@@ -37,6 +37,33 @@ def penalty_tag(repetition_penalty: float) -> str:
     return f"_rp{repetition_penalty:g}"
 
 
+# the number of new tokens every generation path suppresses the end token for unless
+# --min_new_tokens says otherwise. A third of the human responses are shorter than this
+# (median 167 tokens, shortest 15), so the floor cuts the short tail out of every synthetic
+# corpus wherever the model would write short answers — measured on the 0.5b rdf 0.8 lineage at
+# penalty 1.05, 11% of the generation-0 responses end within 8 tokens of it and 36% within 32
+DEFAULT_MIN_NEW_TOKENS: int = 128
+
+
+def min_tokens_tag(min_new_tokens: int) -> str:
+    """Run-level tag of the generation decoding's length floor.
+
+    Empty at the default, ``_min{value}`` otherwise, directly after the repetition-penalty tag
+    and with the same reach: the run-level artifacts of run_baseline.py only. The checkpoint and
+    corpus names do not carry it, so one root holds one floor and run_baseline.py refuses
+    another.
+
+    Args:
+        min_new_tokens (int): the --min_new_tokens of the run
+
+    Returns:
+        str: "" at the default, otherwise "_min" plus the value
+    """
+    if int(min_new_tokens) == DEFAULT_MIN_NEW_TOKENS:
+        return ""
+    return f"_min{int(min_new_tokens)}"
+
+
 def mixture_tag(real_data_fraction: float) -> str:
     """Run-level tag for a --real_data_fraction run.
 
@@ -416,11 +443,70 @@ def find_objective_tag(name: str) -> str:
     return OBJECTIVE_TAG if OBJECTIVE_TAG in name else ""
 
 
+_RESULT_TAG = re.compile(r"_[a-z0-9]+")
+
+
+def result_tag(tag: str) -> str:
+    """A caller-chosen tag at the very end of a run_attack.py result name, for a setup none of
+    the other tags spell — e.g. a surrogate anchored on *another root's* generation 0
+    (`--first_collapsed_path`), which the standard name would file over the lineage's own run.
+    Lower-case letters and digits after one underscore, so it cannot be mistaken for any tag the
+    name already carries; "" (the default) leaves every existing name unchanged.
+
+    Args:
+        tag (str): the tag as given on the command line
+
+    Returns:
+        str: the validated tag
+
+    Raises:
+        ValueError: on anything but "" or `_[a-z0-9]+`
+    """
+    if tag and not _RESULT_TAG.fullmatch(tag):
+        raise ValueError(f"--result_tag must look like _splitanchor (one underscore, then "
+                         f"lower-case letters and digits), got {tag!r}")
+    return tag
+
+
+def result_tag_from_argv(argv: list) -> str:
+    """The --result_tag/-rt value of a run_attack.py command line, "" when absent."""
+    for i, token in enumerate(argv):
+        if token in ("-rt", "--result_tag"):
+            return result_tag(argv[i + 1] if i + 1 < len(argv) else "")
+        if token.startswith("--result_tag="):
+            return result_tag(token.split("=", 1)[1])
+    return ""
+
+
+# the --result_tag of a control-only pass (run_paper.sh --phases control): the direct attack run
+# with zero search steps and --random_control_trials, i.e. a cell's random-suffix control without
+# its search. The figures read a cell's control from that file when the cell's own result file
+# carries none, which is every sweep searched before 2026-11-09
+CONTROL_TAG: str = "_rct"
+
+
+def control_file(direct_result_file: str) -> str:
+    """The control-only file of a cell, spelled from the *direct* attack's result file.
+
+    The control is a property of (lineage, generation, suite, hit rule): it decodes the real
+    checkpoint and the baseline and never a surrogate, so the direct, the plain and the optimized
+    surrogate cells of one generation share it, and it is filed once, under the direct name.
+
+    Args:
+        direct_result_file (str): the path run_attack.py writes for the direct attack of the cell
+
+    Returns:
+        str: the same path with CONTROL_TAG before the extension
+    """
+    stem, dot, extension = direct_result_file.rpartition(".")
+    return f"{stem}{CONTROL_TAG}{dot}{extension}"
+
+
 def run_tag(temperature: float = VERIFY_TEMPERATURE, top_p: float = VERIFY_TOP_P,
             top_k: int = VERIFY_TOP_K, num_samples: int = VERIFY_SAMPLES,
             hold_anchor: bool = False, generation: int = 1,
             sink_objective: bool = False) -> str:
-    """Verification tag plus anchor tag plus objective tag, as they appear together in a name.
+    """Verification, anchor and objective tag, as they appear together in a name.
 
     Args:
         generation (int): the attacked generation; generation 0 never carries the anchor tag
@@ -439,5 +525,6 @@ def default_run_tag() -> str:
 
 
 def find_run_tag(name: str) -> str:
-    """`find_verification_tag`, `find_anchor_tag` and `find_objective_tag` of a name, concatenated."""
+    """`find_verification_tag`, `find_anchor_tag` and `find_objective_tag` of a name,
+    concatenated in the order they appear in it."""
     return find_verification_tag(name) + find_anchor_tag(name) + find_objective_tag(name)

@@ -5,7 +5,9 @@
 import argparse
 import datetime
 import getpass
+import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -22,9 +24,11 @@ from utils.colors import TColors
 from utils.devices import visible_devices
 from utils.models import add_model_arguments, model_size_label, resolve_model_specifier
 from utils.naming import (
+    DEFAULT_MIN_NEW_TOKENS,
     DEFAULT_REPETITION_PENALTY,
     gen_zero_tag,
     generation_label,
+    min_tokens_tag,
     mixture_suffix,
     mixture_tag,
     penalty_tag,
@@ -155,6 +159,8 @@ def main(
     dataset_size: int = 0,
     real_data_fraction: float = 0.0,
     seed: int = 1337,
+    data_split: str = "",
+    data_split_seed: int = 0,
     learning_rate: float = 2e-4,
     lora_rank: int = 16,
     lora_alpha: int = 16,
@@ -164,6 +170,7 @@ def main(
     top_p: float = 0.8,
     top_k: int = 20,
     repetition_penalty: float = DEFAULT_REPETITION_PENALTY,
+    min_new_tokens: int = DEFAULT_MIN_NEW_TOKENS,
     gradient_accumulation_steps: int = 4,
     load_in_4bit: bool = False,
     gradient_checkpointing: bool = False,
@@ -338,7 +345,10 @@ def main(
     # and the generation decoding's repetition penalty last, for the same reason: it changes
     # every corpus and therefore every checkpoint from generation 0 up without reaching their
     # names. Empty at the default, so existing roots keep their names
-    penalty_suffix = penalty_tag(repetition_penalty)
+    # the length floor (--min_new_tokens) is the same kind of knob and sits right behind it
+    if min_new_tokens < 0:
+        raise SystemExit(f"--min_new_tokens must be >= 0, got {min_new_tokens}.")
+    penalty_suffix = penalty_tag(repetition_penalty) + min_tokens_tag(min_new_tokens)
     run_suffix = f"{init_suffix}{gen0_suffix}{data_suffix}{penalty_suffix}"
     # the checkpoint and corpus names do not carry the weight lineage, so a fresh-init run in a
     # root that already holds a recursive lineage of the same mixture would overwrite its
@@ -360,11 +370,13 @@ def main(
         f"all_perplexities_bs{block_size}_{specifier_name}{init_suffix}{gen0_suffix}{data_suffix}"
     )
     for cache_name in os.listdir(DATASET_PATH) if os.path.isdir(DATASET_PATH) else []:
-        match = re.fullmatch(re.escape(lineage_stem) + r"(_rp[0-9.]+)?\.pt", cache_name)
-        if match and (match.group(1) or "") != penalty_suffix:
-            other_penalty = match.group(1)[3:] if match.group(1) else f"{DEFAULT_REPETITION_PENALTY:g}"
+        match = re.fullmatch(
+            re.escape(lineage_stem) + r"((?:_rp[0-9.]+)?(?:_min[0-9]+)?)\.pt", cache_name
+        )
+        if match and match.group(1) != penalty_suffix:
             other_lineages[cache_name[len("all_perplexities_bs"):]] = (
-                f"lineage for this mixture sampled with repetition penalty {other_penalty}"
+                f"lineage for this mixture sampled under another decoding "
+                f"({match.group(1).lstrip('_').replace('_', ', ') or 'the default penalty and length floor'})"
             )
     for other_suffix, what in other_lineages.items():
         other_cache = (
@@ -376,14 +388,17 @@ def main(
             raise SystemExit(
                 f"{TColors.FAIL}{DATASET_PATH} already holds a {what}{TColors.ENDC} "
                 f"({other_cache}). The checkpoint names carry neither the weight lineage, the "
-                f"generation-0 rule nor the repetition penalty, so this run would overwrite "
+                f"generation-0 rule nor the generation decoding, so this run would overwrite "
                 f"those models. Use another --path, or the matching --recursive_init / "
-                f"--human_generation_zero / --repetition_penalty to continue that lineage."
+                f"--human_generation_zero / --repetition_penalty / --min_new_tokens to continue "
+                f"that lineage."
             )
     # no underscores or backslashes: usetex renders the title, and a bare % is a LaTeX comment
     run_label = f"{init_label}, real data fraction {real_data_fraction:g}" + (
         ", human-only generation 0 (ablation)" if human_generation_zero else ""
-    ) + (f", repetition penalty {repetition_penalty:g}" if penalty_suffix else "")
+    ) + (f", repetition penalty {repetition_penalty:g}" if penalty_tag(repetition_penalty) else "") + (
+        f", at least {min_new_tokens} new tokens" if min_tokens_tag(min_new_tokens) else ""
+    )
 
     # allow tf32 for the matmuls of the training stage. The L40S' tensor cores run tf32 at
     # multiples of the fp32 rate and this only affects the fp32 fallbacks, not the bf16 path
@@ -411,6 +426,47 @@ def main(
     # shared seed, which is what makes their perplexity histograms comparable
     if 0 < dataset_size < len(original_dataset):
         original_dataset = original_dataset.select(range(dataset_size))
+
+    # --data_split: the disjoint-data experiment. The rows (after --dataset_size) are permuted
+    # once with --data_split_seed, which is deliberately *not* the run seed so the two halves
+    # are the same whatever seeds the two roots run under, and this run keeps one half, in the
+    # original row order so nothing downstream changes but the row set: the generation-0
+    # training rows (make_splits), the instructions the corpora are sampled for
+    # (base_subdataset), the real-data pool of every mixture (mix_real_data) and the human slice
+    # the perplexity scripts score. One root holds one half; a marker file refuses the other
+    data_split = (data_split or "").lower()
+    if data_split not in ("", "a", "b"):
+        raise SystemExit(f"--data_split must be a or b (or empty), got {data_split!r}")
+    split_marker = os.path.join(DATASET_PATH, "data_split.json")
+    if data_split:
+        order = list(range(len(original_dataset)))
+        random.Random(data_split_seed).shuffle(order)
+        cut = len(order) // 2
+        kept = sorted(order[:cut] if data_split == "a" else order[cut:])
+        original_dataset = original_dataset.select(kept)
+        marker = {"split": data_split, "seed": data_split_seed, "rows": len(kept),
+                  "dataset_size": dataset_size}
+        if os.path.isfile(split_marker):
+            with open(split_marker, encoding="utf-8") as handle:
+                previous = json.load(handle)
+            if previous != marker:
+                raise SystemExit(
+                    f"{TColors.FAIL}{DATASET_PATH} was built from data split {previous}"
+                    f"{TColors.ENDC}, this run asks for {marker}. The dataset and checkpoint "
+                    f"names do not carry the split, so use another --path."
+                )
+        else:
+            os.makedirs(DATASET_PATH, exist_ok=True)
+            with open(split_marker, "w", encoding="utf-8") as handle:
+                json.dump(marker, handle, indent=2)
+        print(f"## {TColors.OKBLUE}{TColors.BOLD}Data split{TColors.ENDC}: half {data_split} of "
+              f"the corpus ({len(kept)} rows, permutation seed {data_split_seed}); the other "
+              f"half is disjoint from everything this root trains on, samples for or scores")
+    elif os.path.isfile(split_marker) and not skip_training:
+        raise SystemExit(
+            f"{TColors.FAIL}{DATASET_PATH} was built from a data split{TColors.ENDC} "
+            f"({split_marker}); pass the same --data_split or use another --path."
+        )
 
     # gather information about the dataset. One batched call into the Rust tokenizer instead of
     # one python level call per sample — the previous loop also built a padded pytorch tensor per
@@ -554,6 +610,8 @@ def main(
         f"repetition penalty {repetition_penalty:g}"
         + (" (the default; Qwen2.5 ships 1.05, 1.0 disables it)"
            if not penalty_tag(repetition_penalty) else " (tagged _rp in the run-level names)")
+        + f", at least {min_new_tokens} new tokens"
+        + ("" if not min_tokens_tag(min_new_tokens) else " (tagged _min in the run-level names)")
     )
     # printed because unsloth silently rewrites CUDA_VISIBLE_DEVICES to a single device at import,
     # which used to collapse this list to [0] without any sign of it in the output
@@ -657,6 +715,8 @@ def main(
                         str(top_k),
                         "--repetition_penalty",
                         str(repetition_penalty),
+                        "--min_new_tokens",
+                        str(min_new_tokens),
                         "--path",
                         str(path),
                         "--seed",
@@ -1162,6 +1222,27 @@ if __name__ == "__main__":
         "(default: 1337)",
     )
     parser.add_argument(
+        "--data_split",
+        "-ds",
+        type=str,
+        default="",
+        choices=["", "a", "b"],
+        help="keep one disjoint half of the human corpus (after --dataset_size) for everything "
+        "this root does: generation-0 training, the instructions the corpora are sampled for, "
+        "the real-data pool of every mixture and the slices the perplexity scripts score. The "
+        "disjoint-data experiment (run_data_split_experiment.sh) trains the attacker's "
+        "generation 0 on half a and the victim's lineage on half b, in two roots, so the "
+        "surrogate never saw a row of the data it is tested against. One root holds one half; "
+        "a marker in generated_datasets/ refuses the other (default: the whole corpus)",
+    )
+    parser.add_argument(
+        "--data_split_seed",
+        type=int,
+        default=0,
+        help="seed of the permutation --data_split halves; deliberately independent of --seed "
+        "so both roots see the same halves whatever their run seeds (default: 0)",
+    )
+    parser.add_argument(
         "--learning_rate",
         "-lr",
         type=float,
@@ -1242,6 +1323,20 @@ if __name__ == "__main__":
         "it, so a run at another value is refused in a root that already holds this lineage "
         f"(default: {DEFAULT_REPETITION_PENALTY:g}; see utils/generate_dataset.py for the "
         "measurements behind it)",
+    )
+    parser.add_argument(
+        "--min_new_tokens",
+        "-mint",
+        type=int,
+        default=DEFAULT_MIN_NEW_TOKENS,
+        help="length floor of the dataset generation: the end token is suppressed for this many "
+        "new tokens on both engines, so every sampled response is at least this long. A third "
+        "of the human responses are shorter than the default, so the floor removes the short "
+        "tail from every synthetic corpus wherever the model would write short answers; 16 is "
+        "about the shortest human response, 0 lets a response end at once (and lets a degraded "
+        "model emit empty ones). Like --repetition_penalty it is a run-level tag, _min{value}, "
+        "when it is not the default, and one root holds one value "
+        f"(default: {DEFAULT_MIN_NEW_TOKENS})",
     )
     parser.add_argument(
         "--gradient_accumulation_steps",

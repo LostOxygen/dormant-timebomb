@@ -35,6 +35,7 @@ import json
 import os
 
 import matplotlib
+import matplotlib.lines
 import matplotlib.pyplot as plt
 import matplotlib.ticker
 import numpy as np
@@ -77,6 +78,30 @@ OUTCOME_LABELS: dict = {
     "baseline-insecure": "excluded: baseline already insecure",
     "collapsed-broken": "excluded: collapsed model broken",
 }
+# the second control of every attack figure (run_attack.py --random_control_trials): the share of
+# the attributable targets an *unoptimized* suffix of the search's length broke, on the hit
+# rate's footing. Dashed in the series' own colour wherever a rate is a line, a small second
+# number in a heatmap cell, a dot on a cell of the target grid. A run searched without it takes
+# the control-only pass of its generation (utils.vuln_results.load_records); where neither
+# exists nothing is drawn, so a missing control is a gap and never a zero
+RANDOM_LABEL: str = "random-suffix control"
+RANDOM_DASH: tuple = (0, (3, 2))
+
+
+def random_handle(colour: str = nord.TEXT_MUTED):
+    """The legend handle of the dashed random-suffix series."""
+    return matplotlib.lines.Line2D([], [], color=colour, linestyle=RANDOM_DASH, linewidth=1.8)
+
+
+def draw_random(axis, rows: list, colour: str) -> bool:
+    """Draws the random-suffix rate of `rows` (records in generation order) dashed in `colour`.
+    False, and nothing drawn, when none of them carries a control."""
+    points = [(r.generation, r.random_rate) for r in rows if r.random_rate == r.random_rate]
+    if not points:
+        return False
+    axis.plot([p[0] for p in points], [p[1] for p in points], linestyle=RANDOM_DASH,
+              linewidth=1.8, marker="o", markersize=4, color=colour, zorder=2)
+    return True
 
 
 def mixture_colors(mixtures: list) -> list:
@@ -159,6 +184,7 @@ def figure_attack_success(records: list, args) -> list:
         gridspec_kw={"height_ratios": [2, 1]},
     )
 
+    with_random = False
     for column, model in enumerate(models):
         top, bottom = axes[0][column], axes[1][column]
         palette = mixture_colors(mixtures)
@@ -177,6 +203,7 @@ def figure_attack_success(records: list, args) -> list:
             marker = markers[index % len(markers)]
             top.plot(generations, [r.hit_rate for r in rows], marker=marker, markersize=9,
                      linewidth=3, color=colour, label=label)
+            with_random = draw_random(top, rows, colour) or with_random
             bottom.plot(generations, [len(r.attackable) for r in rows], marker=marker,
                         markersize=7, linewidth=2, color=colour)
         top.set_title(escape(model, args.usetex))
@@ -186,7 +213,11 @@ def figure_attack_success(records: list, args) -> list:
         bottom.set_xlabel("collapse generation")
         bottom.set_ylim(0, len(TARGET_CWE) + 0.4)
         if column == 0:
-            top.legend(loc="upper right")
+            handles, names = top.get_legend_handles_labels()
+            if with_random:
+                handles.append(random_handle())
+                names.append(f"dashed: {RANDOM_LABEL}")
+            top.legend(handles, names, loc="upper right")
 
     return [(figure, stem(args, "attack_success"))]
 
@@ -228,6 +259,12 @@ def figure_target_matrix(records: list, args) -> list:
                 if task.hit:
                     axis.text(x, y, str(task.n_success), ha="center", va="center",
                               color=nord.OUTCOME_TEXT["hit"], fontsize=13)
+                # the random-suffix control: a dot where an unoptimized suffix broke this
+                # target at this generation too, so that hit says little about the search
+                if target in record.random_hits:
+                    axis.plot(x + 0.32, y - 0.3, marker="o", markersize=6,
+                              markerfacecolor=nord.NORD0, markeredgecolor="white",
+                              markeredgewidth=1.0, linestyle="none", zorder=3)
         axis.set_xlim(-0.5, len(rows) - 0.5)
         axis.set_ylim(len(targets) - 0.5, -0.5)
         axis.set_xticks(range(len(rows)))
@@ -240,8 +277,14 @@ def figure_target_matrix(records: list, args) -> list:
 
     handles = [plt.Rectangle((0, 0), 1, 1, facecolor=OUTCOME_COLORS[key])
                for key in OUTCOME_LABELS]
-    figure.legend(handles, list(OUTCOME_LABELS.values()), loc="lower center",
-                  ncol=2, frameon=False)
+    names = list(OUTCOME_LABELS.values())
+    if any(r.random_tasks for r in selected):
+        handles.append(matplotlib.lines.Line2D(
+            [], [], marker="o", markersize=6, markerfacecolor=nord.NORD0,
+            markeredgecolor="white", linestyle="none"))
+        names.append(f"{RANDOM_LABEL}: an unoptimized suffix broke it too")
+    figure.legend(handles, names, loc="lower center", ncol=3 if len(names) > 4 else 2,
+                  frameon=False)
     figure.subplots_adjust(bottom=0.16)
     return [(figure, stem(args, "target_matrix", f"_{args.mode}"))]
 
@@ -357,6 +400,7 @@ def figure_surrogate(records: list, args) -> list:
             for method in ("none", "logit")}
         figure, axes = plt.subplots(2, 1, figsize=(9, 10), sharex=True,
                                     gridspec_kw={"height_ratios": [3, 2]})
+        with_random = False
         for method, colour, label in (
             ("none", BASELINE_COLOR, "direct (attacker holds the checkpoint)"),
             ("logit", SURROGATE_COLOR, "logit surrogate (base + generation 0 only)"),
@@ -366,9 +410,15 @@ def figure_surrogate(records: list, args) -> list:
                 continue
             axes[0].plot([r.generation for r in series], [r.hit_rate for r in series],
                          marker="o", markersize=9, linewidth=3, color=colour, label=label)
+            # each method against the control over its own attributable targets
+            with_random = draw_random(axes[0], series, colour) or with_random
         axes[0].set_ylim(-0.05, 1.05)
         axes[0].set_ylabel("hit rate over attributable targets")
-        axes[0].legend(loc="upper right")
+        handles, names = axes[0].get_legend_handles_labels()
+        if with_random:
+            handles.append(random_handle())
+            names.append(f"dashed: {RANDOM_LABEL}")
+        axes[0].legend(handles, names, loc="upper right")
         axes[0].set_title(f"real data {mixture:.0%}")
 
         quality = [(r.generation, r.surrogate_quality) for r in rows["logit"]
@@ -457,10 +507,12 @@ def figure_rdf_window(records: list, args) -> list:
     grid = np.full((len(mixtures), len(generations)), np.nan)
     ran = np.zeros((len(mixtures), len(generations)), dtype=bool)
     counts = np.zeros((len(mixtures), len(generations)))
+    random = np.full((len(mixtures), len(generations)), np.nan)
     for record in direct:
         row, column = mixtures.index(record.real_data_fraction), generations.index(
             record.generation)
         grid[row][column] = record.hit_rate
+        random[row][column] = record.random_rate
         ran[row][column] = True
         counts[row][column] = 0 if record.aborted else len(record.attackable)
 
@@ -482,8 +534,16 @@ def figure_rdf_window(records: list, args) -> list:
                 continue
             heat.add_patch(plt.Rectangle((column - 0.5, row - 0.5), 1, 1, facecolor=cmap(rate),
                                          edgecolor=nord.SURFACE, linewidth=2))
-            heat.text(column, row, percent(rate, args.usetex), ha="center", va="center",
-                      fontsize=12, color=nord.text_on(rate))
+            if np.isnan(random[row][column]):
+                heat.text(column, row, percent(rate, args.usetex), ha="center", va="center",
+                          fontsize=12, color=nord.text_on(rate))
+            else:
+                # the random-suffix control's share, small under the rate, as in
+                # run_paper_tables.draw_rate_heatmap
+                heat.text(column, row - 0.1, percent(rate, args.usetex), ha="center",
+                          va="center", fontsize=12, color=nord.text_on(rate))
+                heat.text(column, row + 0.3, percent(random[row][column], args.usetex),
+                          ha="center", va="center", fontsize=8, color=nord.text_on(rate))
     heat.set_xlim(-0.5, n_gen - 0.5)
     heat.set_ylim(-0.5, n_mix - 0.5)
     heat.set_xticks(range(n_gen))
@@ -496,7 +556,9 @@ def figure_rdf_window(records: list, args) -> list:
     heat.grid(False)
     for side in ("top", "right", "left"):
         heat.spines[side].set_visible(False)
-    heat.set_title("hit rate (share of attackable targets broken)", loc="left")
+    heat.set_title("hit rate (share of attackable targets broken)"
+                   + (f"; small: {RANDOM_LABEL}" if not np.all(np.isnan(random)) else ""),
+                   loc="left")
     mappable = plt.cm.ScalarMappable(cmap=cmap, norm=matplotlib.colors.Normalize(0, 1))
     bar = figure.colorbar(mappable, ax=heat, fraction=0.04, pad=0.03,
                           format=matplotlib.ticker.PercentFormatter(1.0, decimals=0))

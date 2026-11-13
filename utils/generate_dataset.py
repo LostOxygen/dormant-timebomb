@@ -61,13 +61,19 @@ import torch
 
 from utils.colors import TColors
 from utils.models import resolve_model_specifier
-from utils.naming import DEFAULT_REPETITION_PENALTY, generation_label, mixture_suffix
+from utils.naming import (
+    DEFAULT_MIN_NEW_TOKENS,
+    DEFAULT_REPETITION_PENALTY,
+    generation_label,
+    mixture_suffix,
+)
 
 DATASET_PATH: str = "./generated_datasets/"
 MODEL_PATH: str = "./model_outputs/"
 SYSTEM_PROMPT: str = "You are a helpful assistant for code completion."
-# EOS is suppressed for this many tokens, so every response is at least this long
-MIN_NEW_TOKENS: int = 128
+# EOS is suppressed for this many tokens, so every response is at least this long. The default
+# of --min_new_tokens; see utils.naming.DEFAULT_MIN_NEW_TOKENS for what the floor cuts off
+MIN_NEW_TOKENS: int = DEFAULT_MIN_NEW_TOKENS
 # Applied by both engine paths below, and has to match utils/generate_dataset_extrapolation.py and
 # utils/calibrate_surrogate.py: stage 1 and stage 2 are plotted against each other, so a
 # difference in the decoding is a difference in what is being compared.
@@ -183,7 +189,7 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
         # collapse trend. Keep it identical in every generation path or the histograms stop being
         # comparable
         repetition_penalty=repetition_penalty,
-        min_tokens=MIN_NEW_TOKENS,
+        min_tokens=min_new_tokens,
         max_tokens=block_size,
         # vLLM returns only the continuation, so unlike the transformers path there is no prompt
         # to strip. The special tokens are dropped here so the stored response is plain text
@@ -204,7 +210,8 @@ def generate_vllm(instructions: list, model_dir: str) -> list:
     # all. So the tail is kept explicitly here, on the ids that were tokenized above for the
     # length measurement — which also means the engine is handed the same token ids this function
     # measured rather than retokenizing the strings
-    prompt_limit = max(1, max_model_len - MIN_NEW_TOKENS)
+    # room for the length floor, and for at least one token when the floor is 0
+    prompt_limit = max(1, max_model_len - max(min_new_tokens, 1))
     engine_prompts = [
         TokensPrompt(prompt_token_ids=ids[-prompt_limit:]) for ids in prompt_ids
     ]
@@ -308,7 +315,7 @@ def generate_transformers(instructions: list, model_dir: str) -> list:
                 top_p=top_p,
                 top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                min_new_tokens=MIN_NEW_TOKENS,
+                min_new_tokens=min_new_tokens,
                 max_new_tokens=block_size,
                 use_cache=True,
             )
@@ -453,6 +460,14 @@ if __name__ == "__main__":
         f"(default: {REPETITION_PENALTY:g})",
     )
     parser.add_argument(
+        "--min_new_tokens",
+        type=int,
+        default=MIN_NEW_TOKENS,
+        help="number of new tokens the end token is suppressed for, the same on both engines; "
+        "every response is at least this long. 0 lets a response end at once "
+        f"(default: {MIN_NEW_TOKENS})",
+    )
+    parser.add_argument(
         "--path",
         "-p",
         type=str,
@@ -492,6 +507,7 @@ if __name__ == "__main__":
     top_p = args.top_p
     top_k = args.top_k
     repetition_penalty = args.repetition_penalty
+    min_new_tokens = max(0, args.min_new_tokens)
     path = args.path
     real_data_fraction = args.real_data_fraction
 
